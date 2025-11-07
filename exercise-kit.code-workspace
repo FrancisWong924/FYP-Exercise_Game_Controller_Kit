@@ -1,0 +1,12 @@
+{
+	"folders": [
+	  { "path": "android_controller" },
+	  { "path": "pc-server" },
+	  { "path": "sdk" },
+	  { "path": "demos" },
+	  { "path": "docs" }
+	],
+	"settings": {
+	  "dart.flutterHotReloadOnSave": "all"
+	}
+  }
