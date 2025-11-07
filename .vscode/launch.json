@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flutter Android",
+      "request": "launch",
+      "type": "dart",
+      "cwd": "${workspaceFolder:android-controller}"
+    },
+    {
+      "name": ".NET Server",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "Server: Run .NET",
+      "program": "${workspaceFolder:pc-server}/Server.Core/bin/Debug/net8.0/Server.Core.dll",
+      "cwd": "${workspaceFolder:pc-server}/Server.Core"
+    }
+  ]
+}
