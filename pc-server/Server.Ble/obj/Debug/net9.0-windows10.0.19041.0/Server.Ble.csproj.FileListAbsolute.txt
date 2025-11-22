@@ -1,0 +1,17 @@
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\Server.Ble.exe
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\Server.Ble.deps.json
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\Server.Ble.runtimeconfig.json
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\Server.Ble.dll
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\Server.Ble.pdb
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\Microsoft.Windows.SDK.NET.dll
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\bin\Debug\net9.0-windows10.0.19041.0\WinRT.Runtime.dll
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.AssemblyInfoInputs.cache
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.AssemblyInfo.cs
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.csproj.CoreCompileInputs.cache
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.csproj.Up2Date
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.dll
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\refint\Server.Ble.dll
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.pdb
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.genruntimeconfig.cache
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\ref\Server.Ble.dll

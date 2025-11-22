@@ -1,0 +1,188 @@
+{
+  "version": 3,
+  "targets": {
+    "net9.0": {
+      "InTheHand.Net.Bluetooth/4.2.2": {
+        "type": "package",
+        "dependencies": {
+          "Linux.Bluetooth": "5.67.1"
+        },
+        "compile": {
+          "lib/net8.0/InTheHand.Net.Bluetooth.dll": {
+            "related": ".xml"
+          }
+        },
+        "runtime": {
+          "lib/net8.0/InTheHand.Net.Bluetooth.dll": {
+            "related": ".xml"
+          }
+        }
+      },
+      "Linux.Bluetooth/5.67.1": {
+        "type": "package",
+        "dependencies": {
+          "Tmds.DBus": "0.20.0"
+        },
+        "compile": {
+          "lib/netstandard2.0/Linux.Bluetooth.dll": {}
+        },
+        "runtime": {
+          "lib/netstandard2.0/Linux.Bluetooth.dll": {}
+        }
+      },
+      "Tmds.DBus/0.20.0": {
+        "type": "package",
+        "compile": {
+          "lib/net6.0/Tmds.DBus.dll": {
+            "related": ".xml"
+          }
+        },
+        "runtime": {
+          "lib/net6.0/Tmds.DBus.dll": {
+            "related": ".xml"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "InTheHand.Net.Bluetooth/4.2.2": {
+      "sha512": "OgRCwJzJS2bNgKlEf1G6Vlt1dn+rICOegWNopvSDbEalk+gOjZ8pm8BzMtbyR6a+tJBRCYDV7mQ4jL2J203NfA==",
+      "type": "package",
+      "path": "inthehand.net.bluetooth/4.2.2",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "32feet-package-icon.png",
+        "README.md",
+        "inthehand.net.bluetooth.4.2.2.nupkg.sha512",
+        "inthehand.net.bluetooth.nuspec",
+        "lib/monoandroid10.0/InTheHand.Net.Bluetooth.dll",
+        "lib/monoandroid10.0/InTheHand.Net.Bluetooth.xml",
+        "lib/net462/InTheHand.Net.Bluetooth.dll",
+        "lib/net462/InTheHand.Net.Bluetooth.xml",
+        "lib/net8.0-android34.0/InTheHand.Net.Bluetooth.dll",
+        "lib/net8.0-android34.0/InTheHand.Net.Bluetooth.xml",
+        "lib/net8.0-ios18.0/InTheHand.Net.Bluetooth.dll",
+        "lib/net8.0-ios18.0/InTheHand.Net.Bluetooth.xml",
+        "lib/net8.0-windows10.0.19041/InTheHand.Net.Bluetooth.dll",
+        "lib/net8.0-windows10.0.19041/InTheHand.Net.Bluetooth.xml",
+        "lib/net8.0-windows7.0/InTheHand.Net.Bluetooth.dll",
+        "lib/net8.0-windows7.0/InTheHand.Net.Bluetooth.xml",
+        "lib/net8.0/InTheHand.Net.Bluetooth.dll",
+        "lib/net8.0/InTheHand.Net.Bluetooth.xml",
+        "lib/netstandard2.0/InTheHand.Net.Bluetooth.dll",
+        "lib/netstandard2.0/InTheHand.Net.Bluetooth.xml",
+        "lib/netstandard2.1/InTheHand.Net.Bluetooth.dll",
+        "lib/netstandard2.1/InTheHand.Net.Bluetooth.xml",
+        "lib/uap10.0.16299/InTheHand.Net.Bluetooth.dll",
+        "lib/uap10.0.16299/InTheHand.Net.Bluetooth.pri",
+        "lib/uap10.0.16299/InTheHand.Net.Bluetooth.xml",
+        "lib/xamarinios10/InTheHand.Net.Bluetooth.dll",
+        "lib/xamarinios10/InTheHand.Net.Bluetooth.xml"
+      ]
+    },
+    "Linux.Bluetooth/5.67.1": {
+      "sha512": "DkSxrPTWGn6Wx0d+/HfCsy/F82Ttfb9DLnWVqBDem46zftrm75UDx0seP6Ii0EljjWTu9Dwgb9T3QzzdSQr5Ow==",
+      "type": "package",
+      "path": "linux.bluetooth/5.67.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "Linux.Bluetooth-128x128.png",
+        "README.md",
+        "lib/netstandard2.0/Linux.Bluetooth.dll",
+        "linux.bluetooth.5.67.1.nupkg.sha512",
+        "linux.bluetooth.nuspec"
+      ]
+    },
+    "Tmds.DBus/0.20.0": {
+      "sha512": "zbWoimlpWKBIyc9JqNr26f0pnJ7W5M78XCks0J02qXEQykWzIgzR3ZCIO7yZyeqww+Oz2Jh+62GnkErNLyIG9w==",
+      "type": "package",
+      "path": "tmds.dbus/0.20.0",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "lib/net6.0/Tmds.DBus.dll",
+        "lib/net6.0/Tmds.DBus.xml",
+        "lib/netstandard2.0/Tmds.DBus.dll",
+        "lib/netstandard2.0/Tmds.DBus.xml",
+        "tmds.dbus.0.20.0.nupkg.sha512",
+        "tmds.dbus.nuspec"
+      ]
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net9.0": [
+      "InTheHand.Net.Bluetooth >= 4.2.2"
+    ]
+  },
+  "packageFolders": {
+    "C:\\Users\\Acer\\.nuget\\packages\\": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "c:\\Users\\Acer\\Desktop\\FYP-Exercise_Game_Controller_Kit\\pc-server\\Server.Core\\Server.Core.csproj",
+      "projectName": "Server.Core",
+      "projectPath": "c:\\Users\\Acer\\Desktop\\FYP-Exercise_Game_Controller_Kit\\pc-server\\Server.Core\\Server.Core.csproj",
+      "packagesPath": "C:\\Users\\Acer\\.nuget\\packages\\",
+      "outputPath": "c:\\Users\\Acer\\Desktop\\FYP-Exercise_Game_Controller_Kit\\pc-server\\Server.Core\\obj\\",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "C:\\Users\\Acer\\AppData\\Roaming\\NuGet\\NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net9.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net9.0": {
+          "targetAlias": "net9.0",
+          "projectReferences": {}
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      },
+      "SdkAnalysisLevel": "9.0.300"
+    },
+    "frameworks": {
+      "net9.0": {
+        "targetAlias": "net9.0",
+        "dependencies": {
+          "InTheHand.Net.Bluetooth": {
+            "target": "Package",
+            "version": "[4.2.2, )"
+          }
+        },
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.306/PortableRuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

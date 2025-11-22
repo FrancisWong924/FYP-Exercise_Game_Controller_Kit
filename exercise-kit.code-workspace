@@ -4,7 +4,8 @@
 	  { "path": "pc-server" },
 	  { "path": "sdk" },
 	  { "path": "demos" },
-	  { "path": "docs" }
+	  { "path": "docs" },
+	  { "path": ".vscode" }
 	],
 	"settings": {
 	  "dart.flutterHotReloadOnSave": "all"

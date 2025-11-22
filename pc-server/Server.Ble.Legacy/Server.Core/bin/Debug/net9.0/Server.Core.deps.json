@@ -1,0 +1,77 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v9.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v9.0": {
+      "Server.Core/1.0.0": {
+        "dependencies": {
+          "InTheHand.Net.Bluetooth": "4.2.2"
+        },
+        "runtime": {
+          "Server.Core.dll": {}
+        }
+      },
+      "InTheHand.Net.Bluetooth/4.2.2": {
+        "dependencies": {
+          "Linux.Bluetooth": "5.67.1"
+        },
+        "runtime": {
+          "lib/net8.0/InTheHand.Net.Bluetooth.dll": {
+            "assemblyVersion": "4.2.2.0",
+            "fileVersion": "4.2.2.0"
+          }
+        }
+      },
+      "Linux.Bluetooth/5.67.1": {
+        "dependencies": {
+          "Tmds.DBus": "0.20.0"
+        },
+        "runtime": {
+          "lib/netstandard2.0/Linux.Bluetooth.dll": {
+            "assemblyVersion": "5.67.1.0",
+            "fileVersion": "5.67.1.0"
+          }
+        }
+      },
+      "Tmds.DBus/0.20.0": {
+        "runtime": {
+          "lib/net6.0/Tmds.DBus.dll": {
+            "assemblyVersion": "0.20.0.0",
+            "fileVersion": "0.20.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Server.Core/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "InTheHand.Net.Bluetooth/4.2.2": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-OgRCwJzJS2bNgKlEf1G6Vlt1dn+rICOegWNopvSDbEalk+gOjZ8pm8BzMtbyR6a+tJBRCYDV7mQ4jL2J203NfA==",
+      "path": "inthehand.net.bluetooth/4.2.2",
+      "hashPath": "inthehand.net.bluetooth.4.2.2.nupkg.sha512"
+    },
+    "Linux.Bluetooth/5.67.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-DkSxrPTWGn6Wx0d+/HfCsy/F82Ttfb9DLnWVqBDem46zftrm75UDx0seP6Ii0EljjWTu9Dwgb9T3QzzdSQr5Ow==",
+      "path": "linux.bluetooth/5.67.1",
+      "hashPath": "linux.bluetooth.5.67.1.nupkg.sha512"
+    },
+    "Tmds.DBus/0.20.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-zbWoimlpWKBIyc9JqNr26f0pnJ7W5M78XCks0J02qXEQykWzIgzR3ZCIO7yZyeqww+Oz2Jh+62GnkErNLyIG9w==",
+      "path": "tmds.dbus/0.20.0",
+      "hashPath": "tmds.dbus.0.20.0.nupkg.sha512"
+    }
+  }
+}

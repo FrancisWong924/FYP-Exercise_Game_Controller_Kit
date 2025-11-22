@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "GZLZMyU7abU=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Acer\\Desktop\\FYP-Exercise_Game_Controller_Kit\\pc-server\\Server.Core\\Server.Core.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Acer\\.nuget\\packages\\inthehand.net.bluetooth\\4.2.2\\inthehand.net.bluetooth.4.2.2.nupkg.sha512",
+    "C:\\Users\\Acer\\.nuget\\packages\\linux.bluetooth\\5.67.1\\linux.bluetooth.5.67.1.nupkg.sha512",
+    "C:\\Users\\Acer\\.nuget\\packages\\tmds.dbus\\0.20.0\\tmds.dbus.0.20.0.nupkg.sha512"
+  ],
+  "logs": []
+}

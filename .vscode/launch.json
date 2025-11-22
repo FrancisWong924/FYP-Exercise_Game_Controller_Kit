@@ -5,7 +5,7 @@
       "name": "Flutter Android",
       "request": "launch",
       "type": "dart",
-      "cwd": "${workspaceFolder:android-controller}"
+      "cwd": "${workspaceFolder:android_controller}"
     },
     {
       "name": ".NET Server",

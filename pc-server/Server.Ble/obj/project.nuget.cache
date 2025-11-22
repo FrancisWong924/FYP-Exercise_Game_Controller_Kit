@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "BcCusqrwgio=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Acer\\Desktop\\FYP-Exercise_Game_Controller_Kit\\pc-server\\Server.Ble\\Server.Ble.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Acer\\.nuget\\packages\\microsoft.windows.sdk.net.ref\\10.0.19041.57\\microsoft.windows.sdk.net.ref.10.0.19041.57.nupkg.sha512"
+  ],
+  "logs": []
+}
