@@ -15,3 +15,4 @@ C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\
 C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.pdb
 C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.genruntimeconfig.cache
 C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\ref\Server.Ble.dll
+C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0-windows10.0.19041.0\Server.Ble.sourcelink.json

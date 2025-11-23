@@ -49,17 +49,18 @@ class BleManager {
     FlutterBluePlus.startScan(timeout: Duration(seconds: 60), withServices: [Guid(BleUuids.service)]);
 
     // auto-cleanup if nothing found
-    _scanTimer = Timer(const Duration(seconds: 62), () {
+    _scanTimer = Timer(const Duration(seconds: 62), () async {
       if (pcDevice == null) {
         print("[BLE] Scan timeout (60s) reached – no PC found");
         FlutterBluePlus.stopScan();
         _statusController.add(BleConnectionStatus.failed);
+        await Future.delayed(Duration(seconds: 1)); startScanningAndConnect();
       }
     });
 
     late StreamSubscription<List<ScanResult>> subscription;
     // Listen to scan results
-    subscription = FlutterBluePlus.scanResults.listen((results) async{
+    subscription = FlutterBluePlus.scanResults.listen((results) async {
       for (ScanResult r in results) {
         if (r.advertisementData.serviceUuids.contains(Guid(BleUuids.service))) {
           
@@ -124,7 +125,7 @@ class BleManager {
       print("[BLE] Connect failed: $e");
       await device.disconnect();
       _statusController.add(BleConnectionStatus.failed);
-      await Future.delayed(Duration(seconds: 5)); startScanningAndConnect();
+      await Future.delayed(Duration(seconds: 3)); startScanningAndConnect();
     }
   }
 
@@ -146,6 +147,19 @@ class BleManager {
       print("[BLE] Send failed: $e");
     }
   }
+
+  // For high-frequency input (60Hz)
+  // Future<void> sendInput(InputState state) async {
+  //   final json = jsonEncode(state.toJson()) + "\n";
+  //   // Use withoutResponse: true for high frequency
+  //   await writeCharacteristic?.write(utf8.encode(json), withoutResponse: true);
+  // }
+
+  // // Or go full binary for ultra-low latency
+  // Future<void> sendBinaryInput(InputState state) async {
+  //   final bytes = state.toBytes();
+  //   await writeCharacteristic?.write(bytes, withoutResponse: true);
+  // }
 
   Future<void> disconnect() async {
     if (pcDevice != null) {

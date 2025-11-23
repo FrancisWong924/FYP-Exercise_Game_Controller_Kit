@@ -3,28 +3,10 @@ import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'bluetooth_connection.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:permission_handler/permission_handler.dart';
-
-Future<bool> requestBlePermissions() async {
-  Map<Permission, PermissionStatus> statuses = await [
-    Permission.bluetoothScan,
-    Permission.bluetoothConnect,
-    Permission.bluetoothAdvertise,
-    Permission.locationWhenInUse, // fallback for older Android
-  ].request();
-
-  bool allGranted = statuses.values.every((status) => status.isGranted);
-
-  if (!allGranted) {
-    // Show explanation and open settings
-    await openAppSettings();
-    return false;
-  }
-  return true;
-}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
@@ -42,6 +24,7 @@ class BluetoothTestScreen extends StatefulWidget {
 class _BluetoothTestScreenState extends State<BluetoothTestScreen> {
   final BleManager bleManager = BleManager();
   String _status = 'Initializing...';
+  bool paused = false;
 
   // Helper: Log to console + update UI
   void _logAndUpdate(String message) {
@@ -102,53 +85,62 @@ class _BluetoothTestScreenState extends State<BluetoothTestScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black87,
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            // status icon
-            Icon(
-              _status.contains('failed')
-                  ? Icons.bluetooth_disabled
-                  : Icons.bluetooth,
-              color: _status.contains('failed')
-                  ? Colors.red
-                  : Colors.green,
-              size: 48,
-            ),
-            const SizedBox(height: 20),
-            // status text
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Text(
-                _status,
-                style: TextStyle(
-                  color: _status.contains('failed')
-                      ? Colors.red
-                      : Colors.green,
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                ),
-                textAlign: TextAlign.center,
-              ),
-            ),
-            const SizedBox(height: 40),
-            // test button
-            if (_status.contains('Connected to PC!'))
-              ElevatedButton.icon(
-                onPressed: () => bleManager.sendToPc("HELLO_FROM_PHONE"),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blue,
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                ),
-                icon: const Icon(Icons.send, color: Colors.white),
-                label: const Text(
-                  'Tap to Send Test',
-                  style: TextStyle(color: Colors.white, fontSize: 18),
+      body: Stack(
+        children: [
+          // Top-center button
+          if (_status.contains('Connected to PC!'))
+            Positioned(
+              top: 5, // Adjust this value to move it higher or lower
+              left: 0,
+              right: 0,
+              child: Center(
+                child: GestureDetector(
+                  onTap: () => {
+                    setState(() => paused = !paused),
+                    bleManager.sendToPc(paused ? "PAUSE" : "RESUME"),
+                  },
+                  child: Container(
+                    width: 36, height: 26,
+                    decoration: const BoxDecoration(
+                      color: Colors.white24,
+                      shape: BoxShape.rectangle,
+                      borderRadius: BorderRadius.all(Radius.circular(4)),
+                    ),
+                    child: Icon(paused ? Icons.play_arrow : Icons.pause, color: Colors.white, size: 18),
+                  ),
                 ),
               ),
-          ],
-        ),
+            ),
+
+          // Main centered content (status icon + text)
+          Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  _status.contains('failed')
+                      ? Icons.bluetooth_disabled
+                      : Icons.bluetooth,
+                  color: _status.contains('failed') ? Colors.red : Colors.green,
+                  size: 48,
+                ),
+                const SizedBox(height: 20),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Text(
+                    _status,
+                    style: TextStyle(
+                      color: _status.contains('failed') ? Colors.red : Colors.green,
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
