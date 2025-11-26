@@ -71,7 +71,9 @@ class _BluetoothTestScreenState extends State<BluetoothTestScreen> {
       case BleConnectionStatus.connected:
         return "Connected to PC!";
       case BleConnectionStatus.disconnected:
-        return "Disconnected";
+        return FlutterBluePlus.isScanningNow
+          ? "Reconnecting..."
+          : "Disconnected – Reconnecting...";
       case BleConnectionStatus.failed:
         return "Connection failed";
       case BleConnectionStatus.bluetoothOff:

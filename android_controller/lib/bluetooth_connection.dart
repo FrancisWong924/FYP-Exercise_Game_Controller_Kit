@@ -21,6 +21,12 @@ class BleManager {
   BluetoothDevice? pcDevice;
   BluetoothCharacteristic? writeCharacteristic;  // Phone → PC
   Timer? _scanTimer;
+  Timer? _heartbeatTimer;
+  DateTime _lastPongTime = DateTime.now();
+  Timer? _disconnectWatcher;
+
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
 
   // Public stream for status updates
   final _statusController = StreamController<BleConnectionStatus>.broadcast();
@@ -29,6 +35,33 @@ class BleManager {
   // Public stream for received data
   final _dataController = StreamController<List<int>>.broadcast();
   Stream<List<int>> get receivedDataStream => _dataController.stream;
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _lastPongTime = DateTime.now();
+
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (writeCharacteristic != null) {
+        sendToPc("PING");  // silent ping
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+  }
+
+  void _startDisconnectWatcher() {
+    _disconnectWatcher?.cancel();
+    _disconnectWatcher = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (DateTime.now().difference(_lastPongTime) > const Duration(seconds: 4)) {
+        print("[BLE] HEARTBEAT TIMEOUT - PC is gone!");
+        _disconnectWatcher?.cancel();
+        pcDevice?.disconnect();  // Force disconnect → triggers connectionState listener
+      }
+    });
+  }
 
   Future<void> startScanningAndConnect() async {
     // Turn on Bluetooth if needed
@@ -54,13 +87,14 @@ class BleManager {
         print("[BLE] Scan timeout (60s) reached – no PC found");
         FlutterBluePlus.stopScan();
         _statusController.add(BleConnectionStatus.failed);
-        await Future.delayed(Duration(seconds: 1)); startScanningAndConnect();
+        await Future.delayed(Duration(seconds: 1));
+        startScanningAndConnect();
       }
     });
 
-    late StreamSubscription<List<ScanResult>> subscription;
+    await _scanSubscription?.cancel();
     // Listen to scan results
-    subscription = FlutterBluePlus.scanResults.listen((results) async {
+    _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
       for (ScanResult r in results) {
         if (r.advertisementData.serviceUuids.contains(Guid(BleUuids.service))) {
           
@@ -70,7 +104,8 @@ class BleManager {
           pcDevice = r.device;
           _statusController.add(BleConnectionStatus.connecting);
           await connectToDevice(pcDevice!);
-          subscription.cancel();  // Stop listening after connect
+          await _scanSubscription?.cancel();  // Stop listening after connect
+           _scanSubscription = null;
           return;
         }
       }
@@ -79,6 +114,9 @@ class BleManager {
 
   Future<void> connectToDevice(BluetoothDevice device) async {
     try {
+      // Cancel any previous connection state listener
+      await _connectionStateSubscription?.cancel();
+      _connectionStateSubscription = null;
       await device.connect(license: License.free);
       print("[BLE] Connected to ${device.platformName}");
       _statusController.add(BleConnectionStatus.connected);
@@ -99,6 +137,10 @@ class BleManager {
               char.lastValueStream.listen((value) {
                 String text = utf8.decode(value).trim();
                 print("[BLE] ← From PC: $text");
+                if (text == "PC_ACK: PONG") {
+                  _lastPongTime = DateTime.now();  // We are alive!
+                  return;
+                }
                 _dataController.add(value);
               });
               print("[BLE] Notify enabled on ${char.uuid.str}");
@@ -112,20 +154,39 @@ class BleManager {
           }
         }
       }
+      _startHeartbeat();
+      _startDisconnectWatcher();
       print("[BLE] Setup complete! Ready to send/receive data.");
+      await _connectionStateSubscription?.cancel();
       // Monitor disconnection
-      device.connectionState.listen((state) {
+      _connectionStateSubscription = device.connectionState.listen((BluetoothConnectionState state) async {
+        print("[BLE] Connection state changed: $state");
         if (state == BluetoothConnectionState.disconnected) {
+          print("[BLE] Disconnected from PC!");
+          _stopHeartbeat();
+          _disconnectWatcher?.cancel();
           _statusController.add(BleConnectionStatus.disconnected);
           pcDevice = null;
           writeCharacteristic = null;
+          await _connectionStateSubscription?.cancel();
+          _connectionStateSubscription = null;
+          await Future.delayed(const Duration(seconds: 1));
+          if (!_statusController.isClosed) {
+            print("[BLE] Attempting to reconnect...");
+            startScanningAndConnect();
+          }
         }
+      },
+      onError: (e) {
+        print("[BLE] Connection error: $e");
+        _statusController.add(BleConnectionStatus.failed);
       });
     } catch (e) {
       print("[BLE] Connect failed: $e");
       await device.disconnect();
       _statusController.add(BleConnectionStatus.failed);
-      await Future.delayed(Duration(seconds: 3)); startScanningAndConnect();
+      await Future.delayed(const Duration(seconds: 3));
+      startScanningAndConnect();
     }
   }
 
@@ -171,6 +232,11 @@ class BleManager {
   }
 
   void dispose() {
+    _scanTimer?.cancel();
+    _scanSubscription?.cancel();
+    _connectionStateSubscription?.cancel();
+    _stopHeartbeat();
+    _disconnectWatcher?.cancel();
     FlutterBluePlus.stopScan();  // FIX: Stop any ongoing scan
     if (pcDevice != null) disconnect();
     _statusController.close();
