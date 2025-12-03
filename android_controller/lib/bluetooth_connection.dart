@@ -1,6 +1,7 @@
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show pi;
 
 class BleUuids {
   static const String service     = "12345678-1234-5678-1234-56789abcdef0";
@@ -20,10 +21,14 @@ enum BleConnectionStatus {
 class BleManager {
   BluetoothDevice? pcDevice;
   BluetoothCharacteristic? writeCharacteristic;  // Phone → PC
+
   Timer? _scanTimer;
   Timer? _heartbeatTimer;
-  DateTime _lastPongTime = DateTime.now();
   Timer? _disconnectWatcher;
+  Timer? _inputTimer;
+  
+  DateTime _lastPongTime = DateTime.now();
+  InputState _lastSentInput = InputState(); // default zero
 
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
@@ -163,6 +168,7 @@ class BleManager {
         print("[BLE] Connection state changed: $state");
         if (state == BluetoothConnectionState.disconnected) {
           print("[BLE] Disconnected from PC!");
+          stopInputSending();
           _stopHeartbeat();
           _disconnectWatcher?.cancel();
           _statusController.add(BleConnectionStatus.disconnected);
@@ -190,11 +196,6 @@ class BleManager {
     }
   }
 
-  void _cancelScanTimer() {
-    _scanTimer?.cancel();
-    _scanTimer = null;
-  }
-
   Future<void> sendToPc(String message) async {
     if (writeCharacteristic == null) {
       print("[BLE] Not connected - can't send");
@@ -209,18 +210,46 @@ class BleManager {
     }
   }
 
-  // For high-frequency input (60Hz)
-  // Future<void> sendInput(InputState state) async {
-  //   final json = jsonEncode(state.toJson()) + "\n";
-  //   // Use withoutResponse: true for high frequency
-  //   await writeCharacteristic?.write(utf8.encode(json), withoutResponse: true);
-  // }
+  // Call this from joystick/buttons at 60 FPS
+  void movementInput(InputState newState) {
+    _lastSentInput = newState;
 
-  // // Or go full binary for ultra-low latency
-  // Future<void> sendBinaryInput(InputState state) async {
-  //   final bytes = state.toBytes();
-  //   await writeCharacteristic?.write(bytes, withoutResponse: true);
-  // }
+    // If timer not running → start sending loop
+    _inputTimer ??= Timer.periodic(const Duration(milliseconds: 16), (_) {
+      _sendCurrentInput();
+    });
+  }
+
+  /// Sends the latest input state ~60 times per second
+  Future<void> _sendCurrentInput() async {
+    if (writeCharacteristic == null || pcDevice == null) {
+      _inputTimer?.cancel();
+      _inputTimer = null;
+      return;
+    }
+
+    try {
+      // Option A: Compact JSON (easy to debug on PC side)
+      final json = jsonEncode(_lastSentInput.toJson()) + "\n";
+      await writeCharacteristic!.write(
+        utf8.encode(json),
+        withoutResponse: true, // Critical for 60 Hz!
+      );
+
+      // Option B: Ultra-low latency binary (uncomment if you implement toBytes())
+      // final bytes = _lastSentInput.toBytes();
+      // await writeCharacteristic!.write(bytes, withoutResponse: true);
+    } catch (e) {
+      print("[BLE] Failed to send input: $e");
+      // If write fails repeatedly, connection might be bad
+    }
+  }
+
+  // Call this when app pauses or disconnects
+  void stopInputSending() {
+    _inputTimer?.cancel();
+    _inputTimer = null;
+  }
 
   Future<void> disconnect() async {
     if (pcDevice != null) {
@@ -242,4 +271,31 @@ class BleManager {
     _statusController.close();
     _dataController.close();
   }
+}
+
+class InputState {
+  final double joyLX;
+  final double joyLY;
+  final double joyRX;
+  final double joyRY;
+  final int buttons; // bitmask or whatever
+
+  InputState({
+    this.joyLX = 0,
+    this.joyLY = 0,
+    this.joyRX = 0,
+    this.joyRY = 0,
+    this.buttons = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'lx': (joyLX * 127).round(),     // -127..127
+        'ly': (joyLY * 127).round(),
+        'rx': (joyRX * 127).round(),
+        'ry': (joyRY * 127).round(),
+        'btn': buttons,
+      };
+
+  // Optional: binary version for even lower latency
+  // List<int> toBytes() { ... }
 }
