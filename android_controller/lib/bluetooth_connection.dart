@@ -1,12 +1,15 @@
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'models/controller_element.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:math' show pi;
 
 class BleUuids {
   static const String service     = "12345678-1234-5678-1234-56789abcdef0";
-  static const String writeChar   = "12345678-1234-5678-1234-56789abcdef1"; // PC writes → phone
   static const String notifyChar  = "12345678-1234-5678-1234-56789abcdef2"; // phone writes → PC
+  static const String pingChar   = "12345678-1234-5678-1234-56789abcdef1"; // Write-With-Response → PING
+  static const String inputChar  = "12345678-1234-5678-1234-56789abcdef3"; // Write-Without-Response → fast input
 }
 
 enum BleConnectionStatus {
@@ -20,7 +23,8 @@ enum BleConnectionStatus {
 
 class BleManager {
   BluetoothDevice? pcDevice;
-  BluetoothCharacteristic? writeCharacteristic;  // Phone → PC
+  BluetoothCharacteristic? pingCharacteristic;   // For PING (WithResponse)
+  BluetoothCharacteristic? inputCharacteristic;  // For fast input (WithoutResponse)
 
   Timer? _scanTimer;
   Timer? _heartbeatTimer;
@@ -28,7 +32,6 @@ class BleManager {
   Timer? _inputTimer;
   
   DateTime _lastPongTime = DateTime.now();
-  InputState _lastSentInput = InputState(); // default zero
 
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
@@ -41,13 +44,16 @@ class BleManager {
   final _dataController = StreamController<List<int>>.broadcast();
   Stream<List<int>> get receivedDataStream => _dataController.stream;
 
+  int currentButtons = 0;           // Live button state
+  InputState currentJoy = InputState();  // Live joystick state
+
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
     _lastPongTime = DateTime.now();
 
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (writeCharacteristic != null) {
-        sendToPc("PING");  // silent ping
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (pingCharacteristic != null) {
+        sendPing();  // silent ping
       }
     });
   }
@@ -59,8 +65,8 @@ class BleManager {
 
   void _startDisconnectWatcher() {
     _disconnectWatcher?.cancel();
-    _disconnectWatcher = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (DateTime.now().difference(_lastPongTime) > const Duration(seconds: 4)) {
+    _disconnectWatcher = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (DateTime.now().difference(_lastPongTime) > const Duration(seconds: 3)) {
         print("[BLE] HEARTBEAT TIMEOUT - PC is gone!");
         _disconnectWatcher?.cancel();
         pcDevice?.disconnect();  // Force disconnect → triggers connectionState listener
@@ -69,6 +75,8 @@ class BleManager {
   }
 
   Future<void> startScanningAndConnect() async {
+    await _scanSubscription?.cancel();
+    _scanSubscription = null;
     // Turn on Bluetooth if needed
     if (await FlutterBluePlus.isSupported == false) {
       print("Bluetooth not supported on this device");
@@ -83,19 +91,11 @@ class BleManager {
 
     print("[BLE] Starting scan...");
 
-    // Start scanning
-    FlutterBluePlus.startScan(timeout: Duration(seconds: 60), withServices: [Guid(BleUuids.service)]);
+    // Ensure no ongoing scan
+    await FlutterBluePlus.stopScan();
 
-    // auto-cleanup if nothing found
-    _scanTimer = Timer(const Duration(seconds: 62), () async {
-      if (pcDevice == null) {
-        print("[BLE] Scan timeout (60s) reached – no PC found");
-        FlutterBluePlus.stopScan();
-        _statusController.add(BleConnectionStatus.failed);
-        await Future.delayed(Duration(seconds: 1));
-        startScanningAndConnect();
-      }
-    });
+    // Start scanning
+    FlutterBluePlus.startScan(withServices: [Guid(BleUuids.service)]);
 
     await _scanSubscription?.cancel();
     // Listen to scan results
@@ -125,7 +125,6 @@ class BleManager {
       await device.connect(license: License.free);
       print("[BLE] Connected to ${device.platformName}");
       _statusController.add(BleConnectionStatus.connected);
-      _scanTimer?.cancel();
 
       // Discover services
       List<BluetoothService> services = await device.discoverServices();
@@ -136,13 +135,14 @@ class BleManager {
           print("[BLE] Found our service!");
 
           for (var char in service.characteristics) {
+            final uuidStr = char.uuid.str.toLowerCase();
             // Setup notify (PC → Phone)
-            if (char.uuid.str.toLowerCase() == BleUuids.notifyChar.toLowerCase()) {
+            if (uuidStr == BleUuids.notifyChar.toLowerCase()) {
               await char.setNotifyValue(true);
               char.lastValueStream.listen((value) {
-                String text = utf8.decode(value).trim();
+                String text = utf8.decode(value, allowMalformed: true).trim();
                 print("[BLE] ← From PC: $text");
-                if (text == "PC_ACK: PONG") {
+                if (text.contains("PONG")) {
                   _lastPongTime = DateTime.now();  // We are alive!
                   return;
                 }
@@ -151,17 +151,29 @@ class BleManager {
               print("[BLE] Notify enabled on ${char.uuid.str}");
             }
 
-            // Save write characteristic (Phone → PC)
-            if (char.uuid.str.toLowerCase() == BleUuids.writeChar.toLowerCase()) {
-              writeCharacteristic = char;
-              print("[BLE] Write characteristic ready: ${char.uuid.str}");
+            // 2. PING characteristic (Write With Response)
+            else if (uuidStr == BleUuids.pingChar.toLowerCase()) {
+              pingCharacteristic = char;
+              print("[BLE] PING characteristic ready: $uuidStr");
+            }
+
+            // 3. INPUT characteristic (Write Without Response) – for buttons & joysticks
+            else if (uuidStr == BleUuids.inputChar.toLowerCase()) {
+              inputCharacteristic = char;
+              print("[BLE] INPUT characteristic ready (fast): $uuidStr");
             }
           }
         }
       }
-      _startHeartbeat();
-      _startDisconnectWatcher();
-      print("[BLE] Setup complete! Ready to send/receive data.");
+      // Start heartbeat only if PING char exists
+      if (pingCharacteristic != null) {
+        _startHeartbeat();
+        _startDisconnectWatcher();
+        startInputSending();
+        print("[BLE] Setup complete! Ready to send input + heartbeat.");
+      } else {
+        print("[BLE] ERROR: PING characteristic not found!");
+      }
       await _connectionStateSubscription?.cancel();
       // Monitor disconnection
       _connectionStateSubscription = device.connectionState.listen((BluetoothConnectionState state) async {
@@ -173,7 +185,8 @@ class BleManager {
           _disconnectWatcher?.cancel();
           _statusController.add(BleConnectionStatus.disconnected);
           pcDevice = null;
-          writeCharacteristic = null;
+          pingCharacteristic = null;
+          inputCharacteristic = null;
           await _connectionStateSubscription?.cancel();
           _connectionStateSubscription = null;
           await Future.delayed(const Duration(seconds: 1));
@@ -186,6 +199,7 @@ class BleManager {
       onError: (e) {
         print("[BLE] Connection error: $e");
         _statusController.add(BleConnectionStatus.failed);
+        startScanningAndConnect();
       });
     } catch (e) {
       print("[BLE] Connect failed: $e");
@@ -196,53 +210,113 @@ class BleManager {
     }
   }
 
-  Future<void> sendToPc(String message) async {
-    if (writeCharacteristic == null) {
-      print("[BLE] Not connected - can't send");
-      return;
-    }
+  Future<void> sendPing() async {
     try {
-      List<int> data = utf8.encode(message + "\n");
-      await writeCharacteristic!.write(data, withoutResponse: false);
-      print("[BLE] → Sent to PC: $message");
+      final bytes = utf8.encode("PING\n");
+      print("[BLE] → Sending PING (${bytes.length} bytes)");
+      await pingCharacteristic!.write(bytes, withoutResponse: false); // ← MUST be false!
     } catch (e) {
-      print("[BLE] Send failed: $e");
+      print("[BLE] PING send failed: $e");
     }
   }
 
-  // Call this from joystick/buttons at 60 FPS
-  void movementInput(InputState newState) {
-    _lastSentInput = newState;
+  Future<bool> togglePause(String command) async {
+    if (pingCharacteristic == null) {
+      print("[BLE] Cannot send $command — PING characteristic not available");
+      return false;
+    }
 
-    // If timer not running → start sending loop
-    _inputTimer ??= Timer.periodic(const Duration(milliseconds: 16), (_) {
-      _sendCurrentInput();
+    try {
+      final bytes = utf8.encode("$command\n");  // e.g., "PAUSE\n" or "RESUME\n"
+      await pingCharacteristic!.write(bytes, withoutResponse: false);  // MUST be false!
+      print("[BLE] → Sent command: $command");
+      return true;
+    } catch (e) {
+      print("[BLE] Failed to send $command: $e");
+      return false;
+    }
+  }
+
+  void updateAndSendButton(int buttonBit, bool pressed) {
+    if (pressed) {
+      currentButtons |= buttonBit;
+    } else {
+      currentButtons &= ~buttonBit;
+    }
+  }
+
+  // Send ONLY when buttons actually change
+  void sendButtons() {
+    if (inputCharacteristic == null) return;
+
+    final packet = Uint8List(4);
+    packet.buffer.asByteData().setUint32(0, currentButtons, Endian.little);
+    // packet[0] = currentButtons & 0xFF;
+    // packet[1] = (currentButtons >> 8) & 0xFF;
+    // packet[2] = (currentButtons >> 16) & 0xFF;
+    // packet[3] = (currentButtons >> 24) & 0xFF;
+
+    inputCharacteristic!.write(packet, withoutResponse: true);
+    // print("→ Buttons: 0x${currentButtons.toRadixString(16)}");
+  }
+
+  void updateAndSendJoystick(ControllerId id, double x, double y) {
+    final bool isLeft = id == ControllerId.leftJoystick;
+    if (isLeft) {
+      currentJoy = currentJoy.copyWith(joyLX: x, joyLY: y);
+    } else {
+      currentJoy = currentJoy.copyWith(joyRX: x, joyRY: y);
+    }
+  }
+
+  // Send ONLY when joysticks actually change
+  void sendJoysticks() {
+    if (inputCharacteristic == null) return;
+
+    final packet = Uint8List(8);
+    final bd = packet.buffer.asByteData();
+
+    bd.setInt16(0, (currentJoy.joyLX * 32767).round(), Endian.little);
+    bd.setInt16(2, (currentJoy.joyLY * 32767).round(), Endian.little);
+    bd.setInt16(4, (currentJoy.joyRX * 32767).round(), Endian.little);
+    bd.setInt16(6, (currentJoy.joyRY * 32767).round(), Endian.little);
+    print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
+    inputCharacteristic!.write(packet, withoutResponse: true);
+    // print("→ Joy L(${currentJoy.joyLX.toStringAsFixed(2)}, ${currentJoy.joyLY.toStringAsFixed(2)})");
+  }
+
+  void sendCombinedInputPacket() {
+    if (inputCharacteristic == null) return;
+
+    final packet = Uint8List(12);
+    final bd = packet.buffer.asByteData();
+
+    // Bytes 0–3: Buttons (32 little-endian
+    bd.setUint32(0, currentButtons, Endian.little);
+
+    // Bytes 4–11: Joysticks (4 × Int16)
+    bd.setInt16(4, (currentJoy.joyLX * 32767).round(), Endian.little);
+    bd.setInt16(6, (currentJoy.joyLY * 32767).round(), Endian.little);
+    bd.setInt16(8, (currentJoy.joyRX * 32767).round(), Endian.little);
+    bd.setInt16(10, (currentJoy.joyRY * 32767).round(), Endian.little);
+
+    // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
+
+    // Fast path: no response
+    inputCharacteristic!.write(packet, withoutResponse: true);
+
+    // Optional debug (remove in release)
+    // print("→ Input packet sent (${packet.length} bytes)");
+  }
+
+  void startInputSending() {
+    print("[BLE] 60Hz input loop started");
+    _inputTimer?.cancel();
+    _inputTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      if (inputCharacteristic != null) {
+        sendCombinedInputPacket();
+      }
     });
-  }
-
-  /// Sends the latest input state ~60 times per second
-  Future<void> _sendCurrentInput() async {
-    if (writeCharacteristic == null || pcDevice == null) {
-      _inputTimer?.cancel();
-      _inputTimer = null;
-      return;
-    }
-
-    try {
-      // Option A: Compact JSON (easy to debug on PC side)
-      final json = jsonEncode(_lastSentInput.toJson()) + "\n";
-      await writeCharacteristic!.write(
-        utf8.encode(json),
-        withoutResponse: true, // Critical for 60 Hz!
-      );
-
-      // Option B: Ultra-low latency binary (uncomment if you implement toBytes())
-      // final bytes = _lastSentInput.toBytes();
-      // await writeCharacteristic!.write(bytes, withoutResponse: true);
-    } catch (e) {
-      print("[BLE] Failed to send input: $e");
-      // If write fails repeatedly, connection might be bad
-    }
   }
 
   // Call this when app pauses or disconnects
@@ -256,14 +330,15 @@ class BleManager {
       await pcDevice!.disconnect();
       print("[BLE] Disconnected");
       pcDevice = null;
-      writeCharacteristic = null;
+      pingCharacteristic = null;
+      inputCharacteristic = null;
     }
   }
 
   void dispose() {
-    _scanTimer?.cancel();
     _scanSubscription?.cancel();
     _connectionStateSubscription?.cancel();
+    stopInputSending();
     _stopHeartbeat();
     _disconnectWatcher?.cancel();
     FlutterBluePlus.stopScan();  // FIX: Stop any ongoing scan
@@ -288,14 +363,26 @@ class InputState {
     this.buttons = 0,
   });
 
-  Map<String, dynamic> toJson() => {
-        'lx': (joyLX * 127).round(),     // -127..127
-        'ly': (joyLY * 127).round(),
-        'rx': (joyRX * 127).round(),
-        'ry': (joyRY * 127).round(),
-        'btn': buttons,
-      };
+  InputState copyWith({
+    double? joyLX, double? joyLY,
+    double? joyRX, double? joyRY,
+    int? buttons,
+  }) => InputState(
+    joyLX: joyLX ?? this.joyLX,
+    joyLY: joyLY ?? this.joyLY,
+    joyRX: joyRX ?? this.joyRX,
+    joyRY: joyRY ?? this.joyRY,
+    buttons: buttons ?? this.buttons,
+  );
 
-  // Optional: binary version for even lower latency
-  // List<int> toBytes() { ... }
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is InputState &&
+      joyLX == other.joyLX && joyLY == other.joyLY &&
+      joyRX == other.joyRX && joyRY == other.joyRY &&
+      buttons == other.buttons;
+
+  @override
+  int get hashCode => Object.hash(joyLX, joyLY, joyRX, joyRY, buttons);
 }

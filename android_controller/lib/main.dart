@@ -34,9 +34,6 @@ class _ControllerAppState extends State<ControllerApp> {
   bool isLoading = true;
   bool paused = false;
 
-  final Map<String, double> joyValues = {};   // "joy1" → x, "joy1_y" → y
-  int currentButtons = 0;  // Only one variable for ALL buttons!
-
   // Customizable layout!
   List<ControllerElement> controllerElements = [];
 
@@ -142,19 +139,19 @@ class _ControllerAppState extends State<ControllerApp> {
   List<ControllerElement> getDefaultLayout(double screenWidth, double screenHeight) {
     return [
       ControllerElement(
-        id: "left_joystick",
+        id: ControllerId.leftJoystick,
         type: ControllerElementType.joystick,
         position: Offset(screenWidth - 590, screenHeight - 90),
         size: 55,
       ),
       ControllerElement(
-        id: "right_joystick",
+        id: ControllerId.rightJoystick,
         type: ControllerElementType.joystick,
         position: Offset(screenWidth - 200, screenHeight - 90),
         size: 55,
       ),
       ControllerElement(
-        id: "button_square",
+        id: ControllerId.buttonSquare,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 160, screenHeight - 180),
         size: 65,
@@ -162,7 +159,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "square",
       ),
       ControllerElement(
-        id: "button_x",
+        id: ControllerId.buttonCross,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 105, screenHeight - 125),
         size: 65,
@@ -170,7 +167,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "cross",
       ),
       ControllerElement(
-        id: "button_o",
+        id: ControllerId.buttonCircle,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 50, screenHeight - 180),
         size: 65,
@@ -178,7 +175,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "circle",
       ),
       ControllerElement(
-        id: "button_triangle",
+        id: ControllerId.buttonTriangle,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 105, screenHeight - 235),
         size: 65,
@@ -186,7 +183,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "triangle",
       ),
       ControllerElement(
-        id: "button_up",
+        id: ControllerId.buttonUp,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 685, screenHeight - 235),
         size: 65,
@@ -194,7 +191,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "arrow_up",
       ),
       ControllerElement(
-        id: "button_down",
+        id: ControllerId.buttonDown,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 685, screenHeight - 125),
         size: 65,
@@ -202,7 +199,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "arrow_down",
       ),
       ControllerElement(
-        id: "button_left",
+        id: ControllerId.buttonLeft,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 740, screenHeight - 180),
         size: 65,
@@ -210,7 +207,7 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "arrow_left",
       ),
       ControllerElement(
-        id: "button_right",
+        id: ControllerId.buttonRight,
         type: ControllerElementType.button,
         position: Offset(screenWidth - 630, screenHeight - 180),
         size: 65,
@@ -218,27 +215,6 @@ class _ControllerAppState extends State<ControllerApp> {
         label: "arrow_right",
       ),
     ];
-  }
-
-  void updateButton(int buttonId, bool pressed) {
-    setState(() {
-      if (pressed) {
-        currentButtons |= buttonId;    // Set bit
-      } else {
-        currentButtons &= ~buttonId;   // Clear bit
-      }
-    });
-
-    // Send immediately — games love instant response
-    // bleManager.sendPacket({
-    //   "type": "btn",
-    //   "buttons": currentButtons
-    // });
-  }
-
-  double applyDeadzone(double value, [double deadzone = 0.15]) {
-    if (value.abs() < deadzone) return 0.0;
-    return (value.abs() - deadzone) / (1.0 - deadzone) * (value > 0 ? 1 : -1);
   }
 
   @override
@@ -261,9 +237,12 @@ class _ControllerAppState extends State<ControllerApp> {
                 right: 0,
                 child: Center(
                   child: GestureDetector(
-                    onTap: () => {
-                      setState(() => paused = !paused),
-                      bleManager.sendToPc(paused ? "PAUSE" : "RESUME"),
+                    onTap: () async {
+                      setState(() => paused = !paused);
+                      final sent = await bleManager.togglePause(paused ? "PAUSE" : "RESUME");
+                      if (!sent) {
+                        setState(() => paused = !paused);
+                      }
                     },
                     child: Container(
                       width: 36, height: 26,
@@ -296,8 +275,9 @@ class _ControllerAppState extends State<ControllerApp> {
                   return CustomButton(
                     element: element,
                     onPressed: (id, pressed) {
-                      // Update your button state bitmask
-                      updateButton(element.buttonId, pressed);
+                      // send button press/release to PC
+                      final bit = element.buttonId;
+                      bleManager.updateAndSendButton(bit, pressed);
                     },
                   );
                 } else if (element.type == ControllerElementType.joystick) {
@@ -305,7 +285,7 @@ class _ControllerAppState extends State<ControllerApp> {
                     element: element,
                     deadzone: 0.20,
                     onChange: (id, x, y) {
-                      bleManager.movementInput(InputState(joyLX: x, joyLY: y));
+                      bleManager.updateAndSendJoystick(id, x, y);
                     },
                   );
                 }
@@ -317,8 +297,9 @@ class _ControllerAppState extends State<ControllerApp> {
                     return CustomButton(
                       element: element,
                       onPressed: (id, pressed) {
-                        // Update your button state bitmask
-                        updateButton(element.buttonId, pressed);
+                        // send button press/release to PC
+                        final bit = element.buttonId;
+                        bleManager.updateAndSendButton(bit, pressed);
                       },
                     );
                   } else if (element.type == ControllerElementType.joystick) {
@@ -326,7 +307,7 @@ class _ControllerAppState extends State<ControllerApp> {
                       element: element,
                       deadzone: 0.20,
                       onChange: (id, x, y) {
-                        bleManager.movementInput(InputState(joyLX: x, joyLY: y));
+                        bleManager.updateAndSendJoystick(id, x, y);
                       },
                     );
                   }

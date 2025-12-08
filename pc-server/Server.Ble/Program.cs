@@ -17,7 +17,7 @@ namespace BleServer
         public float JoyLY { get; set; } = 0f;
         public float JoyRX { get; set; } = 0f;
         public float JoyRY { get; set; } = 0f;
-        public int Buttons { get; set; } = 0;
+        public uint Buttons { get; set; } = 0;
         public float GyroX { get; set; } = 0f;
         public float GyroY { get; set; } = 0f;
         public float GyroZ { get; set; } = 0f;
@@ -31,11 +31,13 @@ namespace BleServer
         private static DateTime lastPingTime = DateTime.Now;
         private static System.Timers.Timer? disconnectTimer = null;
         private static bool disconnect = false;
+        private static InputState lastLoggedInput = new InputState();
         private static InputState currentInput = new InputState();
         private static readonly object inputLock = new object(); // thread-safe
         private static readonly Guid serviceUuid = Guid.Parse("12345678-1234-5678-1234-56789abcdef0");
-        private static readonly Guid writeUuid   = Guid.Parse("12345678-1234-5678-1234-56789abcdef1");   // Phone → PC
-        private static readonly Guid notifyUuid  = Guid.Parse("12345678-1234-5678-1234-56789abcdef2");   // PC → Phone
+        private static readonly Guid notifyUuid  = Guid.Parse("12345678-1234-5678-1234-56789abcdef2"); // PC → Phone
+        private static readonly Guid pingUuid    = Guid.Parse("12345678-1234-5678-1234-56789abcdef1"); // Phone → PC (WithResponse)
+        private static readonly Guid inputUuid   = Guid.Parse("12345678-1234-5678-1234-56789abcdef3"); // Phone → PC (WithoutResponse)
 
         static async Task Main(string[] args)
         {
@@ -48,7 +50,8 @@ namespace BleServer
             }
             var provider = createResult.ServiceProvider;
             GattLocalCharacteristic? notifyChar = null;
-            GattLocalCharacteristic? writeChar = null;
+            GattLocalCharacteristic? inputChar = null;
+            GattLocalCharacteristic? pingChar = null;
 
             // 2. Notify characteristic
             var notifyParams = new GattLocalCharacteristicParameters
@@ -93,135 +96,154 @@ namespace BleServer
                 }
             };
 
-            // 3. Write characteristic (Phone → PC)
-            var writeParams = new GattLocalCharacteristicParameters
+            // 3. INPUT & PING characteristic (Phone → PC)
+            // 3.1 INPUT characteristic – FAST, no response (buttons + joysticks)
+            var inputResult = await provider.Service.CreateCharacteristicAsync(
+                inputUuid,
+                new GattLocalCharacteristicParameters
+                {
+                    CharacteristicProperties = GattCharacteristicProperties.WriteWithoutResponse,
+                    WriteProtectionLevel = GattProtectionLevel.Plain
+                });
+
+            if (inputResult.Characteristic is null)
             {
-                CharacteristicProperties = GattCharacteristicProperties.Write,
-                WriteProtectionLevel = GattProtectionLevel.Plain
-            };
-            var writeResult = await provider.Service.CreateCharacteristicAsync(writeUuid, writeParams);
-            if (writeResult.Characteristic is null)
-            {
-                Console.WriteLine("Failed to create write characteristic.");
+                Console.WriteLine("Failed to create INPUT characteristic!");
                 return;
             }
-            writeChar = writeResult.Characteristic;
+            inputChar = inputResult.Characteristic;
+
+            // 3.2 PING characteristic – reliable, with response (for heartbeat only)
+            var pingResult = await provider.Service.CreateCharacteristicAsync(
+                pingUuid,
+                new GattLocalCharacteristicParameters
+                {
+                    CharacteristicProperties = GattCharacteristicProperties.Write,  // WithResponse!
+                    WriteProtectionLevel = GattProtectionLevel.Plain
+                }
+            );
+            if (pingResult.Characteristic is null)
+            {
+                Console.WriteLine("Failed to create PING characteristic!");
+                return;
+            }
+            pingChar = pingResult.Characteristic;
+            // SINGLE EVENT HANDLER FOR ALL WRITES
+            pingChar!.WriteRequested += WriteRequestedHandler;
+            inputChar!.WriteRequested += WriteRequestedHandler;
 
             // 4. Handle incoming data
-            writeChar.WriteRequested += async (sender, args) =>
+            async void WriteRequestedHandler(object sender, GattWriteRequestedEventArgs args)
             {
-                var deferral = args.GetDeferral();
+                var deferral = args.GetDeferral();  // Always get deferral
                 try
                 {
-                    var request = await args.GetRequestAsync();
-                    if (request.Value is null) return;
+                    var request = await args.GetRequestAsync();  // This is correct
+                    if (request.Value == null) return;
 
-                    // Convert IBuffer to byte[] (requires the using above)
-                    byte[] data = request.Value.ToArray();
-                    string text = Encoding.UTF8.GetString(data);
+                    byte[] bytes = request.Value.ToArray();
+                    var characteristic = sender as GattLocalCharacteristic;
 
-                    Console.WriteLine($"[PC] ← Received from phone: {text}");
-
-                    if (text == "PING\n")
+                    // Determine which characteristic was written
+                    if (characteristic == pingChar)
                     {
-                        // Reply immediately
-                        lastPingTime = DateTime.Now;
-                        disconnect = false;
-                        using var pongWriter = new DataWriter();
-                        pongWriter.WriteString($"PC_ACK: PONG");
-                        await notifyChar.NotifyValueAsync(pongWriter.DetachBuffer());
-                    } 
-                    else
-                    {
-                        // Check if there are subscribed clients before notifying
-                        if (notifyChar.SubscribedClients.Count == 0)
+                        string text = Encoding.UTF8.GetString(bytes).Trim();
+                        // PING characteristic
+                        if (bytes.Length == 5 && 
+                            bytes[0] == 'P' && bytes[1] == 'I' && 
+                            bytes[2] == 'N' && bytes[3] == 'G' && bytes[4] == 0x0A)
                         {
-                            Console.WriteLine("No clients subscribed to notifications - skipping echo.");
-                            return;
+                            lastPingTime = DateTime.Now;
+                            disconnect = false;
+
+                            var writer = new DataWriter();
+                            writer.WriteString("PONG");
+                            await notifyChar!.NotifyValueAsync(writer.DetachBuffer());
+
+                            request.Respond();  // ACK the write
+                            Console.WriteLine("PING received → PONG sent");
+                        }
+                        if (text == "PAUSE" || text == "RESUME")
+                        {
+                            bool shouldPause = text == "PAUSE";
+                            Console.WriteLine($"COMMAND RECEIVED: {text}");
+
+                            // TODO: Pause/resume your game here!
+                            // Example:
+                            // GameInstance.PauseGame(shouldPause);
+                            // or send to Unity/Unreal: SendMessage("Pause(shouldPause);
+
+                            lastPingTime = DateTime.Now;  // Also acts as heartbeat
+                            request.Respond();  // ACK!
+                        } 
+                    }
+                    else if (characteristic == inputChar)
+                    {
+                        // INPUT characteristic (fast data)
+                        lock (inputLock)
+                        {
+                            if (bytes.Length == 4)
+                                currentInput.Buttons = BitConverter.ToUInt32(bytes, 0);
+                            else if (bytes.Length == 8)
+                            {
+                                currentInput.JoyLX = BitConverter.ToInt16(bytes, 0) / 32767f;
+                                currentInput.JoyLY = BitConverter.ToInt16(bytes, 2) / 32767f;
+                                currentInput.JoyRX = BitConverter.ToInt16(bytes, 4) / 32767f;
+                                currentInput.JoyRY = BitConverter.ToInt16(bytes, 6) / 32767f;
+                            }
+                            else if (bytes.Length == 12)
+                            {
+                                // Parse buttons (bytes 0–3) — little-endian
+                                currentInput.Buttons = BitConverter.ToUInt32(bytes, 0);
+
+                                // Parse joysticks (bytes 4–11) — 4 × Int16, little-endian
+                                currentInput.JoyLX = BitConverter.ToInt16(bytes, 4) / 32767f;
+                                currentInput.JoyLY = BitConverter.ToInt16(bytes, 6) / 32767f;
+                                currentInput.JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f;
+                                currentInput.JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f;
+
+                                // Console.WriteLine($"INPUT 12B | Btn: 0x{currentInput.Buttons:X8} " +
+                                //     $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
+                                //     $"R({currentInput.JoyRX,6:F2},{currentInput.JoyRY,6:F2})");
+                                
+                                var newInput = new InputState
+                                {
+                                    Buttons = BitConverter.ToUInt32(bytes, 0),
+                                    JoyLX   = BitConverter.ToInt16(bytes, 4)  / 32767f,
+                                    JoyLY   = BitConverter.ToInt16(bytes, 6)  / 32767f,
+                                    JoyRX   = BitConverter.ToInt16(bytes, 8)  / 32767f,
+                                    JoyRY   = BitConverter.ToInt16(bytes, 10) / 32767f
+                                };
+                                // Only print if something changed
+                                if (newInput.Buttons != lastLoggedInput.Buttons ||
+                                    Math.Abs(newInput.JoyLX - lastLoggedInput.JoyLX) > 0.01f ||
+                                    Math.Abs(newInput.JoyLY - lastLoggedInput.JoyLY) > 0.01f ||
+                                    Math.Abs(newInput.JoyRX - lastLoggedInput.JoyRX) > 0.01f ||
+                                    Math.Abs(newInput.JoyRY - lastLoggedInput.JoyRY) > 0.01f)
+                                {
+                                    Console.WriteLine($"INPUT CHANGED | Btn: 0x{newInput.Buttons:X8} " +
+                                                    $"L({newInput.JoyLX,6:F2},{newInput.JoyLY,6:F2}) " +
+                                                    $"R({newInput.JoyRX,6:F2},{newInput.JoyRY,6:F2})");
+
+                                    lastLoggedInput = newInput;
+                                }
+                            }
+                            lastPingTime = DateTime.Now;
                         }
 
-                        // Handle joystick / button input (JSON)
-                        if (text.StartsWith("{") && text.EndsWith("}"))
-                        {
-                            try
-                            {
-                                var jsonDoc = System.Text.Json.JsonDocument.Parse(text);
-                                var root = jsonDoc.RootElement;
-
-                                // MUST have "type" field
-                                if (!root.TryGetProperty("type", out var typeProp))
-                                {
-                                    Console.WriteLine($"[PC] Missing 'type' field: {text}");
-                                    return;
-                                }
-
-                                string type = typeProp.GetString()!;
-
-                                lock (inputLock)
-                                {
-                                    switch (type)
-                                    {
-                                        case "joy":
-                                            currentInput.JoyLX = root.GetProperty("lx").GetInt32() / 127f;
-                                            currentInput.JoyLY = root.GetProperty("ly").GetInt32() / 127f;
-                                            currentInput.JoyRX = root.GetProperty("rx").GetInt32() / 127f;
-                                            currentInput.JoyRY = root.GetProperty("ry").GetInt32() / 127f;
-                                            break;
-
-                                        case "btn":
-                                            if (root.TryGetProperty("buttons", out var btn))
-                                                currentInput.Buttons = btn.GetInt32();
-                                            break;
-
-                                        case "gyro":
-                                            if (root.TryGetProperty("x", out var gx)) currentInput.GyroX = gx.GetSingle();
-                                            if (root.TryGetProperty("y", out var gy)) currentInput.GyroY = gy.GetSingle();
-                                            if (root.TryGetProperty("z", out var gz)) currentInput.GyroZ = gz.GetSingle();
-                                            break;
-
-                                        case "full": // optional: all in one packet
-                                            if (root.TryGetProperty("lx", out var lx)) currentInput.JoyLX = lx.GetInt32() / 127f;
-                                            if (root.TryGetProperty("ly", out var ly)) currentInput.JoyLY = ly.GetInt32() / 127f;
-                                            if (root.TryGetProperty("rx", out var rx)) currentInput.JoyRX = rx.GetInt32() / 127f;
-                                            if (root.TryGetProperty("ry", out var ry)) currentInput.JoyRY = ry.GetInt32() / 127f;
-                                            if (root.TryGetProperty("buttons", out var b)) currentInput.Buttons = b.GetInt32();
-                                            if (root.TryGetProperty("gx", out var gx2)) currentInput.GyroX = gx2.GetSingle();
-                                            if (root.TryGetProperty("gy", out var gy2)) currentInput.GyroY = gy2.GetSingle();
-                                            if (root.TryGetProperty("gz", out var gz2)) currentInput.GyroZ = gz2.GetSingle();
-                                            break;
-
-                                        default:
-                                            Console.WriteLine($"[PC] Unknown packet type: {type}");
-                                            break;
-                                    }
-                                }
-
-                                lastPingTime = DateTime.Now; // also acts as "alive" signal
-
-                                // Optional: Print at most 30 times per second to avoid spam
-                                // Console.WriteLine($"[INPUT] {currentInput}");
-                            }
-                            catch (Exception jsonEx)
-                            {
-                                Console.WriteLine($"[PC] JSON parse error: {jsonEx.Message} | Raw: {text}");
-                            }
-                        }
-                        
-                            // Echo back via notify
-                            // using var writer = new DataWriter();
-                            // writer.WriteString($"PC_ACK: {text}");
-                            // await notifyChar.NotifyValueAsync(writer.DetachBuffer());
+                        // NO respond() needed for WriteWithoutResponse
+                        // Just complete the deferral
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error handling write: {ex.Message}");
+                    Console.WriteLine($"Write error: {ex.Message}");
                 }
                 finally
                 {
-                    deferral.Complete();
+                    deferral.Complete();  // Always complete!
                 }
-            };
+            }
 
             // 5. Start advertising
             var advParams = new GattServiceProviderAdvertisingParameters
@@ -239,8 +261,8 @@ namespace BleServer
             {
                 if (!disconnect && notifyChar.SubscribedClients.Count > 0)
                 {
-                    var inp = GetCurrentInput();
-                    Console.WriteLine($"[LIVE] {inp}");
+                    // var inp = GetCurrentInput();
+                    // Console.WriteLine($"[LIVE] {inp}");
                 }
             };
             debugTimer.AutoReset = true;
