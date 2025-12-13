@@ -2,14 +2,17 @@
 import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math'as math;
 import 'bluetooth_connection.dart';
 import 'models/controller_element.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:flutter_rotation_sensor/flutter_rotation_sensor.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:simple_gesture_detector/simple_gesture_detector.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  FlutterBluePlus.setLogLevel(LogLevel.error, color: false);
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
@@ -34,12 +37,37 @@ class _ControllerAppState extends State<ControllerApp> {
   bool isLoading = true;
   bool paused = false;
 
+  StreamSubscription<OrientationEvent>? orientationSubscription;
+  double steeringValue = 0.0; // -1.0 (left) to +1.0 (right)
+  Timer? sendTimer;
+  bool isSteeringActive = true;
+
   // Customizable layout!
   List<ControllerElement> controllerElements = [];
 
   @override
   void initState() {
     super.initState();
+    WakelockPlus.enable();
+    RotationSensor.samplingPeriod = SensorInterval.gameInterval; // ~20ms updates
+    // Remap for landscape if needed (test: if roll signs feel flipped, adjust)
+    RotationSensor.coordinateSystem = CoordinateSystem.transformed(Axis3.X, -Axis3.Z);
+    initializeApp();
+  }
+
+  @override
+  void dispose() {
+    WakelockPlus.disable();
+    orientationSubscription?.cancel();
+    sendTimer?.cancel();
+    bleManager.stopInputSending();
+    bleManager.dispose();
+    super.dispose();
+  }
+
+  Future<void> initializeApp() async {
+    await initPrefs();
+
     // Listen to connection status
     bleManager.statusStream.listen((status) {
       String text = statusToString(status);
@@ -54,17 +82,26 @@ class _ControllerAppState extends State<ControllerApp> {
     bleManager.receivedDataStream.listen((data) {
       String message = utf8.decode(data).trim();
       print("[UI] ← From PC: $message");
+
+      // Handle tilt steering commands
+      if (message == "TILT_ON") {
+        setState(() {
+          isSteeringActive = true;
+          saveTiltSteeringState();
+          startTiltSteering();
+        });
+      } else if (message == "TILT_OFF") {
+        setState(() {
+          isSteeringActive = false;
+          saveTiltSteeringState();
+        });
+      }
     });
+    isSteeringActive = true;
+    saveTiltSteeringState();
+    startTiltSteering();
     // Start Bluetooth connection
     bleManager.startScanningAndConnect();
-    initPrefs();
-  }
-
-  @override
-  void dispose() {
-    bleManager.stopInputSending();
-    bleManager.dispose();
-    super.dispose();
   }
 
   // Helper: Log to console + update UI
@@ -114,8 +151,47 @@ class _ControllerAppState extends State<ControllerApp> {
     }
   }
 
+  void startTiltSteering() {
+    orientationSubscription?.cancel();
+    sendTimer?.cancel();
+
+    orientationSubscription = RotationSensor.orientationStream.listen((OrientationEvent event) {
+      if (paused || !isSteeringActive) return;
+
+      // In landscape: roll = left/right tilt (radians)
+      double roll = event.eulerAngles.roll;       // -π to +π
+
+      if (roll > math.pi)  roll -= 2 * math.pi;
+      if (roll < -math.pi) roll += 2 * math.pi;
+
+      const double maxRoll = 0.75;  // ~70° → tweak this for your preference!
+      double steering = (roll / maxRoll).clamp(-1.0, 1.0);
+
+      // Deadzone
+      if (steering.abs() < 0.08) steering = 0.0;
+
+      if ((steering - steeringValue).abs() > 0.01) {
+        setState(() {
+          steeringValue = steering;
+        });
+      }
+
+      // print("Roll: ${roll.toStringAsFixed(3)} → Steering: ${steering.toStringAsFixed(3)}");
+    });
+
+    // Your existing periodic sender (BLE joystick update)
+    sendTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      if (isSteeringActive && steeringValue.abs() > 0.001) {
+        bleManager.updateSteering(
+          steeringValue,  // left = negative, right = positive
+        );
+      }
+    });
+  }
+
   Future<void> initPrefs() async {
     prefs = await SharedPreferences.getInstance();   // ← initialize here
+    isSteeringActive = prefs.getBool('tilt_steering_enabled') ?? false; // Default to false
     await loadLayout();                              // ← then load saved layout
     setState(() => isLoading = false);
   }
@@ -123,6 +199,10 @@ class _ControllerAppState extends State<ControllerApp> {
   Future<void> saveLayout() async {
     final json = controllerElements.map((e) => e.toJson()).toList();
     await prefs.setString('custom_controller', jsonEncode(json));
+  }
+
+  Future<void> saveTiltSteeringState() async {
+    await prefs.setBool('tilt_steering_enabled', isSteeringActive);
   }
 
   Future<void> loadLayout() async {
@@ -277,7 +357,7 @@ class _ControllerAppState extends State<ControllerApp> {
                     onPressed: (id, pressed) {
                       // send button press/release to PC
                       final bit = element.buttonId;
-                      bleManager.updateAndSendButton(bit, pressed);
+                      bleManager.updateButton(bit, pressed);
                     },
                   );
                 } else if (element.type == ControllerElementType.joystick) {
@@ -285,7 +365,7 @@ class _ControllerAppState extends State<ControllerApp> {
                     element: element,
                     deadzone: 0.20,
                     onChange: (id, x, y) {
-                      bleManager.updateAndSendJoystick(id, x, y);
+                      bleManager.updateJoystick(id, x, y);
                     },
                   );
                 }
@@ -299,7 +379,7 @@ class _ControllerAppState extends State<ControllerApp> {
                       onPressed: (id, pressed) {
                         // send button press/release to PC
                         final bit = element.buttonId;
-                        bleManager.updateAndSendButton(bit, pressed);
+                        bleManager.updateButton(bit, pressed);
                       },
                     );
                   } else if (element.type == ControllerElementType.joystick) {
@@ -307,7 +387,7 @@ class _ControllerAppState extends State<ControllerApp> {
                       element: element,
                       deadzone: 0.20,
                       onChange: (id, x, y) {
-                        bleManager.updateAndSendJoystick(id, x, y);
+                        bleManager.updateJoystick(id, x, y);
                       },
                     );
                   }

@@ -3,7 +3,6 @@ import 'models/controller_element.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-import 'dart:math' show pi;
 
 class BleUuids {
   static const String service     = "12345678-1234-5678-1234-56789abcdef0";
@@ -26,7 +25,6 @@ class BleManager {
   BluetoothCharacteristic? pingCharacteristic;   // For PING (WithResponse)
   BluetoothCharacteristic? inputCharacteristic;  // For fast input (WithoutResponse)
 
-  Timer? _scanTimer;
   Timer? _heartbeatTimer;
   Timer? _disconnectWatcher;
   Timer? _inputTimer;
@@ -46,6 +44,7 @@ class BleManager {
 
   int currentButtons = 0;           // Live button state
   InputState currentJoy = InputState();  // Live joystick state
+  double currentSteering = 0.0;  // -1.0 to +1.0
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
@@ -237,7 +236,7 @@ class BleManager {
     }
   }
 
-  void updateAndSendButton(int buttonBit, bool pressed) {
+  void updateButton(int buttonBit, bool pressed) {
     if (pressed) {
       currentButtons |= buttonBit;
     } else {
@@ -260,7 +259,7 @@ class BleManager {
     // print("→ Buttons: 0x${currentButtons.toRadixString(16)}");
   }
 
-  void updateAndSendJoystick(ControllerId id, double x, double y) {
+  void updateJoystick(ControllerId id, double x, double y) {
     final bool isLeft = id == ControllerId.leftJoystick;
     if (isLeft) {
       currentJoy = currentJoy.copyWith(joyLX: x, joyLY: y);
@@ -285,10 +284,14 @@ class BleManager {
     // print("→ Joy L(${currentJoy.joyLX.toStringAsFixed(2)}, ${currentJoy.joyLY.toStringAsFixed(2)})");
   }
 
+  void updateSteering(double steering) {
+    currentSteering = steering;
+  }
+
   void sendCombinedInputPacket() {
     if (inputCharacteristic == null) return;
 
-    final packet = Uint8List(12);
+    final packet = Uint8List(14);
     final bd = packet.buffer.asByteData();
 
     // Bytes 0–3: Buttons (32 little-endian
@@ -300,8 +303,11 @@ class BleManager {
     bd.setInt16(8, (currentJoy.joyRX * 32767).round(), Endian.little);
     bd.setInt16(10, (currentJoy.joyRY * 32767).round(), Endian.little);
 
-    // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
+    // Bytes 12–13: Steering (Int16)
+    bd.setInt16(12, (currentSteering * 32767).round(), Endian.little);
 
+    // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
+    print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
     // Fast path: no response
     inputCharacteristic!.write(packet, withoutResponse: true);
 

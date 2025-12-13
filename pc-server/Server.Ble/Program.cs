@@ -18,12 +18,10 @@ namespace BleServer
         public float JoyRX { get; set; } = 0f;
         public float JoyRY { get; set; } = 0f;
         public uint Buttons { get; set; } = 0;
-        public float GyroX { get; set; } = 0f;
-        public float GyroY { get; set; } = 0f;
-        public float GyroZ { get; set; } = 0f;
+        public float Steering;
 
         public override string ToString()
-            => $"LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4} GYRO:[{GyroX,6:F1},{GyroY,6:F1},{GyroZ,6:F1}]";
+            => $"LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4} GYRO:[{Steering,6:F1}]";
     }
 
     class Program
@@ -191,7 +189,7 @@ namespace BleServer
                                 currentInput.JoyRX = BitConverter.ToInt16(bytes, 4) / 32767f;
                                 currentInput.JoyRY = BitConverter.ToInt16(bytes, 6) / 32767f;
                             }
-                            else if (bytes.Length == 12)
+                            else if (bytes.Length >= 12)
                             {
                                 // Parse buttons (bytes 0–3) — little-endian
                                 currentInput.Buttons = BitConverter.ToUInt32(bytes, 0);
@@ -201,6 +199,15 @@ namespace BleServer
                                 currentInput.JoyLY = BitConverter.ToInt16(bytes, 6) / 32767f;
                                 currentInput.JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f;
                                 currentInput.JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f;
+
+                                if (bytes.Length >= 14)
+                                {
+                                    currentInput.Steering = BitConverter.ToInt16(bytes, 12) / 32767f;
+                                }
+                                else
+                                {
+                                    currentInput.Steering = 0f;  // No steering data → neutral
+                                }
 
                                 // Console.WriteLine($"INPUT 12B | Btn: 0x{currentInput.Buttons:X8} " +
                                 //     $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
@@ -212,18 +219,21 @@ namespace BleServer
                                     JoyLX   = BitConverter.ToInt16(bytes, 4)  / 32767f,
                                     JoyLY   = BitConverter.ToInt16(bytes, 6)  / 32767f,
                                     JoyRX   = BitConverter.ToInt16(bytes, 8)  / 32767f,
-                                    JoyRY   = BitConverter.ToInt16(bytes, 10) / 32767f
+                                    JoyRY   = BitConverter.ToInt16(bytes, 10) / 32767f,
+                                    Steering = currentInput.Steering
                                 };
                                 // Only print if something changed
                                 if (newInput.Buttons != lastLoggedInput.Buttons ||
                                     Math.Abs(newInput.JoyLX - lastLoggedInput.JoyLX) > 0.01f ||
                                     Math.Abs(newInput.JoyLY - lastLoggedInput.JoyLY) > 0.01f ||
                                     Math.Abs(newInput.JoyRX - lastLoggedInput.JoyRX) > 0.01f ||
-                                    Math.Abs(newInput.JoyRY - lastLoggedInput.JoyRY) > 0.01f)
+                                    Math.Abs(newInput.JoyRY - lastLoggedInput.JoyRY) > 0.01f ||
+                                    Math.Abs(newInput.Steering - lastLoggedInput.Steering) > 0.01f)
                                 {
                                     Console.WriteLine($"INPUT CHANGED | Btn: 0x{newInput.Buttons:X8} " +
                                                     $"L({newInput.JoyLX,6:F2},{newInput.JoyLY,6:F2}) " +
-                                                    $"R({newInput.JoyRX,6:F2},{newInput.JoyRY,6:F2})");
+                                                    $"R({newInput.JoyRX,6:F2},{newInput.JoyRY,6:F2})" +
+                                                    $"Steering: {newInput.Steering,6:F2}");
 
                                     lastLoggedInput = newInput;
                                 }
@@ -286,9 +296,7 @@ namespace BleServer
                     JoyRX = currentInput.JoyRX,
                     JoyRY = currentInput.JoyRY,
                     Buttons = currentInput.Buttons,
-                    GyroX = currentInput.GyroX,
-                    GyroY = currentInput.GyroY,
-                    GyroZ = currentInput.GyroZ
+                    Steering = currentInput.Steering
                 };
             }
         }
