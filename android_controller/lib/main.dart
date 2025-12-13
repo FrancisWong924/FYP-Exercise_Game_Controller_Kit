@@ -88,6 +88,43 @@ class _ControllerAppState extends State<ControllerApp> {
         _status = text;
       });
       print("[UI] Status: $text");
+
+      // React to disconnection
+      if (status == BleConnectionStatus.disconnected ||
+          status == BleConnectionStatus.failed ||
+          status == BleConnectionStatus.bluetoothOff) {
+        
+        // Stop tilt steering
+        if (isSteeringActive) {
+          orientationSubscription?.cancel();
+          sendTimer?.cancel();
+          setState(() {
+            steeringValue = 0.0;
+          });
+        }
+
+        // Stop step detection
+        if (isSteppingActive) {
+          accelSubscription?.cancel();
+          stepTimer?.cancel();
+          setState(() {
+            isWalking = false;
+          });
+          // Send neutral joystick to avoid "stuck forward"
+          bleManager.updateJoystick(ControllerId.leftJoystick, 0.0, 0.0);
+        }
+      }
+
+      // When reconnecting and previously enabled, restart sensors
+      if (status == BleConnectionStatus.connected) {
+        // Restart features if they were enabled before disconnect
+        if (isSteeringActive) {
+          startTiltSteering();
+        }
+        if (isSteppingActive) {
+          startWalkingDetection();
+        }
+      }
     });
 
     // Listen to incoming data
