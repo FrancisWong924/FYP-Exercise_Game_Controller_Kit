@@ -6,7 +6,8 @@ import 'dart:math'as math;
 import 'bluetooth_connection.dart';
 import 'models/controller_element.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:flutter_rotation_sensor/flutter_rotation_sensor.dart';
+import 'package:sensors_plus/sensors_plus.dart' as sensors_plus;
+import 'package:flutter_rotation_sensor/flutter_rotation_sensor.dart' as rotation_sensor;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -37,10 +38,18 @@ class _ControllerAppState extends State<ControllerApp> {
   bool isLoading = true;
   bool paused = false;
 
-  StreamSubscription<OrientationEvent>? orientationSubscription;
+  StreamSubscription<rotation_sensor.OrientationEvent>? orientationSubscription;
   double steeringValue = 0.0; // -1.0 (left) to +1.0 (right)
   Timer? sendTimer;
-  bool isSteeringActive = true;
+  bool isSteeringActive = false;
+
+  StreamSubscription<sensors_plus.AccelerometerEvent>? accelSubscription;
+  double accelZ = 0.0;  // Current Z-axis accel
+  double stepThreshold = 1.5;  // Tune this: higher = needs stronger shake/step
+  double lastAccelZ = 0.0;
+  bool isSteppingActive = false;  // True if currently detecting steps
+  bool isWalking = false;  // True if forward motion detected
+  Timer? stepTimer;  // Debounce steps
 
   // Customizable layout!
   List<ControllerElement> controllerElements = [];
@@ -49,9 +58,9 @@ class _ControllerAppState extends State<ControllerApp> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
-    RotationSensor.samplingPeriod = SensorInterval.gameInterval; // ~20ms updates
+    rotation_sensor.RotationSensor.samplingPeriod = rotation_sensor.SensorInterval.gameInterval; // ~20ms updates
     // Remap for landscape if needed (test: if roll signs feel flipped, adjust)
-    RotationSensor.coordinateSystem = CoordinateSystem.transformed(Axis3.X, -Axis3.Z);
+    rotation_sensor.RotationSensor.coordinateSystem = rotation_sensor.CoordinateSystem.transformed(rotation_sensor.Axis3.X, -rotation_sensor.Axis3.Z);
     initializeApp();
   }
 
@@ -59,7 +68,9 @@ class _ControllerAppState extends State<ControllerApp> {
   void dispose() {
     WakelockPlus.disable();
     orientationSubscription?.cancel();
+    accelSubscription?.cancel();
     sendTimer?.cancel();
+    stepTimer?.cancel();
     bleManager.stopInputSending();
     bleManager.dispose();
     super.dispose();
@@ -96,10 +107,21 @@ class _ControllerAppState extends State<ControllerApp> {
           saveTiltSteeringState();
         });
       }
+
+      // Handle step detection
+      if (message == "STEP_ON") {
+        setState(() {
+          isSteppingActive = true;
+          saveStepState();
+          startWalkingDetection();
+        });
+      } else if (message == "STEP_OFF") {
+        setState(() {
+          isSteppingActive = false;
+          saveStepState();
+        });
+      }
     });
-    isSteeringActive = true;
-    saveTiltSteeringState();
-    startTiltSteering();
     // Start Bluetooth connection
     bleManager.startScanningAndConnect();
   }
@@ -155,7 +177,7 @@ class _ControllerAppState extends State<ControllerApp> {
     orientationSubscription?.cancel();
     sendTimer?.cancel();
 
-    orientationSubscription = RotationSensor.orientationStream.listen((OrientationEvent event) {
+    orientationSubscription = rotation_sensor.RotationSensor.orientationStream.listen((rotation_sensor.OrientationEvent event) {
       if (paused || !isSteeringActive) return;
 
       // In landscape: roll = left/right tilt (radians)
@@ -179,7 +201,7 @@ class _ControllerAppState extends State<ControllerApp> {
       // print("Roll: ${roll.toStringAsFixed(3)} → Steering: ${steering.toStringAsFixed(3)}");
     });
 
-    // Your existing periodic sender (BLE joystick update)
+    // Your existing periodic sender (BLE steering update)
     sendTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
       if (isSteeringActive && steeringValue.abs() > 0.001) {
         bleManager.updateSteering(
@@ -189,9 +211,45 @@ class _ControllerAppState extends State<ControllerApp> {
     });
   }
 
+  void startWalkingDetection() {
+    accelSubscription?.cancel();
+
+    // Smoothed values to reduce noise
+    double smoothedZ = 0.0;
+
+    accelSubscription = sensors_plus.accelerometerEventStream(samplingPeriod: sensors_plus.SensorInterval.gameInterval)
+        .listen((sensors_plus.AccelerometerEvent event) {
+      if (paused || !isSteppingActive) return;  // Reuse your pause logic
+
+      accelZ = event.z;  // Z-axis: up/down (gravity ≈9.8 when flat)
+      smoothedZ = 0.8 * smoothedZ + 0.2 * accelZ;  // Adjust 0.2 for more/less smoothing
+      // Simple step detection: detect peaks in Z (up/down bounce)
+      double deltaZ = (smoothedZ - lastAccelZ).abs();
+      lastAccelZ = smoothedZ;
+
+      if (deltaZ > stepThreshold) {
+        // Detected a "step" → set forward
+        isWalking = true;
+        stepTimer?.cancel();
+        stepTimer = Timer(const Duration(milliseconds: 300), () {  // Debounce
+          isWalking = false;
+        });
+      }
+
+      if (isWalking) {
+        bleManager.updateJoystick(ControllerId.leftJoystick, 0.0, -1.0);  // Forward on left Y
+      } else {
+        bleManager.updateJoystick(ControllerId.leftJoystick, 0.0, 0.0);  // Neutral
+      }
+
+      // print("Accel Z: ${accelZ.toStringAsFixed(3)} → Smoothed: ${smoothedZ.toStringAsFixed(3)} → Delta: ${deltaZ.toStringAsFixed(3)} → Walking: $isWalking");
+    });
+  }
+
   Future<void> initPrefs() async {
     prefs = await SharedPreferences.getInstance();   // ← initialize here
     isSteeringActive = prefs.getBool('tilt_steering_enabled') ?? false; // Default to false
+    isSteppingActive = prefs.getBool('step_detection_enabled') ?? false; // Default to true
     await loadLayout();                              // ← then load saved layout
     setState(() => isLoading = false);
   }
@@ -203,6 +261,10 @@ class _ControllerAppState extends State<ControllerApp> {
 
   Future<void> saveTiltSteeringState() async {
     await prefs.setBool('tilt_steering_enabled', isSteeringActive);
+  }
+
+  Future<void> saveStepState() async {
+    await prefs.setBool('step_detection_enabled', isSteppingActive);
   }
 
   Future<void> loadLayout() async {

@@ -213,30 +213,30 @@ namespace BleServer
                                 //     $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
                                 //     $"R({currentInput.JoyRX,6:F2},{currentInput.JoyRY,6:F2})");
                                 
-                                var newInput = new InputState
-                                {
-                                    Buttons = BitConverter.ToUInt32(bytes, 0),
-                                    JoyLX   = BitConverter.ToInt16(bytes, 4)  / 32767f,
-                                    JoyLY   = BitConverter.ToInt16(bytes, 6)  / 32767f,
-                                    JoyRX   = BitConverter.ToInt16(bytes, 8)  / 32767f,
-                                    JoyRY   = BitConverter.ToInt16(bytes, 10) / 32767f,
-                                    Steering = currentInput.Steering
-                                };
-                                // Only print if something changed
-                                if (newInput.Buttons != lastLoggedInput.Buttons ||
-                                    Math.Abs(newInput.JoyLX - lastLoggedInput.JoyLX) > 0.01f ||
-                                    Math.Abs(newInput.JoyLY - lastLoggedInput.JoyLY) > 0.01f ||
-                                    Math.Abs(newInput.JoyRX - lastLoggedInput.JoyRX) > 0.01f ||
-                                    Math.Abs(newInput.JoyRY - lastLoggedInput.JoyRY) > 0.01f ||
-                                    Math.Abs(newInput.Steering - lastLoggedInput.Steering) > 0.01f)
-                                {
-                                    Console.WriteLine($"INPUT CHANGED | Btn: 0x{newInput.Buttons:X8} " +
-                                                    $"L({newInput.JoyLX,6:F2},{newInput.JoyLY,6:F2}) " +
-                                                    $"R({newInput.JoyRX,6:F2},{newInput.JoyRY,6:F2})" +
-                                                    $"Steering: {newInput.Steering,6:F2}");
+                                // var newInput = new InputState
+                                // {
+                                //     Buttons = BitConverter.ToUInt32(bytes, 0),
+                                //     JoyLX   = BitConverter.ToInt16(bytes, 4)  / 32767f,
+                                //     JoyLY   = BitConverter.ToInt16(bytes, 6)  / 32767f,
+                                //     JoyRX   = BitConverter.ToInt16(bytes, 8)  / 32767f,
+                                //     JoyRY   = BitConverter.ToInt16(bytes, 10) / 32767f,
+                                //     Steering = currentInput.Steering
+                                // };
+                                // // Only print if something changed
+                                // if (newInput.Buttons != lastLoggedInput.Buttons ||
+                                //     Math.Abs(newInput.JoyLX - lastLoggedInput.JoyLX) > 0.01f ||
+                                //     Math.Abs(newInput.JoyLY - lastLoggedInput.JoyLY) > 0.01f ||
+                                //     Math.Abs(newInput.JoyRX - lastLoggedInput.JoyRX) > 0.01f ||
+                                //     Math.Abs(newInput.JoyRY - lastLoggedInput.JoyRY) > 0.01f ||
+                                //     Math.Abs(newInput.Steering - lastLoggedInput.Steering) > 0.01f)
+                                // {
+                                //     Console.WriteLine($"INPUT CHANGED | Btn: 0x{newInput.Buttons:X8} " +
+                                //                     $"L({newInput.JoyLX,6:F2},{newInput.JoyLY,6:F2}) " +
+                                //                     $"R({newInput.JoyRX,6:F2},{newInput.JoyRY,6:F2})" +
+                                //                     $"Steering: {newInput.Steering,6:F2}");
 
-                                    lastLoggedInput = newInput;
-                                }
+                                //     lastLoggedInput = newInput;
+                                // }
                             }
                             lastPingTime = DateTime.Now;
                         }

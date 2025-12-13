@@ -307,12 +307,9 @@ class BleManager {
     bd.setInt16(12, (currentSteering * 32767).round(), Endian.little);
 
     // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
-    print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
+    // print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
     // Fast path: no response
     inputCharacteristic!.write(packet, withoutResponse: true);
-
-    // Optional debug (remove in release)
-    // print("→ Input packet sent (${packet.length} bytes)");
   }
 
   void startInputSending() {
