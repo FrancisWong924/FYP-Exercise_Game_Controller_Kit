@@ -10,6 +10,7 @@ import 'package:sensors_plus/sensors_plus.dart' as sensors_plus;
 import 'package:flutter_rotation_sensor/flutter_rotation_sensor.dart' as rotation_sensor;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vibration/vibration.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -120,6 +121,11 @@ class _ControllerAppState extends State<ControllerApp> {
           isSteppingActive = false;
           saveStepState();
         });
+      }
+
+      // NEW: Handle vibration command
+      if (message == "VIBRATE") {
+        triggerVibration();
       }
     });
     // Start Bluetooth connection
@@ -244,6 +250,19 @@ class _ControllerAppState extends State<ControllerApp> {
 
       // print("Accel Z: ${accelZ.toStringAsFixed(3)} → Smoothed: ${smoothedZ.toStringAsFixed(3)} → Delta: ${deltaZ.toStringAsFixed(3)} → Walking: $isWalking");
     });
+  }
+
+  // NEW: Vibration function
+  Future<void> triggerVibration() async {
+    // Check if device supports vibration
+    bool? hasVibrator = await Vibration.hasVibrator();
+    if (hasVibrator != true) {
+      print("[VIBRATION] Device does not support vibration");
+      return;
+    }
+
+    // Simple single buzz (500ms)
+    Vibration.vibrate(duration: 500);
   }
 
   Future<void> initPrefs() async {
