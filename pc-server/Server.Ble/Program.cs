@@ -63,7 +63,7 @@ namespace BleServer
                 return;
             }
             notifyChar = notifyResult.Characteristic;
-            notifyChar.SubscribedClientsChanged += (sender, args) =>
+            notifyChar.SubscribedClientsChanged += async (sender, args) =>
             {
                 int count = notifyChar.SubscribedClients.Count;
                 Console.WriteLine($"[PC] Subscribed clients: {count}");
@@ -71,6 +71,7 @@ namespace BleServer
                 if (count > 0)
                 {
                     Console.WriteLine("Phone connected and subscribed!");
+                    await SendCommand("VIBRATE");
                     lastPingTime = DateTime.Now;
                     disconnect = false;
                     if (disconnectTimer == null)
@@ -240,9 +241,6 @@ namespace BleServer
                             }
                             lastPingTime = DateTime.Now;
                         }
-
-                        // NO respond() needed for WriteWithoutResponse
-                        // Just complete the deferral
                     }
                 }
                 catch (Exception ex)
@@ -252,6 +250,33 @@ namespace BleServer
                 finally
                 {
                     deferral.Complete();  // Always complete!
+                }
+            }
+
+            async Task SendCommand(string command)
+            {
+                if (notifyChar == null)
+                {
+                    Console.WriteLine($"[PC] Cannot send '{command}' — notify characteristic not ready");
+                    return;
+                }
+
+                if (notifyChar.SubscribedClients.Count == 0)
+                {
+                    Console.WriteLine($"[PC] Cannot send '{command}' — no phone subscribed (not connected)");
+                    return;
+                }
+
+                try
+                {
+                    var writer = new DataWriter();
+                    writer.WriteString(command + "\n");  // Match your phone's utf8.decode().trim()
+                    await notifyChar.NotifyValueAsync(writer.DetachBuffer());
+                    Console.WriteLine($"[PC] → Sent command: {command}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[PC] Failed to send '{command}': {ex.Message}");
                 }
             }
 
