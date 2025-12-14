@@ -136,13 +136,11 @@ class _ControllerAppState extends State<ControllerApp> {
       if (message == "TILT_ON") {
         setState(() {
           isSteeringActive = true;
-          saveTiltSteeringState();
           startTiltSteering();
         });
       } else if (message == "TILT_OFF") {
         setState(() {
           isSteeringActive = false;
-          saveTiltSteeringState();
         });
       }
 
@@ -150,13 +148,11 @@ class _ControllerAppState extends State<ControllerApp> {
       if (message == "STEP_ON") {
         setState(() {
           isSteppingActive = true;
-          saveStepState();
           startWalkingDetection();
         });
       } else if (message == "STEP_OFF") {
         setState(() {
           isSteppingActive = false;
-          saveStepState();
         });
       }
 
@@ -304,8 +300,6 @@ class _ControllerAppState extends State<ControllerApp> {
 
   Future<void> initPrefs() async {
     prefs = await SharedPreferences.getInstance();   // ← initialize here
-    isSteeringActive = prefs.getBool('tilt_steering_enabled') ?? false; // Default to false
-    isSteppingActive = prefs.getBool('step_detection_enabled') ?? false; // Default to true
     await loadLayout();                              // ← then load saved layout
     setState(() => isLoading = false);
   }
@@ -313,14 +307,6 @@ class _ControllerAppState extends State<ControllerApp> {
   Future<void> saveLayout() async {
     final json = controllerElements.map((e) => e.toJson()).toList();
     await prefs.setString('custom_controller', jsonEncode(json));
-  }
-
-  Future<void> saveTiltSteeringState() async {
-    await prefs.setBool('tilt_steering_enabled', isSteeringActive);
-  }
-
-  Future<void> saveStepState() async {
-    await prefs.setBool('step_detection_enabled', isSteppingActive);
   }
 
   Future<void> loadLayout() async {

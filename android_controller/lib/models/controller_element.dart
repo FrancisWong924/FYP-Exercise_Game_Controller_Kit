@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'package:flutter_svg/flutter_svg.dart';
 
 enum ControllerId {
@@ -205,11 +206,18 @@ class _CustomJoystickState extends State<CustomJoystick> {
   Offset delta = Offset.zero;
   late double maxRadius;
   Offset? dragStartCenter;
+  Timer? _joystickTimer;
 
   @override
   void initState() {
     super.initState();
     maxRadius = widget.element.size;
+  }
+
+  @override
+  void dispose() {
+    _joystickTimer?.cancel();
+    super.dispose();
   }
 
   double _applyDeadzone(double value, [double deadzone = 0.15]) {
@@ -220,6 +228,8 @@ class _CustomJoystickState extends State<CustomJoystick> {
   void _onPanStart(DragStartDetails details) {
     final box = context.findRenderObject() as RenderBox;
     dragStartCenter = box.globalToLocal(details.globalPosition);
+    delta = Offset.zero;  // Reset delta on start
+    _startContinuousSending();
   }
 
   void _onPanUpdate(DragUpdateDetails details) {
@@ -231,20 +241,31 @@ class _CustomJoystickState extends State<CustomJoystick> {
     final dist = delta.distance;
     if (dist > maxRadius) delta = delta * (maxRadius / dist);
 
-    final rawX = delta.dx / maxRadius;
-    final rawY = delta.dy / maxRadius;
-    final x = _applyDeadzone(rawX, widget.deadzone);
-    final y = _applyDeadzone(rawY, widget.deadzone);
-
-    widget.onChange(widget.element.id, x, y);
+    _sendUpdate();
     setState(() {});
   }
 
   void _onPanEnd(DragEndDetails _) {
+    _joystickTimer?.cancel();
     delta = Offset.zero;
     widget.onChange(widget.element.id, 0, 0);
     dragStartCenter = null;
     setState(() {});
+  }
+
+  void _startContinuousSending() {
+    _joystickTimer?.cancel();
+    _joystickTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      _sendUpdate();
+    });
+  }
+
+  void _sendUpdate() {
+    final rawX = delta.dx / maxRadius;
+    final rawY = delta.dy / maxRadius;
+    final x = _applyDeadzone(rawX, widget.deadzone);
+    final y = _applyDeadzone(rawY, widget.deadzone);
+    widget.onChange(widget.element.id, x, y);
   }
 
   @override

@@ -46,6 +46,8 @@ class BleManager {
   InputState currentJoy = InputState();  // Live joystick state
   double currentSteering = 0.0;  // -1.0 to +1.0
 
+  Uint8List? _lastSentPacket;
+
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
     _lastPongTime = DateTime.now();
@@ -308,8 +310,27 @@ class BleManager {
 
     // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
     // print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
+    _lastSentPacket = Uint8List.fromList(packet);
+    bool isNeutral = currentButtons == 0 &&
+      currentJoy.joyLX.abs() < 0.001 &&
+      currentJoy.joyLY.abs() < 0.001 &&
+      currentJoy.joyRX.abs() < 0.001 &&
+      currentJoy.joyRY.abs() < 0.001 &&
+      currentSteering.abs() < 0.001;
+      
+    if (isNeutral && _arePacketsEqual(_lastSentPacket!, packet)) {
+      return;
+    }
     // Fast path: no response
     inputCharacteristic!.write(packet, withoutResponse: true);
+  }
+
+  bool _arePacketsEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   void startInputSending() {

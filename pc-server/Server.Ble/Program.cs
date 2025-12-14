@@ -8,6 +8,8 @@ using System.Text;
 using System.Text.Json;
 using System.Timers;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Net;
+using System.Net.Sockets;
 
 namespace BleServer
 {
@@ -18,7 +20,7 @@ namespace BleServer
         public float JoyRX { get; set; } = 0f;
         public float JoyRY { get; set; } = 0f;
         public uint Buttons { get; set; } = 0;
-        public float Steering;
+        public float Steering { get; set; } = 0f;
 
         public override string ToString()
             => $"LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4} GYRO:[{Steering,6:F1}]";
@@ -36,6 +38,9 @@ namespace BleServer
         private static readonly Guid notifyUuid  = Guid.Parse("12345678-1234-5678-1234-56789abcdef2"); // PC → Phone
         private static readonly Guid pingUuid    = Guid.Parse("12345678-1234-5678-1234-56789abcdef1"); // Phone → PC (WithResponse)
         private static readonly Guid inputUuid   = Guid.Parse("12345678-1234-5678-1234-56789abcdef3"); // Phone → PC (WithoutResponse)
+        private static TcpListener? _tcpListener;
+        private static readonly List<TcpClient> _connectedClients = new();
+        private static readonly object _clientsLock = new();
 
         static async Task Main(string[] args)
         {
@@ -179,6 +184,8 @@ namespace BleServer
                     else if (characteristic == inputChar)
                     {
                         // INPUT characteristic (fast data)
+                        InputState localInput;  // Capture a snapshot to broadcast safely
+
                         lock (inputLock)
                         {
                             if (bytes.Length == 4)
@@ -210,9 +217,10 @@ namespace BleServer
                                     currentInput.Steering = 0f;  // No steering data → neutral
                                 }
 
-                                // Console.WriteLine($"INPUT 12B | Btn: 0x{currentInput.Buttons:X8} " +
-                                //     $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
-                                //     $"R({currentInput.JoyRX,6:F2},{currentInput.JoyRY,6:F2})");
+                                Console.WriteLine($"INPUT 12B | Btn: 0x{currentInput.Buttons:X8} " +
+                                    $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
+                                    $"R({currentInput.JoyRX,6:F2},{currentInput.JoyRY,6:F2})" +
+                                    $" Steering: {currentInput.Steering,6:F2}");
                                 
                                 // var newInput = new InputState
                                 // {
@@ -239,8 +247,14 @@ namespace BleServer
                                 //     lastLoggedInput = newInput;
                                 // }
                             }
+
                             lastPingTime = DateTime.Now;
+
+                            // Capture a safe copy for broadcasting (outside lock)
+                            localInput = GetCurrentInput();
                         }
+
+                        await BroadcastInputAsync(localInput);
                     }
                 }
                 catch (Exception ex)
@@ -280,6 +294,46 @@ namespace BleServer
                 }
             }
 
+            // Helper to broadcast input to all games
+            async Task BroadcastInputAsync(InputState input)
+            {
+                string json = JsonSerializer.Serialize(input) + "\n";
+                byte[] data = Encoding.UTF8.GetBytes(json);
+
+                var writeTasks = new List<ValueTask>();
+                var disconnected = new List<TcpClient>();
+
+                lock (_clientsLock)
+                {
+                    foreach (var client in _connectedClients)
+                    {
+                        try
+                        {
+                            NetworkStream stream = client.GetStream();
+                            if (stream.CanWrite)
+                            {
+                                writeTasks.Add(stream.WriteAsync(data));
+                            }
+                        }
+                        catch
+                        {
+                            disconnected.Add(client);
+                        }
+                    }
+
+                    foreach (var dead in disconnected)
+                    {
+                        _connectedClients.Remove(dead);
+                        dead.Close();
+                    }
+                }
+
+                if (writeTasks.Count > 0)
+                {
+                    await Task.WhenAll(writeTasks.Select(vt => vt.AsTask()));
+                }
+            }
+
             // 5. Start advertising
             var advParams = new GattServiceProviderAdvertisingParameters
             {
@@ -290,6 +344,54 @@ namespace BleServer
 
             Console.WriteLine("✅ PC BLE GATT Server is advertising!");
             Console.WriteLine("Open your Flutter app, scan, and connect now.");
+
+            _tcpListener = new TcpListener(IPAddress.Loopback, 38420);
+            _tcpListener.Start();
+            Console.WriteLine("[TCP] Listening on 127.0.0.1:38420 for game connections");
+
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    try
+                    {
+                        TcpClient client = await _tcpListener.AcceptTcpClientAsync();
+                        lock (_clientsLock)
+                        {
+                            _connectedClients.Add(client);
+                        }
+                        Console.WriteLine($"[TCP] Game client connected ({_connectedClients.Count} total)");
+
+                        // Handle client disconnect
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                // Wait until the client socket is closed/disconnected
+                                var buffer = new byte[1];
+                                #pragma warning disable CA2022 // Intentional use of ReadAsync with count=0 to detect disconnect
+                                await client.GetStream().ReadAsync(buffer, 0, 0);
+                                #pragma warning restore CA2022
+                            }
+                            catch { } // Client disconnected
+                            finally
+                            {
+                                lock (_clientsLock)
+                                {
+                                    _connectedClients.Remove(client);
+                                    client.Close();
+                                }
+                                Console.WriteLine($"[TCP] Game client disconnected ({_connectedClients.Count} left)");
+                            }
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[TCP] Accept error: {ex.Message}");
+                    }
+                }
+            });
+
             // Debug timer
             var debugTimer = new System.Timers.Timer(33);
             debugTimer.Elapsed += (s, e) =>
