@@ -4,12 +4,18 @@ using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Storage.Streams;
 using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
 using System.Text;
 using System.Text.Json;
 using System.Timers;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Net;
 using System.Net.Sockets;
+using WebSocketSharp;
+using WebSocketSharp.Server;
+using WebSocketSharp.Net;
 
 namespace BleServer
 {
@@ -20,6 +26,7 @@ namespace BleServer
         public float JoyRX { get; set; } = 0f;
         public float JoyRY { get; set; } = 0f;
         public uint Buttons { get; set; } = 0;
+        public float Stepping { get; set; } = 0f;
         public float Steering { get; set; } = 0f;
 
         public override string ToString()
@@ -31,7 +38,6 @@ namespace BleServer
         private static DateTime lastPingTime = DateTime.Now;
         private static System.Timers.Timer? disconnectTimer = null;
         private static bool disconnect = false;
-        private static InputState lastLoggedInput = new InputState();
         private static InputState currentInput = new InputState();
         private static readonly object inputLock = new object(); // thread-safe
         private static readonly Guid serviceUuid = Guid.Parse("12345678-1234-5678-1234-56789abcdef0");
@@ -41,9 +47,72 @@ namespace BleServer
         private static TcpListener? _tcpListener;
         private static readonly List<TcpClient> _connectedClients = new();
         private static readonly object _clientsLock = new();
+        static WebSocketServer? wsServer;
+        internal static readonly List<WebSocketSharp.WebSocket> wsSessions = new();
+        internal static readonly object _wsLock = new();  // Separate lock for WS
+        private static GattLocalCharacteristic? notifyChar = null;
+        private static GattLocalCharacteristic? inputChar = null;
+        private static GattLocalCharacteristic? pingChar = null;
+        static GattServiceProvider? provider = null;
 
         static async Task Main(string[] args)
         {
+            // KILL OLD GHOSTS
+            var current = Process.GetCurrentProcess();
+            var duplicates = Process.GetProcessesByName(current.ProcessName)
+                                .Where(p => p.Id != current.Id);
+            foreach (var duplicate in duplicates) {
+                try { duplicate.Kill(); } catch { }
+            }
+
+            // Define a cleanup function
+            Action cleanUp = () => {
+                if (provider != null) {
+                    try {
+                        Console.WriteLine("[BLE] Stopping Advertisement...");
+                        provider.StopAdvertising();
+                        provider = null;
+                        Console.WriteLine("[BLE] Cleanup complete.");
+                    } catch (Exception ex) {
+                        Console.WriteLine($"[BLE] Error: {ex.Message}");
+                    }
+                }
+                Environment.Exit(0);
+            };
+
+            // SIGNAL HANDLER: Catches the CTRL_BREAK signal from C++ closeServer()
+            Console.CancelKeyPress += (s, e) => {
+                Console.WriteLine("[BLE] External Shutdown Signal Received...");
+                e.Cancel = true; // Prevent immediate crash
+                cleanUp();
+            };
+
+            // WATCHDOG: Handles the "X" button/Crashes
+            if (args.Length > 0 && int.TryParse(args[0], out int gamePid))
+            {
+                _ = Task.Run(async () =>
+                {
+                    while (true)
+                    {
+                        await Task.Delay(1000);
+                        try
+                        {
+                            var gameProcess = Process.GetProcessById(gamePid);
+                            if (gameProcess == null || gameProcess.HasExited)
+                            {
+                                throw new Exception("Game Exited");
+                            }
+                        }
+                        catch
+                        {
+                            // IF THE GAME IS GONE, CLEAN UP AND KILL SELF
+                            Console.WriteLine("[WATCHDOG] Game is gone. Initiating auto-cleanup...");
+                            cleanUp();
+                        }
+                    }
+                });
+            }
+
             // 1. Create GATT Service
             var createResult = await GattServiceProvider.CreateAsync(serviceUuid);
             if (createResult.ServiceProvider is null)
@@ -51,10 +120,7 @@ namespace BleServer
                 Console.WriteLine("Failed to create service (null provider). Check Bluetooth permissions and run as Admin.");
                 return;
             }
-            var provider = createResult.ServiceProvider;
-            GattLocalCharacteristic? notifyChar = null;
-            GattLocalCharacteristic? inputChar = null;
-            GattLocalCharacteristic? pingChar = null;
+            provider = createResult.ServiceProvider;
 
             // 2. Notify characteristic
             var notifyParams = new GattLocalCharacteristicParameters
@@ -208,44 +274,17 @@ namespace BleServer
                                 currentInput.JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f;
                                 currentInput.JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f;
 
-                                if (bytes.Length >= 14)
-                                {
-                                    currentInput.Steering = BitConverter.ToInt16(bytes, 12) / 32767f;
-                                }
-                                else
-                                {
-                                    currentInput.Steering = 0f;  // No steering data → neutral
-                                }
+                                // Parse steering (bytes 12–13) — Int16, little-endian
+                                currentInput.Steering = BitConverter.ToInt16(bytes, 12) / 32767f;
+
+                                // Parse Stepping (bytes 14–15) — Int16, little-endian
+                                currentInput.Stepping = BitConverter.ToInt16(bytes, 14) / 32767f;
 
                                 Console.WriteLine($"INPUT 12B | Btn: 0x{currentInput.Buttons:X8} " +
                                     $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
                                     $"R({currentInput.JoyRX,6:F2},{currentInput.JoyRY,6:F2})" +
+                                    $" Stepping: {currentInput.Stepping,6:F2}" +
                                     $" Steering: {currentInput.Steering,6:F2}");
-                                
-                                // var newInput = new InputState
-                                // {
-                                //     Buttons = BitConverter.ToUInt32(bytes, 0),
-                                //     JoyLX   = BitConverter.ToInt16(bytes, 4)  / 32767f,
-                                //     JoyLY   = BitConverter.ToInt16(bytes, 6)  / 32767f,
-                                //     JoyRX   = BitConverter.ToInt16(bytes, 8)  / 32767f,
-                                //     JoyRY   = BitConverter.ToInt16(bytes, 10) / 32767f,
-                                //     Steering = currentInput.Steering
-                                // };
-                                // // Only print if something changed
-                                // if (newInput.Buttons != lastLoggedInput.Buttons ||
-                                //     Math.Abs(newInput.JoyLX - lastLoggedInput.JoyLX) > 0.01f ||
-                                //     Math.Abs(newInput.JoyLY - lastLoggedInput.JoyLY) > 0.01f ||
-                                //     Math.Abs(newInput.JoyRX - lastLoggedInput.JoyRX) > 0.01f ||
-                                //     Math.Abs(newInput.JoyRY - lastLoggedInput.JoyRY) > 0.01f ||
-                                //     Math.Abs(newInput.Steering - lastLoggedInput.Steering) > 0.01f)
-                                // {
-                                //     Console.WriteLine($"INPUT CHANGED | Btn: 0x{newInput.Buttons:X8} " +
-                                //                     $"L({newInput.JoyLX,6:F2},{newInput.JoyLY,6:F2}) " +
-                                //                     $"R({newInput.JoyRX,6:F2},{newInput.JoyRY,6:F2})" +
-                                //                     $"Steering: {newInput.Steering,6:F2}");
-
-                                //     lastLoggedInput = newInput;
-                                // }
                             }
 
                             lastPingTime = DateTime.Now;
@@ -264,33 +303,6 @@ namespace BleServer
                 finally
                 {
                     deferral.Complete();  // Always complete!
-                }
-            }
-
-            async Task SendCommand(string command)
-            {
-                if (notifyChar == null)
-                {
-                    Console.WriteLine($"[PC] Cannot send '{command}' — notify characteristic not ready");
-                    return;
-                }
-
-                if (notifyChar.SubscribedClients.Count == 0)
-                {
-                    Console.WriteLine($"[PC] Cannot send '{command}' — no phone subscribed (not connected)");
-                    return;
-                }
-
-                try
-                {
-                    var writer = new DataWriter();
-                    writer.WriteString(command + "\n");  // Match your phone's utf8.decode().trim()
-                    await notifyChar.NotifyValueAsync(writer.DetachBuffer());
-                    Console.WriteLine($"[PC] → Sent command: {command}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[PC] Failed to send '{command}': {ex.Message}");
                 }
             }
 
@@ -331,6 +343,23 @@ namespace BleServer
                 if (writeTasks.Count > 0)
                 {
                     await Task.WhenAll(writeTasks.Select(vt => vt.AsTask()));
+                }
+
+                // WebSocket clients
+                lock (_wsLock)
+                {
+                    for (int i = wsSessions.Count - 1; i >= 0; i--)
+                    {
+                        var session = wsSessions[i];
+                        if (session.IsAlive)
+                        {
+                            session.Send(data);
+                        }
+                        else
+                        {
+                            wsSessions.RemoveAt(i);
+                        }
+                    }
                 }
             }
 
@@ -392,6 +421,12 @@ namespace BleServer
                 }
             });
 
+            wsServer = new WebSocketServer(IPAddress.Parse("127.0.0.1"), 38421);
+            wsServer.AllowForwardedRequest = true;
+            wsServer.AddWebSocketService<ControllerWsBehavior>("/controller");
+            wsServer.Start();
+            Console.WriteLine("[WS] WebSocket server started on ws://127.0.0.1:38421/controller");
+
             // Debug timer
             var debugTimer = new System.Timers.Timer(33);
             debugTimer.Elapsed += (s, e) =>
@@ -410,6 +445,36 @@ namespace BleServer
             provider.StopAdvertising();
             debugTimer.Stop();
             Console.WriteLine("Server stopped.");
+
+            // Keep the app alive
+            await Task.Delay(-1);
+        }
+
+        internal static async Task SendCommand(string command)
+        {
+            if (notifyChar == null)
+            {
+                Console.WriteLine($"[PC] Cannot send '{command}' — notify characteristic not ready");
+                return;
+            }
+
+            if (notifyChar.SubscribedClients.Count == 0)
+            {
+                Console.WriteLine($"[PC] Cannot send '{command}' — no phone subscribed (not connected)");
+                return;
+            }
+
+            try
+            {
+                var writer = new DataWriter();
+                writer.WriteString(command + "\n");
+                await notifyChar.NotifyValueAsync(writer.DetachBuffer());
+                Console.WriteLine($"[PC] → Sent command to phone: {command}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[PC] Failed to send '{command}': {ex.Message}");
+            }
         }
 
         public static InputState GetCurrentInput()
@@ -423,8 +488,65 @@ namespace BleServer
                     JoyRX = currentInput.JoyRX,
                     JoyRY = currentInput.JoyRY,
                     Buttons = currentInput.Buttons,
+                    Stepping = currentInput.Stepping,
                     Steering = currentInput.Steering
                 };
+            }
+        }
+    }
+
+    public class ControllerWsBehavior : WebSocketBehavior
+    {
+        public ControllerWsBehavior()
+        {
+            this.Protocol = ""; 
+            this.IgnoreExtensions = true;
+            this.EmitOnPing = true;
+        }
+        protected override void OnOpen()
+        {
+            Console.WriteLine("[WS] Cocos Creator client connected");
+            lock (Program._wsLock)
+            {
+                Program.wsSessions.Add(Context.WebSocket);
+            }
+        }
+
+        protected override void OnClose(WebSocketSharp.CloseEventArgs e)
+        {
+            Console.WriteLine("[WS] Cocos Creator client disconnected");
+            lock (Program._wsLock)
+            {
+                Program.wsSessions.Remove(Context.WebSocket);
+            }
+        }
+
+        protected override void OnError(WebSocketSharp.ErrorEventArgs e)
+        {
+            Console.WriteLine($"[WS] Error: {e.Message}");
+            lock (Program._wsLock)
+            {
+                Program.wsSessions.Remove(Context.WebSocket);
+            }
+        }
+
+        protected override void OnMessage(MessageEventArgs e)
+        {
+            if (e.IsText)
+            {
+                string command = e.Data.Trim();
+                Console.WriteLine($"[WS] Command from game: {command}");
+
+                if (command == "SHUTDOWN_SERVER") 
+                {
+                    Console.WriteLine("[WS] Shutdown command received from game.");
+                    // This will trigger the ProcessExit/Cleanup logic naturally
+                    Environment.Exit(0); 
+                    return;
+                }
+
+                // Forward to phone via BLE Notify
+                Task.Run(async () => await Program.SendCommand(command));
             }
         }
     }

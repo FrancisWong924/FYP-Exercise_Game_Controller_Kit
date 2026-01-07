@@ -45,6 +45,7 @@ class BleManager {
   int currentButtons = 0;           // Live button state
   InputState currentJoy = InputState();  // Live joystick state
   double currentSteering = 0.0;  // -1.0 to +1.0
+  double currentStep = 0.0;  // -1.0 to 0.0
 
   Uint8List? _lastSentPacket;
 
@@ -126,7 +127,8 @@ class BleManager {
       await device.connect(license: License.free);
       print("[BLE] Connected to ${device.platformName}");
       _statusController.add(BleConnectionStatus.connected);
-
+      // IMPORTANT: Wait a moment for Windows to initialize the GATT table
+      await Future.delayed(const Duration(milliseconds: 500));
       // Discover services
       List<BluetoothService> services = await device.discoverServices();
       print("[BLE] Discovered ${services.length} services");
@@ -193,6 +195,7 @@ class BleManager {
           await Future.delayed(const Duration(seconds: 1));
           if (!_statusController.isClosed) {
             print("[BLE] Attempting to reconnect...");
+            await Future.delayed(const Duration(seconds: 2));
             startScanningAndConnect();
           }
         }
@@ -290,10 +293,20 @@ class BleManager {
     currentSteering = steering;
   }
 
-  void sendCombinedInputPacket() {
-    if (inputCharacteristic == null) return;
+  void updateStep(ControllerId id, double x, double y) {
+    currentStep = y;
+  }
 
-    final packet = Uint8List(14);
+  void sendCombinedInputPacket() async {
+    if (inputCharacteristic == null || pcDevice == null) return;
+    // Only attempt write if Flutter thinks we are connected
+    if (FlutterBluePlus.connectedDevices.contains(pcDevice) == false) {
+      print("[BLE] Guard: Device not in connected list. Stopping loop.");
+      stopInputSending();
+      return;
+    }
+
+    final packet = Uint8List(16);
     final bd = packet.buffer.asByteData();
 
     // Bytes 0–3: Buttons (32 little-endian
@@ -308,6 +321,9 @@ class BleManager {
     // Bytes 12–13: Steering (Int16)
     bd.setInt16(12, (currentSteering * 32767).round(), Endian.little);
 
+    // Bytes 14–15: NEW Step Variable
+    bd.setInt16(14, (currentStep * 32767).round(), Endian.little);
+
     // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
     // print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
     _lastSentPacket = Uint8List.fromList(packet);
@@ -316,13 +332,23 @@ class BleManager {
       currentJoy.joyLY.abs() < 0.001 &&
       currentJoy.joyRX.abs() < 0.001 &&
       currentJoy.joyRY.abs() < 0.001 &&
+      currentStep.abs() < 0.001 &&
       currentSteering.abs() < 0.001;
       
     if (isNeutral && _arePacketsEqual(_lastSentPacket!, packet)) {
       return;
     }
-    // Fast path: no response
-    inputCharacteristic!.write(packet, withoutResponse: true);
+    try {
+      if (pcDevice!.isConnected) {
+        // Fast path: no response
+        inputCharacteristic!.write(packet, withoutResponse: true);
+      }
+    } catch (e) {
+      // If a write fails, the link is dead. Kill the loop immediately.
+      print("[BLE] Write Error: $e");
+      stopInputSending(); 
+      _stopHeartbeat();
+    }
   }
 
   bool _arePacketsEqual(Uint8List a, Uint8List b) {

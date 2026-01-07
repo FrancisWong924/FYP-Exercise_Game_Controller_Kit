@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:math'as math;
 import 'bluetooth_connection.dart';
 import 'models/controller_element.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart' as sensors_plus;
 import 'package:flutter_rotation_sensor/flutter_rotation_sensor.dart' as rotation_sensor;
@@ -42,13 +43,11 @@ class _ControllerAppState extends State<ControllerApp> {
   StreamSubscription<rotation_sensor.OrientationEvent>? orientationSubscription;
   double steeringValue = 0.0; // -1.0 (left) to +1.0 (right)
   Timer? sendTimer;
-  bool isSteeringActive = false;
 
   StreamSubscription<sensors_plus.AccelerometerEvent>? accelSubscription;
   double accelZ = 0.0;  // Current Z-axis accel
   double stepThreshold = 1.5;  // Tune this: higher = needs stronger shake/step
   double lastAccelZ = 0.0;
-  bool isSteppingActive = false;  // True if currently detecting steps
   bool isWalking = false;  // True if forward motion detected
   Timer? stepTimer;  // Debounce steps
 
@@ -92,38 +91,27 @@ class _ControllerAppState extends State<ControllerApp> {
       // React to disconnection
       if (status == BleConnectionStatus.disconnected ||
           status == BleConnectionStatus.failed ||
-          status == BleConnectionStatus.bluetoothOff) {
-        
+          status == BleConnectionStatus.bluetoothOff) {   
         // Stop tilt steering
-        if (isSteeringActive) {
-          orientationSubscription?.cancel();
-          sendTimer?.cancel();
-          setState(() {
-            steeringValue = 0.0;
-          });
-        }
+        orientationSubscription?.cancel();
+        sendTimer?.cancel();
+        setState(() {
+          steeringValue = 0.0;
+        });
 
         // Stop step detection
-        if (isSteppingActive) {
-          accelSubscription?.cancel();
-          stepTimer?.cancel();
-          setState(() {
-            isWalking = false;
-          });
-          // Send neutral joystick to avoid "stuck forward"
-          bleManager.updateJoystick(ControllerId.leftJoystick, 0.0, 0.0);
-        }
+        accelSubscription?.cancel();
+        stepTimer?.cancel();
+        setState(() {
+          isWalking = false;
+        });
       }
 
       // When reconnecting and previously enabled, restart sensors
       if (status == BleConnectionStatus.connected) {
         // Restart features if they were enabled before disconnect
-        if (isSteeringActive) {
-          startTiltSteering();
-        }
-        if (isSteppingActive) {
-          startWalkingDetection();
-        }
+        startWalkingDetection();
+        startTiltSteering();
       }
     });
 
@@ -132,31 +120,7 @@ class _ControllerAppState extends State<ControllerApp> {
       String message = utf8.decode(data).trim();
       print("[UI] ← From PC: $message");
 
-      // Handle tilt steering commands
-      if (message == "TILT_ON") {
-        setState(() {
-          isSteeringActive = true;
-          startTiltSteering();
-        });
-      } else if (message == "TILT_OFF") {
-        setState(() {
-          isSteeringActive = false;
-        });
-      }
-
-      // Handle step detection
-      if (message == "STEP_ON") {
-        setState(() {
-          isSteppingActive = true;
-          startWalkingDetection();
-        });
-      } else if (message == "STEP_OFF") {
-        setState(() {
-          isSteppingActive = false;
-        });
-      }
-
-      // NEW: Handle vibration command
+      // Handle vibration command
       if (message == "VIBRATE") {
         triggerVibration();
       }
@@ -217,13 +181,18 @@ class _ControllerAppState extends State<ControllerApp> {
     sendTimer?.cancel();
 
     orientationSubscription = rotation_sensor.RotationSensor.orientationStream.listen((rotation_sensor.OrientationEvent event) {
-      if (paused || !isSteeringActive) return;
+      if (paused) return;
 
       // In landscape: roll = left/right tilt (radians)
       double roll = event.eulerAngles.roll;       // -π to +π
 
-      if (roll > math.pi)  roll -= 2 * math.pi;
-      if (roll < -math.pi) roll += 2 * math.pi;
+      roll = roll % (2 * math.pi);
+      while (roll > math.pi) {
+        roll -= 2 * math.pi;
+      }
+      while (roll < -math.pi) {
+        roll += 2 * math.pi;
+      }
 
       const double maxRoll = 0.75;  // ~70° → tweak this for your preference!
       double steering = (roll / maxRoll).clamp(-1.0, 1.0);
@@ -231,22 +200,16 @@ class _ControllerAppState extends State<ControllerApp> {
       // Deadzone
       if (steering.abs() < 0.08) steering = 0.0;
 
-      if ((steering - steeringValue).abs() > 0.01) {
-        setState(() {
-          steeringValue = steering;
-        });
-      }
+      steeringValue = steering;
 
       // print("Roll: ${roll.toStringAsFixed(3)} → Steering: ${steering.toStringAsFixed(3)}");
     });
 
     // Your existing periodic sender (BLE steering update)
     sendTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
-      if (isSteeringActive && steeringValue.abs() > 0.001) {
         bleManager.updateSteering(
           steeringValue,  // left = negative, right = positive
         );
-      }
     });
   }
 
@@ -258,7 +221,7 @@ class _ControllerAppState extends State<ControllerApp> {
 
     accelSubscription = sensors_plus.accelerometerEventStream(samplingPeriod: sensors_plus.SensorInterval.gameInterval)
         .listen((sensors_plus.AccelerometerEvent event) {
-      if (paused || !isSteppingActive) return;  // Reuse your pause logic
+      if (paused) return;  // Reuse your pause logic
 
       accelZ = event.z;  // Z-axis: up/down (gravity ≈9.8 when flat)
       smoothedZ = 0.8 * smoothedZ + 0.2 * accelZ;  // Adjust 0.2 for more/less smoothing
@@ -276,9 +239,9 @@ class _ControllerAppState extends State<ControllerApp> {
       }
 
       if (isWalking) {
-        bleManager.updateJoystick(ControllerId.leftJoystick, 0.0, -1.0);  // Forward on left Y
+        bleManager.updateStep(ControllerId.leftJoystick, 0.0, -1.0);  // Forward on left Y
       } else {
-        bleManager.updateJoystick(ControllerId.leftJoystick, 0.0, 0.0);  // Neutral
+        bleManager.updateStep(ControllerId.leftJoystick, 0.0, 0.0);  // Neutral
       }
 
       // print("Accel Z: ${accelZ.toStringAsFixed(3)} → Smoothed: ${smoothedZ.toStringAsFixed(3)} → Delta: ${deltaZ.toStringAsFixed(3)} → Walking: $isWalking");
@@ -401,6 +364,32 @@ class _ControllerAppState extends State<ControllerApp> {
     ];
   }
 
+  // Helper method to keep your buttons consistent
+  Widget _buildMenuButton(Widget iconWidget, String label, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.05),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            SizedBox(
+            width: 24, 
+              height: 24, 
+              child: Center(child: iconWidget)
+            ),
+            const SizedBox(width: 15),
+            Text(label, style: const TextStyle(color: Colors.white, fontSize: 16)),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (isLoading) {
@@ -420,23 +409,84 @@ class _ControllerAppState extends State<ControllerApp> {
                 left: 16,
                 right: 0,
                 child: Center(
-                  child: GestureDetector(
-                    onTap: () async {
-                      setState(() => paused = !paused);
-                      final sent = await bleManager.togglePause(paused ? "PAUSE" : "RESUME");
-                      if (!sent) {
-                        setState(() => paused = !paused);
-                      }
-                    },
-                    child: Container(
-                      width: 36, height: 26,
-                      decoration: const BoxDecoration(
-                        color: Colors.white24,
-                        shape: BoxShape.rectangle,
-                        borderRadius: BorderRadius.all(Radius.circular(4)),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min, // Keep buttons tightly packed
+                    children: [
+                      GestureDetector(
+                        onTap: () async {
+                          setState(() => paused = !paused);
+                          final sent = await bleManager.togglePause(paused ? "PAUSE" : "RESUME");
+                          if (!sent) {
+                            setState(() => paused = !paused);
+                          }
+                        },
+                        child: Container(
+                          width: 36, height: 26,
+                          decoration: const BoxDecoration(
+                            color: Colors.white24,
+                            shape: BoxShape.rectangle,
+                            borderRadius: BorderRadius.all(Radius.circular(4)),
+                          ),
+                          child: Icon(paused ? Icons.play_arrow : Icons.pause, color: Colors.white, size: 18),
+                        ),
                       ),
-                      child: Icon(paused ? Icons.play_arrow : Icons.pause, color: Colors.white, size: 18),
-                    ),
+                      const SizedBox(width: 4),
+                      GestureDetector(
+                        onTap: () {
+                          showDialog(
+                            context: context,
+                            barrierColor: Colors.black54, // Darkens the background
+                            builder: (BuildContext context) {
+                              return Center(
+                                child: Material(
+                                  color: Colors.transparent,
+                                  child: Container(
+                                    // Set your desired width/height for the center box
+                                    width: MediaQuery.of(context).size.width * 0.4,
+                                    padding: const EdgeInsets.all(20),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF1A1A1A), // Dark charcoal
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(color: Colors.white10),
+                                      boxShadow: [
+                                        BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
+                                      ],
+                                    ),
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Text(
+                                          "SETTINGS",
+                                          style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                                        ),
+                                        const SizedBox(height: 20),
+                                        // Button 1: Layout Customization
+                                        _buildMenuButton(const Icon(Icons.tune, color: Colors.white54, size: 20), "Customize Layout", () {}),
+                                        const SizedBox(height: 10),
+                                        // Close Button
+                                        TextButton(
+                                          onPressed: () => Navigator.pop(context),
+                                          child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                        child: Container(
+                          width: 36, height: 26,
+                          decoration: const BoxDecoration(
+                            color: Colors.white24,
+                            shape: BoxShape.rectangle,
+                            borderRadius: BorderRadius.all(Radius.circular(4)),
+                          ),
+                          child: Icon(Icons.settings, color: Colors.white, size: 18),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
