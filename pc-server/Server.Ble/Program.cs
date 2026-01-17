@@ -61,30 +61,22 @@ namespace BleServer
             var current = Process.GetCurrentProcess();
             var duplicates = Process.GetProcessesByName(current.ProcessName)
                                 .Where(p => p.Id != current.Id);
-            foreach (var duplicate in duplicates) {
-                try { duplicate.Kill(); } catch { }
-            }
-
-            // Define a cleanup function
-            Action cleanUp = () => {
-                if (provider != null) {
-                    try {
-                        Console.WriteLine("[BLE] Stopping Advertisement...");
-                        provider.StopAdvertising();
-                        provider = null;
-                        Console.WriteLine("[BLE] Cleanup complete.");
-                    } catch (Exception ex) {
-                        Console.WriteLine($"[BLE] Error: {ex.Message}");
-                    }
+            if (duplicates.Any()) {
+                foreach (var duplicate in duplicates) {
+                    try { 
+                        duplicate.Kill(); 
+                        duplicate.WaitForExit(1000); // Wait up to 1s for it to actually die
+                    } catch { }
                 }
-                Environment.Exit(0);
-            };
+                // Small sleep to let the OS cleanup the WebSocket port
+                System.Threading.Thread.Sleep(500); 
+            }
 
             // SIGNAL HANDLER: Catches the CTRL_BREAK signal from C++ closeServer()
             Console.CancelKeyPress += (s, e) => {
                 Console.WriteLine("[BLE] External Shutdown Signal Received...");
                 e.Cancel = true; // Prevent immediate crash
-                cleanUp();
+                CleanUp();
             };
 
             // WATCHDOG: Handles the "X" button/Crashes
@@ -107,7 +99,7 @@ namespace BleServer
                         {
                             // IF THE GAME IS GONE, CLEAN UP AND KILL SELF
                             Console.WriteLine("[WATCHDOG] Game is gone. Initiating auto-cleanup...");
-                            cleanUp();
+                            CleanUp();
                         }
                     }
                 });
@@ -142,27 +134,38 @@ namespace BleServer
                 if (count > 0)
                 {
                     Console.WriteLine("Phone connected and subscribed!");
+
+                    SendStatusToWSClients("PHONE_CONNECTED");
                     await SendCommand("VIBRATE");
                     lastPingTime = DateTime.Now;
                     disconnect = false;
-                    if (disconnectTimer == null)
-                    {
-                        disconnectTimer = new System.Timers.Timer(2000); // check every 2s
-                        disconnectTimer.Elapsed += (s, e) =>
-                        {
-                            if (DateTime.Now - lastPingTime > TimeSpan.FromSeconds(3))
-                            {
-                                Console.WriteLine("HEARTBEAT TIMEOUT → Phone is DEAD or app was force-killed!");
-                                Console.WriteLine("   (SubscribedClients may still show 1 — normal on Windows)");
-                                disconnect = true;
-                                disconnectTimer?.Stop();
-                            }
-                        };
-                        disconnectTimer.AutoReset = true;
-                    }
 
+                    if (disconnectTimer != null)
+                    {
+                        disconnectTimer.Stop(); // Stop old instance if it exists
+                        disconnectTimer.Dispose();
+                    }
+                    
+                    disconnectTimer = new System.Timers.Timer(2000); // check every 2s
+                    disconnectTimer.Elapsed += (s, e) =>
+                    {
+                        if (DateTime.Now - lastPingTime > TimeSpan.FromSeconds(3))
+                        {
+                            Console.WriteLine("HEARTBEAT TIMEOUT → Phone is DEAD or app was force-killed!");
+                            disconnect = true;
+                            SendStatusToWSClients("PHONE_DISCONNECTED");
+                            disconnectTimer?.Stop();
+                        }
+                    };
+                    disconnectTimer.AutoReset = true;
                     disconnectTimer.Start();
                     Console.WriteLine("[PC] Heartbeat watcher STARTED (phone connected)");
+                } 
+                else
+                {
+                    Console.WriteLine("[PC] All clients unsubscribed.");
+                    disconnect = true;
+                    disconnectTimer?.Stop();
                 }
             };
 
@@ -224,7 +227,14 @@ namespace BleServer
                             bytes[2] == 'N' && bytes[3] == 'G' && bytes[4] == 0x0A)
                         {
                             lastPingTime = DateTime.Now;
-                            disconnect = false;
+
+                            if (disconnect) {
+                                Console.WriteLine("[BLE] Phone recovered! Resetting disconnect state.");
+                                disconnect = false;
+                                await SendCommand("VIBRATE");
+                                SendStatusToWSClients("PHONE_CONNECTED");
+                                disconnectTimer?.Start(); 
+                            }
 
                             var writer = new DataWriter();
                             writer.WriteString("PONG");
@@ -239,9 +249,20 @@ namespace BleServer
                             Console.WriteLine($"COMMAND RECEIVED: {text}");
 
                             // TODO: Pause/resume your game here!
-                            // Example:
-                            // GameInstance.PauseGame(shouldPause);
-                            // or send to Unity/Unreal: SendMessage("Pause(shouldPause);
+                            string cmdJson = JsonSerializer.Serialize(new { type = "command", value = text });
+                            byte[] cmdData = Encoding.UTF8.GetBytes(cmdJson + "\n");
+
+                            // 2. Broadcast to all WebSocket clients (Cocos Creator)
+                            lock (_wsLock)
+                            {
+                                foreach (var session in wsSessions.ToList())
+                                {
+                                    if (session.IsAlive)
+                                    {
+                                        session.Send(cmdData);
+                                    }
+                                }
+                            }
 
                             lastPingTime = DateTime.Now;  // Also acts as heartbeat
                             request.Respond();  // ACK!
@@ -450,6 +471,34 @@ namespace BleServer
             await Task.Delay(-1);
         }
 
+        private static void SendStatusToWSClients(string status)
+        {
+            string statusMsg = JsonSerializer.Serialize(new { type = "status", value = status });
+            byte[] statusData = Encoding.UTF8.GetBytes(statusMsg + "\n");
+            
+            lock (_wsLock) {
+                foreach (var session in wsSessions.ToList()) {
+                    if (session.IsAlive) session.Send(statusData);
+                }
+            }
+        }
+
+        public static void CleanUp() 
+        {
+            if (provider != null) {
+                try {
+                    Console.WriteLine("[BLE] Stopping Advertisement...");
+                    provider.StopAdvertising();
+                    provider = null;
+                    Console.WriteLine("[BLE] Cleanup complete.");
+                } catch (Exception ex) {
+                    Console.WriteLine($"[BLE] Error: {ex.Message}");
+                }
+            }
+            // Now it's safe to exit
+            Environment.Exit(0);
+        }
+
         internal static async Task SendCommand(string command)
         {
             if (notifyChar == null)
@@ -537,11 +586,11 @@ namespace BleServer
                 string command = e.Data.Trim();
                 Console.WriteLine($"[WS] Command from game: {command}");
 
-                if (command == "SHUTDOWN_SERVER") 
+                if (command == "SHUTDOWN") 
                 {
                     Console.WriteLine("[WS] Shutdown command received from game.");
                     // This will trigger the ProcessExit/Cleanup logic naturally
-                    Environment.Exit(0); 
+                    Program.CleanUp();
                     return;
                 }
 

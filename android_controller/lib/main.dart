@@ -7,8 +7,7 @@ import 'bluetooth_connection.dart';
 import 'models/controller_element.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:sensors_plus/sensors_plus.dart' as sensors_plus;
-import 'package:flutter_rotation_sensor/flutter_rotation_sensor.dart' as rotation_sensor;
+import 'package:sensors_plus/sensors_plus.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
@@ -40,11 +39,14 @@ class _ControllerAppState extends State<ControllerApp> {
   bool isLoading = true;
   bool paused = false;
 
-  StreamSubscription<rotation_sensor.OrientationEvent>? orientationSubscription;
+  double neutralRoll = 1.55;
+  double maxDeviation = 1.1;
+  double filteredSteering = 0.0;
+  double smoothedZ = 0.0;
   double steeringValue = 0.0; // -1.0 (left) to +1.0 (right)
   Timer? sendTimer;
 
-  StreamSubscription<sensors_plus.AccelerometerEvent>? accelSubscription;
+  StreamSubscription<AccelerometerEvent>? accelSubscription;
   double accelZ = 0.0;  // Current Z-axis accel
   double stepThreshold = 1.5;  // Tune this: higher = needs stronger shake/step
   double lastAccelZ = 0.0;
@@ -58,16 +60,12 @@ class _ControllerAppState extends State<ControllerApp> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
-    rotation_sensor.RotationSensor.samplingPeriod = rotation_sensor.SensorInterval.gameInterval; // ~20ms updates
-    // Remap for landscape if needed (test: if roll signs feel flipped, adjust)
-    rotation_sensor.RotationSensor.coordinateSystem = rotation_sensor.CoordinateSystem.transformed(rotation_sensor.Axis3.X, -rotation_sensor.Axis3.Z);
     initializeApp();
   }
 
   @override
   void dispose() {
     WakelockPlus.disable();
-    orientationSubscription?.cancel();
     accelSubscription?.cancel();
     sendTimer?.cancel();
     stepTimer?.cancel();
@@ -91,16 +89,15 @@ class _ControllerAppState extends State<ControllerApp> {
       // React to disconnection
       if (status == BleConnectionStatus.disconnected ||
           status == BleConnectionStatus.failed ||
-          status == BleConnectionStatus.bluetoothOff) {   
+          status == BleConnectionStatus.bluetoothOff) {
+        accelSubscription?.cancel();
         // Stop tilt steering
-        orientationSubscription?.cancel();
         sendTimer?.cancel();
         setState(() {
           steeringValue = 0.0;
         });
 
         // Stop step detection
-        accelSubscription?.cancel();
         stepTimer?.cancel();
         setState(() {
           isWalking = false;
@@ -110,8 +107,7 @@ class _ControllerAppState extends State<ControllerApp> {
       // When reconnecting and previously enabled, restart sensors
       if (status == BleConnectionStatus.connected) {
         // Restart features if they were enabled before disconnect
-        startWalkingDetection();
-        startTiltSteering();
+        startAccelerometerListening();
       }
     });
 
@@ -176,75 +172,56 @@ class _ControllerAppState extends State<ControllerApp> {
     }
   }
 
-  void startTiltSteering() {
-    orientationSubscription?.cancel();
+  // Call this once when you need both features
+  void startAccelerometerListening() {
+    accelSubscription?.cancel();
     sendTimer?.cancel();
 
-    orientationSubscription = rotation_sensor.RotationSensor.orientationStream.listen((rotation_sensor.OrientationEvent event) {
-      if (paused) return;
+    accelSubscription = accelerometerEventStream(samplingPeriod: SensorInterval.gameInterval)
+      .listen((AccelerometerEvent event) {
+        if (paused) return;
 
-      // In landscape: roll = left/right tilt (radians)
-      double roll = event.eulerAngles.roll;       // -π to +π
+        // ── STEERING (landscape left/right tilt) ───────────────────────────────
+        double roll = math.atan2(event.z, event.y);
+        // print("Raw roll: ${roll.toStringAsFixed(3)}");
+        double deviation = neutralRoll - roll;
+        double rawSteering = deviation / maxDeviation;
+        rawSteering = rawSteering.clamp(-1.0, 1.0);
+        // print("rawSteering: ${rawSteering.toStringAsFixed(3)}");
+        const double smoothing = 0.2;
+        filteredSteering = filteredSteering * (1 - smoothing) + rawSteering * smoothing;
 
-      roll = roll % (2 * math.pi);
-      while (roll > math.pi) {
-        roll -= 2 * math.pi;
-      }
-      while (roll < -math.pi) {
-        roll += 2 * math.pi;
-      }
+        double steering = filteredSteering;
+        if (steering.abs() < 0.08) steering = 0.0;
+        // print("steering: ${steering.toStringAsFixed(3)}");
+        if ((steering - steeringValue).abs() > 0.01) {
+          setState(() => steeringValue = steering);
+        }
 
-      const double maxRoll = 0.75;  // ~70° → tweak this for your preference!
-      double steering = (roll / maxRoll).clamp(-1.0, 1.0);
+        // ── WALKING DETECTION ──────────────────────────────────────────────────
+        smoothedZ = 0.8 * smoothedZ + 0.2 * event.z;
+        double deltaZ = (smoothedZ - lastAccelZ).abs();
+        lastAccelZ = smoothedZ;
 
-      // Deadzone
-      if (steering.abs() < 0.08) steering = 0.0;
+        if (deltaZ > stepThreshold) {
+          isWalking = true;
+          stepTimer?.cancel();
+          stepTimer = Timer(const Duration(milliseconds: 300), () {
+            isWalking = false;
+          });
+        }
 
-      steeringValue = steering;
-
-      // print("Roll: ${roll.toStringAsFixed(3)} → Steering: ${steering.toStringAsFixed(3)}");
+        if (isWalking) {
+          bleManager.updateStep(ControllerId.leftJoystick, 0.0, -1.0);
+        } else {
+          bleManager.updateStep(ControllerId.leftJoystick, 0.0, 0.0);
+        }
     });
 
-    // Your existing periodic sender (BLE steering update)
     sendTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
         bleManager.updateSteering(
           steeringValue,  // left = negative, right = positive
         );
-    });
-  }
-
-  void startWalkingDetection() {
-    accelSubscription?.cancel();
-
-    // Smoothed values to reduce noise
-    double smoothedZ = 0.0;
-
-    accelSubscription = sensors_plus.accelerometerEventStream(samplingPeriod: sensors_plus.SensorInterval.gameInterval)
-        .listen((sensors_plus.AccelerometerEvent event) {
-      if (paused) return;  // Reuse your pause logic
-
-      accelZ = event.z;  // Z-axis: up/down (gravity ≈9.8 when flat)
-      smoothedZ = 0.8 * smoothedZ + 0.2 * accelZ;  // Adjust 0.2 for more/less smoothing
-      // Simple step detection: detect peaks in Z (up/down bounce)
-      double deltaZ = (smoothedZ - lastAccelZ).abs();
-      lastAccelZ = smoothedZ;
-
-      if (deltaZ > stepThreshold) {
-        // Detected a "step" → set forward
-        isWalking = true;
-        stepTimer?.cancel();
-        stepTimer = Timer(const Duration(milliseconds: 300), () {  // Debounce
-          isWalking = false;
-        });
-      }
-
-      if (isWalking) {
-        bleManager.updateStep(ControllerId.leftJoystick, 0.0, -1.0);  // Forward on left Y
-      } else {
-        bleManager.updateStep(ControllerId.leftJoystick, 0.0, 0.0);  // Neutral
-      }
-
-      // print("Accel Z: ${accelZ.toStringAsFixed(3)} → Smoothed: ${smoothedZ.toStringAsFixed(3)} → Delta: ${deltaZ.toStringAsFixed(3)} → Walking: $isWalking");
     });
   }
 
