@@ -4,6 +4,8 @@ using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
 using Windows.Storage.Streams;
 using System;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
@@ -21,6 +23,8 @@ namespace BleServer
 {
     public class InputState
     {
+        public string Type { get; set; } = "input";
+        public int PlayerId { get; set; } = 1;
         public float JoyLX { get; set; } = 0f;
         public float JoyLY { get; set; } = 0f;
         public float JoyRX { get; set; } = 0f;
@@ -30,30 +34,34 @@ namespace BleServer
         public float Steering { get; set; } = 0f;
 
         public override string ToString()
-            => $"LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4} GYRO:[{Steering,6:F1}]";
+            => $"Player:{PlayerId} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4} GYRO:[{Steering,6:F1}]";
     }
 
     class Program
     {
-        private static DateTime lastPingTime = DateTime.Now;
-        private static System.Timers.Timer? disconnectTimer = null;
-        private static bool disconnect = false;
-        private static InputState currentInput = new InputState();
-        private static readonly object inputLock = new object(); // thread-safe
+        // private static TcpListener? _tcpListener;
+        // private static readonly List<TcpClient> _connectedClients = new();
+        // private static readonly object _clientsLock = new();
+        // --- BLE Configuration ---
         private static readonly Guid serviceUuid = Guid.Parse("12345678-1234-5678-1234-56789abcdef0");
         private static readonly Guid notifyUuid  = Guid.Parse("12345678-1234-5678-1234-56789abcdef2"); // PC → Phone
         private static readonly Guid pingUuid    = Guid.Parse("12345678-1234-5678-1234-56789abcdef1"); // Phone → PC (WithResponse)
         private static readonly Guid inputUuid   = Guid.Parse("12345678-1234-5678-1234-56789abcdef3"); // Phone → PC (WithoutResponse)
-        private static TcpListener? _tcpListener;
-        private static readonly List<TcpClient> _connectedClients = new();
-        private static readonly object _clientsLock = new();
+        static GattServiceProvider? provider = null;
+        private static GattLocalCharacteristic? notifyChar = null;
+
+        // --- Session Management ---
+        public static ConcurrentDictionary<int, PlayerSession> ConnectedPlayers = new ConcurrentDictionary<int, PlayerSession>();
+        private static ConcurrentDictionary<string, int> _playerIdHistory = new ConcurrentDictionary<string, int>();
+        private static int _nextPlayerId = 0;
+
+        // --- Game Engine Integration (WebSocket) ---
         static WebSocketServer? wsServer;
         internal static readonly List<WebSocketSharp.WebSocket> wsSessions = new();
-        internal static readonly object _wsLock = new();  // Separate lock for WS
-        private static GattLocalCharacteristic? notifyChar = null;
-        private static GattLocalCharacteristic? inputChar = null;
-        private static GattLocalCharacteristic? pingChar = null;
-        static GattServiceProvider? provider = null;
+        internal static readonly object _wsLock = new object();  // Separate lock for WS
+
+        // Timer for cleaning up stale connections
+        private static System.Timers.Timer? disconnectTimer = null;
 
         static async Task Main(string[] args)
         {
@@ -69,7 +77,7 @@ namespace BleServer
                     } catch { }
                 }
                 // Small sleep to let the OS cleanup the WebSocket port
-                System.Threading.Thread.Sleep(500); 
+                await Task.Delay(1000);
             }
 
             // SIGNAL HANDLER: Catches the CTRL_BREAK signal from C++ closeServer()
@@ -92,7 +100,7 @@ namespace BleServer
                             var gameProcess = Process.GetProcessById(gamePid);
                             if (gameProcess == null || gameProcess.HasExited)
                             {
-                                throw new Exception("Game Exited");
+                                CleanUp();
                             }
                         }
                         catch
@@ -115,206 +123,55 @@ namespace BleServer
             provider = createResult.ServiceProvider;
 
             // 2. Notify characteristic
-            var notifyParams = new GattLocalCharacteristicParameters
-            {
-                CharacteristicProperties = GattCharacteristicProperties.Notify
-            };
-            var notifyResult = await provider.Service.CreateCharacteristicAsync(notifyUuid, notifyParams);
-            if (notifyResult.Characteristic is null)
-            {
-                Console.WriteLine("Failed to create notify characteristic.");
-                return;
-            }
+            var notifyResult = await provider.Service.CreateCharacteristicAsync(notifyUuid, 
+                new GattLocalCharacteristicParameters { CharacteristicProperties = GattCharacteristicProperties.Notify });
             notifyChar = notifyResult.Characteristic;
-            notifyChar.SubscribedClientsChanged += async (sender, args) =>
-            {
-                int count = notifyChar.SubscribedClients.Count;
-                Console.WriteLine($"[PC] Subscribed clients: {count}");
-
-                if (count > 0)
-                {
-                    Console.WriteLine("Phone connected and subscribed!");
-
-                    SendStatusToWSClients("PHONE_CONNECTED");
-                    await SendCommand("VIBRATE");
-                    lastPingTime = DateTime.Now;
-                    disconnect = false;
-
-                    if (disconnectTimer != null)
-                    {
-                        disconnectTimer.Stop(); // Stop old instance if it exists
-                        disconnectTimer.Dispose();
-                    }
-                    
-                    disconnectTimer = new System.Timers.Timer(2000); // check every 2s
-                    disconnectTimer.Elapsed += (s, e) =>
-                    {
-                        if (DateTime.Now - lastPingTime > TimeSpan.FromSeconds(3))
-                        {
-                            Console.WriteLine("HEARTBEAT TIMEOUT → Phone is DEAD or app was force-killed!");
-                            disconnect = true;
-                            SendStatusToWSClients("PHONE_DISCONNECTED");
-                            disconnectTimer?.Stop();
-                        }
-                    };
-                    disconnectTimer.AutoReset = true;
-                    disconnectTimer.Start();
-                    Console.WriteLine("[PC] Heartbeat watcher STARTED (phone connected)");
-                } 
-                else
-                {
-                    Console.WriteLine("[PC] All clients unsubscribed.");
-                    disconnect = true;
-                    disconnectTimer?.Stop();
-                }
-            };
+            notifyChar.SubscribedClientsChanged -= OnSubscribedClientsChanged; 
+            notifyChar.SubscribedClientsChanged += OnSubscribedClientsChanged;
 
             // 3. INPUT & PING characteristic (Phone → PC)
             // 3.1 INPUT characteristic – FAST, no response (buttons + joysticks)
-            var inputResult = await provider.Service.CreateCharacteristicAsync(
-                inputUuid,
+            var inputResult = await provider.Service.CreateCharacteristicAsync(inputUuid,
                 new GattLocalCharacteristicParameters
                 {
                     CharacteristicProperties = GattCharacteristicProperties.WriteWithoutResponse,
                     WriteProtectionLevel = GattProtectionLevel.Plain
                 });
-
-            if (inputResult.Characteristic is null)
+            inputResult.Characteristic.WriteRequested += async (sender, args) =>
             {
-                Console.WriteLine("Failed to create INPUT characteristic!");
-                return;
-            }
-            inputChar = inputResult.Characteristic;
-
-            // 3.2 PING characteristic – reliable, with response (for heartbeat only)
-            var pingResult = await provider.Service.CreateCharacteristicAsync(
-                pingUuid,
-                new GattLocalCharacteristicParameters
-                {
-                    CharacteristicProperties = GattCharacteristicProperties.Write,  // WithResponse!
-                    WriteProtectionLevel = GattProtectionLevel.Plain
-                }
-            );
-            if (pingResult.Characteristic is null)
-            {
-                Console.WriteLine("Failed to create PING characteristic!");
-                return;
-            }
-            pingChar = pingResult.Characteristic;
-            // SINGLE EVENT HANDLER FOR ALL WRITES
-            pingChar!.WriteRequested += WriteRequestedHandler;
-            inputChar!.WriteRequested += WriteRequestedHandler;
-
-            // 4. Handle incoming data
-            async void WriteRequestedHandler(object sender, GattWriteRequestedEventArgs args)
-            {
-                var deferral = args.GetDeferral();  // Always get deferral
+                var deferral = args.GetDeferral();
                 try
                 {
-                    var request = await args.GetRequestAsync();  // This is correct
+                    // Identify which player sent this based on DeviceId
+                    string deviceId = args.Session.DeviceId.Id;
+                    var session = ConnectedPlayers.Values.FirstOrDefault(p => p.DeviceId == deviceId);
+                    if (session == null) return; // Ignore input from untracked devices
+                    
+                    var request = await args.GetRequestAsync();
                     if (request.Value == null) return;
 
                     byte[] bytes = request.Value.ToArray();
-                    var characteristic = sender as GattLocalCharacteristic;
-
-                    // Determine which characteristic was written
-                    if (characteristic == pingChar)
+                    if (bytes.Length >= 16)
                     {
-                        string text = Encoding.UTF8.GetString(bytes).Trim();
-                        // PING characteristic
-                        if (bytes.Length == 5 && 
-                            bytes[0] == 'P' && bytes[1] == 'I' && 
-                            bytes[2] == 'N' && bytes[3] == 'G' && bytes[4] == 0x0A)
-                        {
-                            lastPingTime = DateTime.Now;
+                        session.LastSeen = DateTime.Now;
 
-                            if (disconnect) {
-                                Console.WriteLine("[BLE] Phone recovered! Resetting disconnect state.");
-                                disconnect = false;
-                                await SendCommand("VIBRATE");
-                                SendStatusToWSClients("PHONE_CONNECTED");
-                                disconnectTimer?.Start(); 
-                            }
+                        var state = new InputState 
+                        { 
+                            PlayerId = session.PlayerId,
+                            Buttons = BitConverter.ToUInt32(bytes, 0),
+                            JoyLX = BitConverter.ToInt16(bytes, 4) / 32767f,
+                            JoyLY = BitConverter.ToInt16(bytes, 6) / 32767f,
+                            JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f,
+                            JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f,
+                            Steering = BitConverter.ToInt16(bytes, 12) / 32767f,
+                            Stepping = BitConverter.ToInt16(bytes, 14) / 32767f
+                        };
 
-                            var writer = new DataWriter();
-                            writer.WriteString("PONG");
-                            await notifyChar!.NotifyValueAsync(writer.DetachBuffer());
-
-                            request.Respond();  // ACK the write
-                            Console.WriteLine("PING received → PONG sent");
-                        }
-                        if (text == "PAUSE" || text == "RESUME")
-                        {
-                            bool shouldPause = text == "PAUSE";
-                            Console.WriteLine($"COMMAND RECEIVED: {text}");
-
-                            // TODO: Pause/resume your game here!
-                            string cmdJson = JsonSerializer.Serialize(new { type = "command", value = text });
-                            byte[] cmdData = Encoding.UTF8.GetBytes(cmdJson + "\n");
-
-                            // 2. Broadcast to all WebSocket clients (Cocos Creator)
-                            lock (_wsLock)
-                            {
-                                foreach (var session in wsSessions.ToList())
-                                {
-                                    if (session.IsAlive)
-                                    {
-                                        session.Send(cmdData);
-                                    }
-                                }
-                            }
-
-                            lastPingTime = DateTime.Now;  // Also acts as heartbeat
-                            request.Respond();  // ACK!
-                        } 
-                    }
-                    else if (characteristic == inputChar)
-                    {
-                        // INPUT characteristic (fast data)
-                        InputState localInput;  // Capture a snapshot to broadcast safely
-
-                        lock (inputLock)
-                        {
-                            if (bytes.Length == 4)
-                                currentInput.Buttons = BitConverter.ToUInt32(bytes, 0);
-                            else if (bytes.Length == 8)
-                            {
-                                currentInput.JoyLX = BitConverter.ToInt16(bytes, 0) / 32767f;
-                                currentInput.JoyLY = BitConverter.ToInt16(bytes, 2) / 32767f;
-                                currentInput.JoyRX = BitConverter.ToInt16(bytes, 4) / 32767f;
-                                currentInput.JoyRY = BitConverter.ToInt16(bytes, 6) / 32767f;
-                            }
-                            else if (bytes.Length >= 12)
-                            {
-                                // Parse buttons (bytes 0–3) — little-endian
-                                currentInput.Buttons = BitConverter.ToUInt32(bytes, 0);
-
-                                // Parse joysticks (bytes 4–11) — 4 × Int16, little-endian
-                                currentInput.JoyLX = BitConverter.ToInt16(bytes, 4) / 32767f;
-                                currentInput.JoyLY = BitConverter.ToInt16(bytes, 6) / 32767f;
-                                currentInput.JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f;
-                                currentInput.JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f;
-
-                                // Parse steering (bytes 12–13) — Int16, little-endian
-                                currentInput.Steering = BitConverter.ToInt16(bytes, 12) / 32767f;
-
-                                // Parse Stepping (bytes 14–15) — Int16, little-endian
-                                currentInput.Stepping = BitConverter.ToInt16(bytes, 14) / 32767f;
-
-                                Console.WriteLine($"INPUT 12B | Btn: 0x{currentInput.Buttons:X8} " +
-                                    $"L({currentInput.JoyLX,6:F2},{currentInput.JoyLY,6:F2}) " +
-                                    $"R({currentInput.JoyRX,6:F2},{currentInput.JoyRY,6:F2})" +
-                                    $" Stepping: {currentInput.Stepping,6:F2}" +
-                                    $" Steering: {currentInput.Steering,6:F2}");
-                            }
-
-                            lastPingTime = DateTime.Now;
-
-                            // Capture a safe copy for broadcasting (outside lock)
-                            localInput = GetCurrentInput();
-                        }
-
-                        await BroadcastInputAsync(localInput);
+                        // Broadcast the specific player's data
+                        _ = BroadcastInputAsync(state);
+                        
+                        // Optional: Console log with Player ID
+                        Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X} LX: {state.JoyLX:F2} LY: {state.JoyLY:F2} RX: {state.JoyRX:F2} RY: {state.JoyRY:F2} STR: {state.Steering:F2} STP: {state.Stepping:F2}");
                     }
                 }
                 catch (Exception ex)
@@ -325,64 +182,112 @@ namespace BleServer
                 {
                     deferral.Complete();  // Always complete!
                 }
-            }
+            };
 
-            // Helper to broadcast input to all games
-            async Task BroadcastInputAsync(InputState input)
+            // 3.2 PING characteristic – reliable, with response (for heartbeat only)
+            var pingResult = await provider.Service.CreateCharacteristicAsync(pingUuid,
+                new GattLocalCharacteristicParameters
+                {
+                    CharacteristicProperties = GattCharacteristicProperties.Write,  // WithResponse!
+                    WriteProtectionLevel = GattProtectionLevel.Plain
+                }
+            );
+            pingResult.Characteristic.WriteRequested += async (sender, args) =>
             {
-                string json = JsonSerializer.Serialize(input) + "\n";
-                byte[] data = Encoding.UTF8.GetBytes(json);
-
-                var writeTasks = new List<ValueTask>();
-                var disconnected = new List<TcpClient>();
-
-                lock (_clientsLock)
+                var deferral = args.GetDeferral();
+                try
                 {
-                    foreach (var client in _connectedClients)
+                    var request = await args.GetRequestAsync();  // This is correct 
+                    if (request.Value == null) return;
+
+                    byte[] bytes = request.Value.ToArray();
+                    string text = Encoding.UTF8.GetString(bytes).Trim();
+                    string deviceId = args.Session.DeviceId.Id;
+
+                    // 1. Identify the PlayerSession by DeviceId
+                    var session = ConnectedPlayers.Values.FirstOrDefault(p => p.DeviceId == deviceId);
+                    if (session == null) 
                     {
-                        try
-                        {
-                            NetworkStream stream = client.GetStream();
-                            if (stream.CanWrite)
+                        var activeSubscriber = notifyChar.SubscribedClients
+                            .FirstOrDefault(c => c.Session.DeviceId.Id == deviceId);
+
+                        if (activeSubscriber != null) {
+                            Console.WriteLine($"[BLE] Late Registration for {deviceId}. Adding to tracking...");
+                            int assignedId = GetStickyPlayerId(deviceId);
+
+                            if (!ConnectedPlayers.ContainsKey(assignedId)) 
                             {
-                                writeTasks.Add(stream.WriteAsync(data));
+                                session = new PlayerSession {
+                                    PlayerId = assignedId,
+                                    DeviceId = deviceId,
+                                    Client = activeSubscriber,
+                                    LastSeen = DateTime.Now
+                                };
+                                ConnectedPlayers.TryAdd(assignedId, session);
+                                SendStatusToWSClients("CONNECTED", assignedId);
+                                await session.SendMessageViaBle("VIBRATE", notifyChar);
                             }
-                        }
-                        catch
-                        {
-                            disconnected.Add(client);
-                        }
-                    }
-
-                    foreach (var dead in disconnected)
-                    {
-                        _connectedClients.Remove(dead);
-                        dead.Close();
-                    }
-                }
-
-                if (writeTasks.Count > 0)
-                {
-                    await Task.WhenAll(writeTasks.Select(vt => vt.AsTask()));
-                }
-
-                // WebSocket clients
-                lock (_wsLock)
-                {
-                    for (int i = wsSessions.Count - 1; i >= 0; i--)
-                    {
-                        var session = wsSessions[i];
-                        if (session.IsAlive)
-                        {
-                            session.Send(data);
                         }
                         else
                         {
-                            wsSessions.RemoveAt(i);
+                            Console.WriteLine($"[BLE] Unauthorized client {deviceId}. Ignoring.");
+                            request.Respond();
+                            return;
+                        }
+                    }
+
+                    // Handle Heartbeat (PING)
+                    if (text == "PING") 
+                    {
+                        if (session != null) 
+                        {
+                            // Update the timestamp (Heartbeat)
+                            session.LastSeen = DateTime.Now;
+                            await session.SendMessageViaBle("PONG", notifyChar);   
+                            request.Respond(); 
+                            Console.WriteLine($"[P{session.PlayerId}] PING → PONG");
+                        }
+                    }
+                    // 3. Handle Commands (PAUSE, RESUME, NEED_LAYOUT)
+                    if (text == "PAUSE" || text == "RESUME" || text == "NEED_LAYOUT")
+                    {
+                        if (session != null) 
+                        {
+                            session.LastSeen = DateTime.Now;
+                            Console.WriteLine($"[P{session.PlayerId}] COMMAND RECEIVED: {text}");
+
+                            // Include the PlayerId in the JSON so Cocos knows who sent it
+                            var cmdObj = new { 
+                                type = "command", 
+                                value = text, 
+                                playerId = session.PlayerId
+                            };
+                            
+                            string cmdJson = JsonSerializer.Serialize(cmdObj);
+                            byte[] cmdData = Encoding.UTF8.GetBytes(cmdJson + "\n");
+
+                            // Broadcast to WebSocket clients (Cocos Creator)
+                            lock (_wsLock)
+                            {
+                                foreach (var ws in wsSessions.ToList())
+                                {
+                                    if (ws.IsAlive) ws.Send(cmdData);
+                                }
+                            }
+
+                            request.Respond(); // Always ACK the write
                         }
                     }
                 }
-            }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Write error: {ex.Message}");
+                }
+                finally
+                {
+                    deferral.Complete();  // Always complete!
+                }
+            };
 
             // 5. Start advertising
             var advParams = new GattServiceProviderAdvertisingParameters
@@ -390,57 +295,63 @@ namespace BleServer
                 IsDiscoverable = true,
                 IsConnectable = true
             };
-            provider.StartAdvertising(advParams);
-
-            Console.WriteLine("✅ PC BLE GATT Server is advertising!");
-            Console.WriteLine("Open your Flutter app, scan, and connect now.");
-
-            _tcpListener = new TcpListener(IPAddress.Loopback, 38420);
-            _tcpListener.Start();
-            Console.WriteLine("[TCP] Listening on 127.0.0.1:38420 for game connections");
-
-            _ = Task.Run(async () =>
+            try 
             {
-                while (true)
-                {
-                    try
-                    {
-                        TcpClient client = await _tcpListener.AcceptTcpClientAsync();
-                        lock (_clientsLock)
-                        {
-                            _connectedClients.Add(client);
-                        }
-                        Console.WriteLine($"[TCP] Game client connected ({_connectedClients.Count} total)");
+                provider.StartAdvertising(advParams);
+                Console.WriteLine("✅ PC BLE GATT Server is advertising!");
+                Console.WriteLine("Open your Flutter app, scan, and connect now.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ CRASH during StartAdvertising: {ex.Message}");
+            }
 
-                        // Handle client disconnect
-                        _ = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                // Wait until the client socket is closed/disconnected
-                                var buffer = new byte[1];
-                                #pragma warning disable CA2022 // Intentional use of ReadAsync with count=0 to detect disconnect
-                                await client.GetStream().ReadAsync(buffer, 0, 0);
-                                #pragma warning restore CA2022
-                            }
-                            catch { } // Client disconnected
-                            finally
-                            {
-                                lock (_clientsLock)
-                                {
-                                    _connectedClients.Remove(client);
-                                    client.Close();
-                                }
-                                Console.WriteLine($"[TCP] Game client disconnected ({_connectedClients.Count} left)");
-                            }
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[TCP] Accept error: {ex.Message}");
-                    }
-                }
-            });
+            // _tcpListener = new TcpListener(IPAddress.Loopback, 38420);
+            // _tcpListener.Start();
+            // Console.WriteLine("[TCP] Listening on 127.0.0.1:38420 for game connections");
+
+            // _ = Task.Run(async () =>
+            // {
+            //     while (true)
+            //     {
+            //         try
+            //         {
+            //             TcpClient client = await _tcpListener.AcceptTcpClientAsync();
+            //             lock (_clientsLock)
+            //             {
+            //                 _connectedClients.Add(client);
+            //             }
+            //             Console.WriteLine($"[TCP] Game client connected ({_connectedClients.Count} total)");
+
+            //             // Handle client disconnect
+            //             _ = Task.Run(async () =>
+            //             {
+            //                 try
+            //                 {
+            //                     // Wait until the client socket is closed/disconnected
+            //                     var buffer = new byte[1];
+            //                     #pragma warning disable CA2022 // Intentional use of ReadAsync with count=0 to detect disconnect
+            //                     await client.GetStream().ReadAsync(buffer, 0, 0);
+            //                     #pragma warning restore CA2022
+            //                 }
+            //                 catch { } // Client disconnected
+            //                 finally
+            //                 {
+            //                     lock (_clientsLock)
+            //                     {
+            //                         _connectedClients.Remove(client);
+            //                         client.Close();
+            //                     }
+            //                     Console.WriteLine($"[TCP] Game client disconnected ({_connectedClients.Count} left)");
+            //                 }
+            //             });
+            //         }
+            //         catch (Exception ex)
+            //         {
+            //             Console.WriteLine($"[TCP] Accept error: {ex.Message}");
+            //         }
+            //     }
+            // });
 
             wsServer = new WebSocketServer(IPAddress.Parse("127.0.0.1"), 38421);
             wsServer.AllowForwardedRequest = true;
@@ -448,32 +359,145 @@ namespace BleServer
             wsServer.Start();
             Console.WriteLine("[WS] WebSocket server started on ws://127.0.0.1:38421/controller");
 
-            // Debug timer
-            var debugTimer = new System.Timers.Timer(33);
-            debugTimer.Elapsed += (s, e) =>
-            {
-                if (!disconnect && notifyChar.SubscribedClients.Count > 0)
-                {
-                    // var inp = GetCurrentInput();
-                    // Console.WriteLine($"[LIVE] {inp}");
-                }
-            };
-            debugTimer.AutoReset = true;
-            debugTimer.Start();
             Console.WriteLine("Press Enter to stop...");
             Console.ReadLine();
 
             provider.StopAdvertising();
-            debugTimer.Stop();
             Console.WriteLine("Server stopped.");
 
             // Keep the app alive
             await Task.Delay(-1);
         }
 
-        private static void SendStatusToWSClients(string status)
+        private static async void OnSubscribedClientsChanged(GattLocalCharacteristic sender, object args) {
+            if (notifyChar != null) 
+            {
+                var currentSubscribers = notifyChar.SubscribedClients;
+                // A. REMOVE DISCONNECTED CLIENTS
+                // If a player in our dictionary is no longer in the system's subscriber list, remove them.
+                var stalePlayers = ConnectedPlayers
+                    .Where(kvp => !currentSubscribers.Contains(kvp.Value.Client))
+                    .ToList();
+                foreach (var stale in stalePlayers) {
+                    if (ConnectedPlayers.TryRemove(stale.Key, out _)) {
+                        Console.WriteLine($"[BLE] Subscriber dropped: Player {stale.Key}");
+                        SendStatusToWSClients("DISCONNECTED", stale.Key);
+                    }
+                }
+
+                // B. ADD NEW SESSIONS + GHOST FILTERING
+                foreach (var client in currentSubscribers) {
+                    string deviceId = client.Session.DeviceId.Id;
+                    // Check if this device is already in our dictionary
+                    if (!ConnectedPlayers.Values.Any(p => p.DeviceId == deviceId)) {
+                        int assignedId = GetStickyPlayerId(deviceId);
+
+                        var newSession = new PlayerSession {
+                            PlayerId = assignedId,
+                            DeviceId = deviceId,
+                            Client = client,
+                            LastSeen = DateTime.Now
+                        };
+
+                        if (ConnectedPlayers.TryAdd(assignedId, newSession)) {
+                            try {
+                                Console.WriteLine($"[BLE] Player {assignedId} Connected ({deviceId})");
+                                await Task.Delay(1000);
+                                SendStatusToWSClients("CONNECTED", assignedId);
+                                await newSession.SendMessageViaBle("VIBRATE", notifyChar);
+                            } catch (Exception ex) {
+                                Console.WriteLine($"[BLE] Initial failed: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+                StartHeartbeatWatcher();
+            }
+        }
+
+        private static void OnHeartbeatElapsed(object? sender, System.Timers.ElapsedEventArgs e) {
+            var now = DateTime.Now;
+            
+            // Identify players who haven't been seen in over 3 seconds
+            var timedOutPlayers = ConnectedPlayers
+                .Where(kvp => (now - kvp.Value.LastSeen).TotalSeconds > 3)
+                .ToList();
+
+            foreach (var timedOut in timedOutPlayers) {
+                if (ConnectedPlayers.TryRemove(timedOut.Key, out var session)) {
+                    Console.WriteLine($"[TIMEOUT] Player {timedOut.Key} (Device: {session.DeviceId}) timed out.");
+                    SendStatusToWSClients("DISCONNECTED", timedOut.Key);
+                }
+            }
+
+            if (ConnectedPlayers.IsEmpty) {
+                Console.WriteLine("[WATCHER] No players remaining. Idling...");
+            }
+        }
+
+        private static void StartHeartbeatWatcher() {
+            if (disconnectTimer != null) return;
+            disconnectTimer = new System.Timers.Timer(2000);
+            disconnectTimer.AutoReset = true;
+            disconnectTimer.Elapsed += OnHeartbeatElapsed;
+            disconnectTimer.Start();
+        }
+
+        private static int GetStickyPlayerId(string deviceId)
         {
-            string statusMsg = JsonSerializer.Serialize(new { type = "status", value = status });
+            // 1. If we've seen this phone before, reuse the old ID
+            if (_playerIdHistory.TryGetValue(deviceId, out int existingId))
+            {
+                Console.WriteLine($"[ID] Welcome back! Reassigning ID {existingId} to {deviceId}");
+                return existingId;
+            }
+
+            // 2. If it's a brand new phone, generate a new ID
+            int newId = Interlocked.Increment(ref _nextPlayerId);
+            _playerIdHistory.TryAdd(deviceId, newId);
+            return newId;
+        }
+
+        public static void CleanUp() 
+        {
+            disconnectTimer?.Stop();
+            if (provider != null) {
+                try {
+                    Console.WriteLine("[BLE] Stopping Advertisement...");
+                    provider.StopAdvertising();
+                    if (notifyChar != null) {
+                        notifyChar.SubscribedClientsChanged -= OnSubscribedClientsChanged;
+                    }
+                    provider = null;
+                    notifyChar = null;
+                    ConnectedPlayers.Clear();
+                    _playerIdHistory.Clear();
+                    lock (_wsLock)
+                    {
+                        foreach (var ws in wsSessions) { try { ws.Close(); } catch { } }
+                        wsSessions.Clear();
+                    }
+                    Console.WriteLine("[BLE] Cleanup complete.");
+                } catch (Exception ex) {
+                    Console.WriteLine($"[BLE] Error: {ex.Message}");
+                }
+            }
+            System.Threading.Thread.Sleep(1500);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            Task.Delay(500).Wait();
+            Environment.Exit(0);
+        }
+
+        private static void SendStatusToWSClients(string status, int pId)
+        {
+            var statusObj = new 
+            { 
+                type = "status", 
+                value = status, 
+                playerId = pId 
+            };
+            string statusMsg = JsonSerializer.Serialize(statusObj);
             byte[] statusData = Encoding.UTF8.GetBytes(statusMsg + "\n");
             
             lock (_wsLock) {
@@ -483,69 +507,66 @@ namespace BleServer
             }
         }
 
-        public static void CleanUp() 
+        // Helper to broadcast input to all games
+        private static Task BroadcastInputAsync(InputState input)
         {
-            if (provider != null) {
-                try {
-                    Console.WriteLine("[BLE] Stopping Advertisement...");
-                    provider.StopAdvertising();
-                    provider = null;
-                    Console.WriteLine("[BLE] Cleanup complete.");
-                } catch (Exception ex) {
-                    Console.WriteLine($"[BLE] Error: {ex.Message}");
-                }
-            }
-            // Now it's safe to exit
-            Environment.Exit(0);
-        }
+            return Task.Run(() =>
+            {
+                string json = JsonSerializer.Serialize(input) + "\n";
+                byte[] data = Encoding.UTF8.GetBytes(json);
 
-        internal static async Task SendCommand(string command)
-        {
-            if (notifyChar == null)
-            {
-                Console.WriteLine($"[PC] Cannot send '{command}' — notify characteristic not ready");
-                return;
-            }
-
-            if (notifyChar.SubscribedClients.Count == 0)
-            {
-                Console.WriteLine($"[PC] Cannot send '{command}' — no phone subscribed (not connected)");
-                return;
-            }
-
-            try
-            {
-                var writer = new DataWriter();
-                writer.WriteString(command + "\n");
-                await notifyChar.NotifyValueAsync(writer.DetachBuffer());
-                Console.WriteLine($"[PC] → Sent command to phone: {command}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[PC] Failed to send '{command}': {ex.Message}");
-            }
-        }
-
-        public static InputState GetCurrentInput()
-        {
-            lock (inputLock)
-            {
-                return new InputState
+                lock (_wsLock)
                 {
-                    JoyLX = currentInput.JoyLX,
-                    JoyLY = currentInput.JoyLY,
-                    JoyRX = currentInput.JoyRX,
-                    JoyRY = currentInput.JoyRY,
-                    Buttons = currentInput.Buttons,
-                    Stepping = currentInput.Stepping,
-                    Steering = currentInput.Steering
-                };
+                    for (int i = wsSessions.Count - 1; i >= 0; i--)
+                    {
+                        try
+                        {
+                            var ws = wsSessions[i];
+                            if (ws != null && ws.IsAlive)
+                            {
+                                ws.Send(data);
+                            }
+                            else
+                            {
+                                wsSessions.RemoveAt(i);
+                            }
+                        }
+                        catch
+                        {
+                            wsSessions.RemoveAt(i);
+                        }
+                    }
+                }
+            });
+        }
+
+        public static async Task SendToPlayer(int pId, string message)
+        {
+            // notifyChar is your global GattLocalCharacteristic
+            if (ConnectedPlayers.TryGetValue(pId, out var session))
+            {
+                await session.SendMessageViaBle(message, notifyChar);
             }
+            else
+            {
+                Console.WriteLine($"[BLE] Target Player {pId} not found in active sessions.");
+            }
+        }
+
+        public static async Task BroadcastToAllPlayers(string message)
+        {
+            var uniqueSessions = ConnectedPlayers.Values
+                .GroupBy(s => s.DeviceId)
+                .Select(g => g.First());
+
+            var tasks = uniqueSessions.Select(player => player.SendMessageViaBle(message, notifyChar));
+            await Task.WhenAll(tasks);
         }
     }
 
     public class ControllerWsBehavior : WebSocketBehavior
     {
+        private static readonly System.Threading.SemaphoreSlim _sendLock = new System.Threading.SemaphoreSlim(1, 1);
         public ControllerWsBehavior()
         {
             this.Protocol = ""; 
@@ -557,6 +578,7 @@ namespace BleServer
             Console.WriteLine("[WS] Cocos Creator client connected");
             lock (Program._wsLock)
             {
+                Program.wsSessions.RemoveAll(s => !s.IsAlive);
                 Program.wsSessions.Add(Context.WebSocket);
             }
         }
@@ -583,19 +605,91 @@ namespace BleServer
         {
             if (e.IsText)
             {
-                string command = e.Data.Trim();
-                Console.WriteLine($"[WS] Command from game: {command}");
-
-                if (command == "SHUTDOWN") 
+                string rawData = e.Data.Trim();
+                // 1. Handle SYSTEM Commands (pId: -2)
+                if (rawData.StartsWith("SYSTEM:")) 
                 {
-                    Console.WriteLine("[WS] Shutdown command received from game.");
-                    // This will trigger the ProcessExit/Cleanup logic naturally
-                    Program.CleanUp();
+                    string sysCmd = rawData.Substring(7); // Remove "SYSTEM:"
+                    if (sysCmd == "SHUTDOWN") 
+                    {
+                        Console.WriteLine("[WS] Shutdown command received from game.");
+                        Program.CleanUp();
+                    }
                     return;
                 }
 
-                // Forward to phone via BLE Notify
-                Task.Run(async () => await Program.SendCommand(command));
+                // 2. Handle TARGET Commands (Direct or Broadcast)
+                if (rawData.StartsWith("TARGET:")) 
+                {
+                    // Forward to phone via BLE Notify
+                    _ = Task.Run(async () => {
+                        await _sendLock.WaitAsync(); // Wait for the previous message to finish
+                        try 
+                        {
+                            // Format: TARGET:pId:actualCommand
+                            // Split by ':' but only into 3 parts to preserve colons inside JSON/Base64
+                            string[] parts = rawData.Split(':', 3);
+                            if (parts.Length < 3) return;
+
+                            int pId = int.Parse(parts[1]);
+                            string actualCmd = parts[2];
+
+                            if (pId == -1) 
+                            {
+                                // BROADCAST: Send to everyone
+                                await Program.BroadcastToAllPlayers(actualCmd);
+                            } 
+                            else 
+                            {
+                                if (!Program.ConnectedPlayers.ContainsKey(pId))
+                                {
+                                    return; 
+                                }
+                                // DIRECT: Send to specific phone
+                                await Program.SendToPlayer(pId, actualCmd);
+                            }
+
+                            // Adaptive delay for large data transfers (Chunks)
+                            if (actualCmd.StartsWith("CHUNK:")) 
+                            {
+                                await Task.Delay(50); 
+                            }
+                        }
+                        catch (Exception ex) 
+                        {
+                            Console.WriteLine($"[WS] Error parsing target command: {ex.Message}");
+                        }
+                        finally {
+                            _sendLock.Release(); // Let the next message proceed
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    public class PlayerSession
+    {
+        public int PlayerId { get; set; }
+        public required string DeviceId { get; set; }
+        public required GattSubscribedClient Client { get; set; }
+        public DateTime LastSeen { get; set; } = DateTime.Now;
+
+        public async Task SendMessageViaBle(string message, GattLocalCharacteristic? notifyChar)
+        {
+            if (notifyChar == null || Client == null) return;
+
+            try
+            {
+                var writer = new DataWriter();
+                writer.WriteString(message + "\n");
+                // Use the specific client stored in this session
+                await notifyChar.NotifyValueAsync(writer.DetachBuffer(), Client);
+                Console.WriteLine($"[PC] → Sent to Player {PlayerId}: {message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[PC] Failed to send to Player {PlayerId}: {ex.Message}");
             }
         }
     }

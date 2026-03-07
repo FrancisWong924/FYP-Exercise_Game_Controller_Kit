@@ -3,6 +3,7 @@ import 'models/controller_element.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'dart:io';
 
 class BleUuids {
   static const String service     = "12345678-1234-5678-1234-56789abcdef0";
@@ -25,6 +26,7 @@ class BleManager {
   BluetoothCharacteristic? pingCharacteristic;   // For PING (WithResponse)
   BluetoothCharacteristic? inputCharacteristic;  // For fast input (WithoutResponse)
 
+  bool _isConnecting = false;
   Timer? _heartbeatTimer;
   Timer? _disconnectWatcher;
   Timer? _inputTimer;
@@ -33,6 +35,7 @@ class BleManager {
 
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   StreamSubscription<List<ScanResult>>? _scanSubscription;
+  StreamSubscription<List<int>>? _lastValueSubscription;
 
   // Public stream for status updates
   final _statusController = StreamController<BleConnectionStatus>.broadcast();
@@ -48,6 +51,7 @@ class BleManager {
   double currentStep = 0.0;  // -1.0 to 0.0
 
   Uint8List? _lastSentPacket;
+  bool _isPausedForLargeData = false;
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
@@ -70,6 +74,7 @@ class BleManager {
     _disconnectWatcher = Timer.periodic(const Duration(seconds: 2), (_) {
       if (DateTime.now().difference(_lastPongTime) > const Duration(seconds: 3)) {
         print("[BLE] HEARTBEAT TIMEOUT - PC is gone!");
+        _stopHeartbeat();
         _disconnectWatcher?.cancel();
         pcDevice?.disconnect();  // Force disconnect → triggers connectionState listener
       }
@@ -77,12 +82,13 @@ class BleManager {
   }
 
   Future<void> startScanningAndConnect() async {
+    if (_isConnecting || (pcDevice != null && pcDevice!.isConnected)) return;
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     // Turn on Bluetooth if needed
     if (await FlutterBluePlus.isSupported == false) {
       print("Bluetooth not supported on this device");
-      _statusController.add(BleConnectionStatus.failed);
+      _statusController.add(BleConnectionStatus.bluetoothOff);
       return;
     }
 
@@ -91,32 +97,38 @@ class BleManager {
       await FlutterBluePlus.turnOn();
     }
 
-    print("[BLE] Starting scan...");
-
-    // Ensure no ongoing scan
-    await FlutterBluePlus.stopScan();
-
-    // Start scanning
-    FlutterBluePlus.startScan(withServices: [Guid(BleUuids.service)]);
-
-    await _scanSubscription?.cancel();
-    // Listen to scan results
-    _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
-      for (ScanResult r in results) {
-        if (r.advertisementData.serviceUuids.contains(Guid(BleUuids.service))) {
-          
-          print("[BLE] Found PC: ${r.device.platformName}");
-          FlutterBluePlus.stopScan();
-
-          pcDevice = r.device;
-          _statusController.add(BleConnectionStatus.connecting);
-          await connectToDevice(pcDevice!);
-          await _scanSubscription?.cancel();  // Stop listening after connect
-           _scanSubscription = null;
-          return;
+    try {
+      // Clear out ALL old subscriptions to prevent multiple listeners
+      await _scanSubscription?.cancel();
+      _scanSubscription = null;
+      // Ensure no ongoing scan
+      await FlutterBluePlus.stopScan();
+      print("[BLE] Starting scan...");
+      _statusController.add(BleConnectionStatus.scanning);
+      // Start scanning
+      FlutterBluePlus.startScan(withServices: [Guid(BleUuids.service)]);
+      // Listen to scan results
+      _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
+        for (ScanResult r in results) {
+          if (r.advertisementData.serviceUuids.contains(Guid(BleUuids.service))) {
+            FlutterBluePlus.stopScan();
+            if (_isConnecting) return;
+            print("[BLE] Found PC: ${r.device.platformName}");
+            _isConnecting = true;
+            pcDevice = r.device;
+            _statusController.add(BleConnectionStatus.connecting);
+            await connectToDevice(pcDevice!);
+            await _scanSubscription?.cancel();  // Stop listening after connect
+            _scanSubscription = null;
+            _isConnecting = false;
+            return;
+          }
         }
-      }
-    });
+      });
+    } catch (e) {
+      print("[BLE] Scan error: $e");
+      _isConnecting = false;
+    }
   }
 
   Future<void> connectToDevice(BluetoothDevice device) async {
@@ -126,23 +138,41 @@ class BleManager {
       _connectionStateSubscription = null;
       await device.connect(license: License.free);
       print("[BLE] Connected to ${device.platformName}");
-      _statusController.add(BleConnectionStatus.connected);
-      // IMPORTANT: Wait a moment for Windows to initialize the GATT table
-      await Future.delayed(const Duration(milliseconds: 500));
-      // Discover services
-      List<BluetoothService> services = await device.discoverServices();
+      await Future.delayed(const Duration(seconds: 2));
+      if (Platform.isAndroid) {
+        print("[BLE] Clearing Android GATT Cache...");
+        await device.clearGattCache();
+        await Future.delayed(const Duration(seconds: 3));
+      }
+
+      List<BluetoothService> services = [];
+      for (int i = 0; i < 3; i++) {
+        services = await device.discoverServices();
+        if (services.isNotEmpty) break;
+        
+        print("[BLE] Services empty, waiting and retrying ($i)...");
+        await Future.delayed(const Duration(seconds: 1));
+      }
+      if (services.isEmpty) {
+        print("[BLE] Fatal: Could not find services after 3 tries.");
+        _handleCleanupAndReconnect();
+        return;
+      }
       print("[BLE] Discovered ${services.length} services");
 
       for (var service in services) {
         if (service.uuid.str.toLowerCase() == BleUuids.service.toLowerCase()) {
           print("[BLE] Found our service!");
-
           for (var char in service.characteristics) {
             final uuidStr = char.uuid.str.toLowerCase();
             // Setup notify (PC → Phone)
             if (uuidStr == BleUuids.notifyChar.toLowerCase()) {
+              await _lastValueSubscription?.cancel();
+              _lastValueSubscription = null;
               await char.setNotifyValue(true);
-              char.lastValueStream.listen((value) {
+              await Future.delayed(const Duration(milliseconds: 200));
+
+              _lastValueSubscription = char.lastValueStream.listen((value) {
                 String text = utf8.decode(value, allowMalformed: true).trim();
                 print("[BLE] ← From PC: $text");
                 if (text.contains("PONG")) {
@@ -170,6 +200,7 @@ class BleManager {
       }
       // Start heartbeat only if PING char exists
       if (pingCharacteristic != null) {
+        _statusController.add(BleConnectionStatus.connected);
         _startHeartbeat();
         _startDisconnectWatcher();
         startInputSending();
@@ -177,39 +208,40 @@ class BleManager {
       } else {
         print("[BLE] ERROR: PING characteristic not found!");
       }
-      await _connectionStateSubscription?.cancel();
       // Monitor disconnection
       _connectionStateSubscription = device.connectionState.listen((BluetoothConnectionState state) async {
         print("[BLE] Connection state changed: $state");
         if (state == BluetoothConnectionState.disconnected) {
           print("[BLE] Disconnected from PC!");
-          stopInputSending();
-          _stopHeartbeat();
-          _disconnectWatcher?.cancel();
           _statusController.add(BleConnectionStatus.disconnected);
-          pcDevice = null;
-          pingCharacteristic = null;
-          inputCharacteristic = null;
-          await _connectionStateSubscription?.cancel();
-          _connectionStateSubscription = null;
-          await Future.delayed(const Duration(seconds: 1));
-          if (!_statusController.isClosed) {
-            print("[BLE] Attempting to reconnect...");
-            await Future.delayed(const Duration(seconds: 2));
-            startScanningAndConnect();
-          }
+          _handleCleanupAndReconnect();
         }
       },
       onError: (e) {
         print("[BLE] Connection error: $e");
-        _statusController.add(BleConnectionStatus.failed);
-        startScanningAndConnect();
+        _handleCleanupAndReconnect();
       });
     } catch (e) {
       print("[BLE] Connect failed: $e");
       await device.disconnect();
-      _statusController.add(BleConnectionStatus.failed);
-      await Future.delayed(const Duration(seconds: 3));
+      _handleCleanupAndReconnect();
+    }
+  }
+
+  void _handleCleanupAndReconnect() async {
+    stopInputSending();
+    _stopHeartbeat();
+    _disconnectWatcher?.cancel();
+    
+    pcDevice = null;
+    pingCharacteristic = null;
+    inputCharacteristic = null;
+    
+    _isConnecting = false;
+    _statusController.add(BleConnectionStatus.failed);
+    await Future.delayed(const Duration(seconds: 5)); // Increased delay for Windows release
+    if (!_statusController.isClosed) {
+      print("[BLE] Attempting to reconnect...");
       startScanningAndConnect();
     }
   }
@@ -224,7 +256,7 @@ class BleManager {
     }
   }
 
-  Future<bool> togglePause(String command) async {
+  Future<bool> sendMessage(String command) async {
     if (pingCharacteristic == null) {
       print("[BLE] Cannot send $command — PING characteristic not available");
       return false;
@@ -249,44 +281,12 @@ class BleManager {
     }
   }
 
-  // Send ONLY when buttons actually change
-  void sendButtons() {
-    if (inputCharacteristic == null) return;
-
-    final packet = Uint8List(4);
-    packet.buffer.asByteData().setUint32(0, currentButtons, Endian.little);
-    // packet[0] = currentButtons & 0xFF;
-    // packet[1] = (currentButtons >> 8) & 0xFF;
-    // packet[2] = (currentButtons >> 16) & 0xFF;
-    // packet[3] = (currentButtons >> 24) & 0xFF;
-
-    inputCharacteristic!.write(packet, withoutResponse: true);
-    // print("→ Buttons: 0x${currentButtons.toRadixString(16)}");
-  }
-
-  void updateJoystick(ControllerId id, double x, double y) {
-    final bool isLeft = id == ControllerId.leftJoystick;
-    if (isLeft) {
+  void updateJoystick(String type, double x, double y) {
+    if (type == "left") {
       currentJoy = currentJoy.copyWith(joyLX: x, joyLY: y);
     } else {
       currentJoy = currentJoy.copyWith(joyRX: x, joyRY: y);
     }
-  }
-
-  // Send ONLY when joysticks actually change
-  void sendJoysticks() {
-    if (inputCharacteristic == null) return;
-
-    final packet = Uint8List(8);
-    final bd = packet.buffer.asByteData();
-
-    bd.setInt16(0, (currentJoy.joyLX * 32767).round(), Endian.little);
-    bd.setInt16(2, (currentJoy.joyLY * 32767).round(), Endian.little);
-    bd.setInt16(4, (currentJoy.joyRX * 32767).round(), Endian.little);
-    bd.setInt16(6, (currentJoy.joyRY * 32767).round(), Endian.little);
-    print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
-    inputCharacteristic!.write(packet, withoutResponse: true);
-    // print("→ Joy L(${currentJoy.joyLX.toStringAsFixed(2)}, ${currentJoy.joyLY.toStringAsFixed(2)})");
   }
 
   void updateSteering(double steering) {
@@ -299,6 +299,7 @@ class BleManager {
 
   void sendCombinedInputPacket() async {
     if (inputCharacteristic == null || pcDevice == null) return;
+    if (_isPausedForLargeData) return;
     // Only attempt write if Flutter thinks we are connected
     if (FlutterBluePlus.connectedDevices.contains(pcDevice) == false) {
       print("[BLE] Guard: Device not in connected list. Stopping loop.");
@@ -326,7 +327,6 @@ class BleManager {
 
     // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
     // print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
-    _lastSentPacket = Uint8List.fromList(packet);
     bool isNeutral = currentButtons == 0 &&
       currentJoy.joyLX.abs() < 0.001 &&
       currentJoy.joyLY.abs() < 0.001 &&
@@ -334,10 +334,11 @@ class BleManager {
       currentJoy.joyRY.abs() < 0.001 &&
       currentStep.abs() < 0.001 &&
       currentSteering.abs() < 0.001;
-      
-    if (isNeutral && _arePacketsEqual(_lastSentPacket!, packet)) {
+    bool stateChanged = _lastSentPacket == null || !_arePacketsEqual(_lastSentPacket!, packet);
+    if (isNeutral && !stateChanged) {
       return;
     }
+    _lastSentPacket = Uint8List.fromList(packet);
     try {
       if (pcDevice!.isConnected) {
         // Fast path: no response
@@ -369,6 +370,15 @@ class BleManager {
     });
   }
 
+  void setInputPause(bool pause) {
+    _isPausedForLargeData = pause;
+    if (pause) {
+      print("[BLE] Input loop throttled for incoming data...");
+    } else {
+      print("[BLE] Input loop resumed.");
+    }
+  }
+
   // Call this when app pauses or disconnects
   void stopInputSending() {
     _inputTimer?.cancel();
@@ -388,6 +398,7 @@ class BleManager {
   void dispose() {
     _scanSubscription?.cancel();
     _connectionStateSubscription?.cancel();
+    _lastValueSubscription?.cancel();
     stopInputSending();
     _stopHeartbeat();
     _disconnectWatcher?.cancel();
