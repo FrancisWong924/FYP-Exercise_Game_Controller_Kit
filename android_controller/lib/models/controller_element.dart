@@ -26,7 +26,8 @@ enum ControllerElementType {
 
 class ControllerLayout {
   final String gameId;          // e.g., "racing_game_01"
-  final String layoutName;      // e.g., "Manual Transmission"
+  String layoutName;      // e.g., "Manual Transmission"
+  bool favorite;        // User can mark certain layouts as favorites
   final String version;
   final String? backgroundImage;  // The game dev might want a custom skin
   final String? backgroundColor;  // Optional solid color background (hex ARGB)
@@ -39,12 +40,14 @@ class ControllerLayout {
     this.layoutName = "Default",
     this.backgroundImage,
     this.backgroundColor,
+    this.favorite = false,
   });
 
   Map<String, dynamic> toJson() => {
     'gameId': gameId,
     'layoutName': layoutName,
     'version': version,
+    'favorite': favorite,
     'data': {
       'backgroundImage': backgroundImage,
       'backgroundColor': backgroundColor,
@@ -72,6 +75,7 @@ class ControllerLayout {
       version: json['version'].toString(),
       backgroundImage: data['backgroundImage'],
       backgroundColor: hexColor,
+      favorite: json['favorite'] ?? false,
       elements: elementList,
     );
   }
@@ -80,17 +84,16 @@ class ControllerLayout {
 class ControllerElement {
   final String id;                    // Unique ID
   final ControllerElementType type;
-  final Offset position;              // Center position (or bottom-left for joystick)
-  final double size;
   final int buttonId;                 // For buttons: bitmask value
   final String? joystickType;
   final String label;                 // Optional: "A", "X", "Fire", etc.
   final String backgroundColor;
   final String color;
-
   final String? image;    // For Base64 encoded strings
   final bool useSystemIcon;   // If true, use your local assets/icons/
   final double opacity;       // Some buttons should be faint
+  double size;
+  Offset position;              // Center position (or bottom-left for joystick)
 
   ControllerElement({
     required this.id,
@@ -103,7 +106,7 @@ class ControllerElement {
     this.color = "FFFFFFFF",
     this.backgroundColor = "33FFFFFF",
     this.image,
-    this.useSystemIcon = true, 
+    this.useSystemIcon = false, 
     this.opacity = 1.0,
   });
 
@@ -156,7 +159,7 @@ class ControllerElement {
       backgroundColor: backgroundColorData ?? "33FFFFFF",
       color: colorData ?? "FFFFFFFF",
       image: json['image']?.toString(),
-      useSystemIcon: json['useSystemIcon'] ?? true,
+      useSystemIcon: json['useSystemIcon'] ?? false,
       opacity: (json['opacity'] ?? 1.0).toDouble(),
     );
   }
@@ -164,12 +167,20 @@ class ControllerElement {
 
 class CustomButton extends StatefulWidget {
   final ControllerElement element;
+  final bool isEditing;
+  final bool isSelected;
+  final VoidCallback onSelect;
+  final Function(Offset newPosition) onPositionChanged;
   final Function(String id, bool pressed) onPressed;
 
   const CustomButton({
     super.key,
     required this.element,
     required this.onPressed,
+    required this.onSelect,
+    required this.onPositionChanged,
+    this.isEditing = false,
+    this.isSelected = false,
   });
 
   @override
@@ -250,7 +261,7 @@ class _CustomButtonState extends State<CustomButton> {
  
     // System Icons
     if (element.useSystemIcon && element.image == null) {
-      return _buildSvgLabel(element.label, element.size);
+      return _buildSvgLabel(element.label, element.size, element.color);
     }
 
     return Text(
@@ -263,7 +274,7 @@ class _CustomButtonState extends State<CustomButton> {
     );
   }
 
-  Widget _buildSvgLabel(String key, double size) {
+  Widget _buildSvgLabel(String key, double size, String colorHex) {
     const String path = 'assets/icons/';
     
     final Map<String, String> svgMap = {
@@ -278,7 +289,7 @@ class _CustomButtonState extends State<CustomButton> {
     };
 
     final String? svgFile = svgMap[key];
-    final Color iconColor = isPressed ? Colors.black : Colors.white;
+    final Color iconColor = isPressed ? Colors.black : colorHex != "FFFFFFFF" ? Color(int.parse(colorHex, radix: 16)) : Colors.white;
 
     // Optional tiny position tweak per icon
     final Map<String, Offset> nudge = {
@@ -323,37 +334,54 @@ class _CustomButtonState extends State<CustomButton> {
     final bool hideDecoration = imageData != null && !imageData.startsWith('<svg');
 
     return Positioned(
-      left: realX - widget.element.size / 2,
-      top: realY - widget.element.size / 2,
+      left: realX - (widget.element.size / 2) - 4,
+      top: realY - (widget.element.size / 2) - 4,
       child: GestureDetector(
-        onTapDown: (_) => {
+        onPanUpdate: widget.isEditing ? (details) {
+          if (widget.isSelected) {
+            double newX = (details.globalPosition.dx / screenSize.width).clamp(0.0, 1.0);
+            double newY = (details.globalPosition.dy / screenSize.height).clamp(0.0, 1.0);
+            widget.onPositionChanged(Offset(newX, newY));
+          }
+        } : null,
+        onTap: widget.isEditing ? widget.onSelect : null,
+        onTapDown: widget.isEditing ? null : (_) => {
           setState(() => isPressed = true),
           widget.onPressed(widget.element.id, true),
         },
-        onTapUp: (_) => {
+        onTapUp: widget.isEditing ? null : (_) => {
           setState(() => isPressed = false),
           widget.onPressed(widget.element.id, false),
         },
-        onTapCancel: () => {
+        onTapCancel: widget.isEditing ? null : () => {
           setState(() => isPressed = false),
           widget.onPressed(widget.element.id, false),
         },
-        child: Transform.scale(
-          scale: isPressed ? 0.92 : 1.0,
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 80),
-            width: widget.element.size,
-            height: widget.element.size,
-            decoration: hideDecoration 
-              ? null // No circle background for Links/Base64 
-              : BoxDecoration(
-                shape: BoxShape.circle,
-                color: isPressed ? Colors.white : Color(int.parse(widget.element.backgroundColor, radix: 16)),
-                border: Border.all(color: isPressed ? Colors.white : widget.element.backgroundColor != "33FFFFFF" ? Color(int.parse(widget.element.backgroundColor, radix: 16)) : Colors.white54, width: 2),
-                boxShadow: isPressed ? [const BoxShadow(color: Colors.black26, blurRadius: 6, offset: Offset(0, 3))] : null,
-              ),
-            alignment: Alignment.center,          // ← THIS DOES THE MAGIC!
-            child: _buildIcon(widget.element),
+        child: Container(
+          padding: const EdgeInsets.all(4), // Space between button and selection line
+          decoration: BoxDecoration(
+            border: widget.isSelected 
+                ? Border.all(color: Colors.blueAccent.withOpacity(0.8), width: 1.5) 
+                : Border.all(color: Colors.transparent),
+            borderRadius: BorderRadius.circular(4), // Slightly rounded corners for the square
+          ),
+          child: Transform.scale(
+            scale: isPressed ? 0.92 : 1.0,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 80),
+              width: widget.element.size,
+              height: widget.element.size,
+              decoration: hideDecoration 
+                ? null // No circle background for Links/Base64 
+                : BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: isPressed ? Colors.white : Color(int.parse(widget.element.backgroundColor, radix: 16)),
+                  border: Border.all(color: isPressed ? Colors.white : widget.element.backgroundColor != "33FFFFFF" ? Color(int.parse(widget.element.backgroundColor, radix: 16)) : Colors.white54, width: 2),
+                  boxShadow: isPressed ? [const BoxShadow(color: Colors.black26, blurRadius: 6, offset: Offset(0, 3))] : null,
+                ),
+              alignment: Alignment.center,
+              child: _buildIcon(widget.element),
+            ),
           ),
         ),
       ),
@@ -363,10 +391,22 @@ class _CustomButtonState extends State<CustomButton> {
 
 class CustomJoystick extends StatefulWidget {
   final ControllerElement element;
+  final bool isEditing;
+  final bool isSelected;
+  final VoidCallback onSelect;
+  final Function(Offset newPosition) onPositionChanged;
   final Function(String id, double x, double y) onChange;
   final double deadzone;
 
-  const CustomJoystick({super.key, required this.element, required this.onChange,this.deadzone = 0.15});
+  const CustomJoystick({super.key,
+    required this.element,
+    required this.onChange,
+    required this.onSelect,
+    required this.onPositionChanged,
+    this.isEditing = false,
+    this.isSelected = false,
+    this.deadzone = 0.15
+  });
 
   @override
   State<CustomJoystick> createState() => _CustomJoystickState();
@@ -374,14 +414,12 @@ class CustomJoystick extends StatefulWidget {
 
 class _CustomJoystickState extends State<CustomJoystick> {
   Offset delta = Offset.zero;
-  late double maxRadius;
   Offset? dragStartCenter;
   Timer? _joystickTimer;
 
   @override
   void initState() {
     super.initState();
-    maxRadius = widget.element.size;
   }
 
   @override
@@ -409,7 +447,7 @@ class _CustomJoystickState extends State<CustomJoystick> {
     delta = pos - dragStartCenter!;
 
     final dist = delta.distance;
-    if (dist > maxRadius) delta = delta * (maxRadius / dist);
+    if (dist > widget.element.size) delta = delta * (widget.element.size / dist);
 
     _sendUpdate();
     setState(() {});
@@ -431,8 +469,8 @@ class _CustomJoystickState extends State<CustomJoystick> {
   }
 
   void _sendUpdate() {
-    final rawX = delta.dx / maxRadius;
-    final rawY = delta.dy / maxRadius;
+    final rawX = delta.dx / widget.element.size;
+    final rawY = delta.dy / widget.element.size;
     final x = _applyDeadzone(rawX, widget.deadzone);
     final y = _applyDeadzone(rawY, widget.deadzone);
     widget.onChange(widget.element.id, x, y);
@@ -441,53 +479,72 @@ class _CustomJoystickState extends State<CustomJoystick> {
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.of(context).size;
+    final double maxRadius = widget.element.size;
     // Convert 0.0-1.0 to actual pixels
     final double realX = widget.element.position.dx * screenSize.width;
     final double realY = widget.element.position.dy * screenSize.height;
     return Positioned(
-      left: realX - maxRadius,
-      top: realY - maxRadius,
+      left: realX - maxRadius - 4,
+      top: realY - maxRadius - 4,
       child: GestureDetector(
-        onPanStart: _onPanStart,
-        onPanUpdate: _onPanUpdate,
-        onPanEnd: _onPanEnd,
+        onPanStart: widget.isEditing ? null : _onPanStart,
+        onPanUpdate: widget.isEditing
+          ? (details) {
+              if (widget.isSelected) {
+                double newX = (details.globalPosition.dx / screenSize.width).clamp(0.0, 1.0);
+                double newY = (details.globalPosition.dy / screenSize.height).clamp(0.0, 1.0);
+                widget.onPositionChanged(Offset(newX, newY));
+              }
+            } 
+          : _onPanUpdate,
+        onPanEnd: widget.isEditing ? null : _onPanEnd,
+        onTap: widget.isEditing ? widget.onSelect : null,
         child: Container(
-          width: maxRadius * 2,
-          height: maxRadius * 2,
+          padding: const EdgeInsets.all(4), 
           decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: Color(int.parse(widget.element.backgroundColor, radix: 16)),
-            border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white54, width: 2),
+            border: widget.isSelected 
+                ? Border.all(color: Colors.blueAccent.withOpacity(0.8), width: 1.5) 
+                : Border.all(color: Colors.transparent),
+            borderRadius: BorderRadius.circular(4),
           ),
-          child: Stack(
-            children: [
-              Center(
-                child: Container(
-                  width: maxRadius * 1.6,
-                  height: maxRadius * 1.6, 
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle, 
-                    border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white30)
-                  )
-                )
-              ),
-              Center(
-                child: Transform.translate(
-                  offset: delta, 
+          child: Container(
+            width: maxRadius * 2,
+            height: maxRadius * 2,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Color(int.parse(widget.element.backgroundColor, radix: 16)),
+              border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white54, width: 2),
+            ),
+            child: Stack(
+              children: [
+                Center(
                   child: Container(
-                    width: 44, 
-                    height: 44, 
+                    width: maxRadius * 1.6,
+                    height: maxRadius * 1.6, 
                     decoration: BoxDecoration(
-                      color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white, 
                       shape: BoxShape.circle, 
-                      boxShadow: const [
-                        BoxShadow(blurRadius: 8, color: Colors.black45)
-                      ]
+                      border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white30)
                     )
                   )
-                )
-              ),
-            ],
+                ),
+                Center(
+                  child: Transform.translate(
+                    offset: delta, 
+                    child: Container(
+                      width: 44, 
+                      height: 44, 
+                      decoration: BoxDecoration(
+                        color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white, 
+                        shape: BoxShape.circle, 
+                        boxShadow: const [
+                          BoxShadow(blurRadius: 8, color: Colors.black45)
+                        ]
+                      )
+                    )
+                  )
+                ),
+              ],
+            ),
           ),
         ),
       ),

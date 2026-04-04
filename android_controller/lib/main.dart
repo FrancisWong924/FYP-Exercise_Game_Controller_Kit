@@ -35,9 +35,10 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   late SharedPreferences prefs;
   String _status = 'Connecting...';
   bool showStatusBanner = true;
-  Timer? bannerTimer;
   bool isLoading = true;
   bool paused = false;
+  Timer? bannerTimer;
+  Offset editorPosition = const Offset(0.5, 0.05);
 
   double neutralRoll = 1.55;
   double maxDeviation = 1.1;
@@ -49,8 +50,8 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   double accelZ = 0.0;  // Current Z-axis accel
   double stepThreshold = 1.5;  // Tune this: higher = needs stronger shake/step
   double lastAccelZ = 0.0;
-  bool isWalking = false;  // True if forward motion detected
   Timer? stepTimer;  // Debounce steps
+  bool isWalking = false;  // True if forward motion detected
 
   String messageBuffer = ""; // Buffer for large transmissions
   bool isReceivingLayout = false;
@@ -58,11 +59,18 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   DateTime? lastLayoutChunkTime;
   Timer? layoutWatchdog;
 
-  ControllerLayout? customLayout; 
-  bool isUsingCustomLayout = false;
+  static String defaultKey = "Default_Layout";
+  ControllerLayout? defaultLayout;
+  ControllerLayout? currentLayout;
+  ControllerLayout? cachedLayout; 
 
   Widget? _processedBackground;
   Widget? backgroundColor;
+
+  bool isEditing = false;
+  String? currentStorageKey;
+  ControllerLayout? editLayoutCopy;
+  ControllerElement? selectedElement;
 
   @override
   void initState() {
@@ -76,7 +84,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
-    customLayout = null;
+    cachedLayout = null;
+    currentLayout = null;
+    currentStorageKey = null;
     accelSubscription?.cancel();
     stepTimer?.cancel();
     bleManager.stopInputSending();
@@ -113,7 +123,15 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
 
   Future<void> initializeApp() async {
     await initPrefs();
-
+    defaultLayout = await getDefaultLayout();
+    currentStorageKey = defaultKey;
+    if (!prefs.containsKey(defaultKey)) {
+      print("[Init] Default layout not found. Creating it now...");
+      await saveLayout(defaultKey, defaultLayout!);
+    }
+    setState(() {
+      currentLayout = defaultLayout;
+    });
     // Listen to connection status
     bleManager.statusStream.listen((status) {
       String text = statusToString(status);
@@ -132,7 +150,26 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         // Stop tilt steering
         setState(() {
           steeringValue = 0.0;
-          isUsingCustomLayout = false;
+          currentLayout = defaultLayout;
+          currentStorageKey = defaultKey;
+          _processedBackground = null;
+          backgroundColor = null;
+          final allKeys = prefs.getKeys();
+          for (String key in allKeys) {
+            final jsonString = prefs.getString(key);
+            if (jsonString == null) continue;
+            try {
+              final Map<String, dynamic> data = jsonDecode(jsonString);
+              // Check if it's the same game/version AND it's already a favorite
+              if (data['gameId'] == defaultLayout!.gameId && data['favorite'] == true) {
+                final layout = ControllerLayout.fromJson(data);
+                currentLayout = layout;
+                currentStorageKey = key;
+              }
+            } catch (e) {
+              continue; // Skip keys that aren't valid layout JSON
+            }
+          }
         });
 
         // Stop step detection
@@ -163,13 +200,6 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
             String storageKey = "${gameId}_v$version"; // Create a unique key per version
 
             print("[UI] Game Handshake: $gameId (Version: $version)");
-            
-            if (customLayout != null && customLayout!.gameId == gameId && customLayout!.version == version) {
-              setState(() {
-                isUsingCustomLayout = true;
-              });
-              return;
-            }
             
             if (prefs.containsKey(storageKey)) {
               print("[UI] Found cached layout for $storageKey");
@@ -395,7 +425,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   Future<void> initPrefs() async {
     prefs = await SharedPreferences.getInstance();   // ← initialize here
     // await prefs.clear();
-  //   final allKeys = prefs.getKeys();
+    // final allKeys = prefs.getKeys();
   // print("--- [DEBUG] SharedPreferences Content ---");
   // if (allKeys.isEmpty) {
   //   print("Storage is empty.");
@@ -422,14 +452,15 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     if (jsonString != null) {
       try {     
         // Use the fromJson factory we created earlier
-        customLayout = ControllerLayout.fromJson(jsonDecode(jsonString));
-        processBackgroundImage(customLayout!.backgroundImage);
-        buildBackgroundColor(customLayout!.backgroundColor);
-        setState(() {
-          isUsingCustomLayout = true;
-        });
-
-        print("[Storage] Local layout found for $storageKey");
+        cachedLayout = ControllerLayout.fromJson(jsonDecode(jsonString));
+        currentLayout = cachedLayout; // Set current layout to the loaded cached layout
+        if (isEditing) {
+          cloneLayout();
+        }
+        processBackgroundImage(currentLayout!.backgroundImage);
+        buildBackgroundColor(currentLayout!.backgroundColor);
+        print("--------------------------------------------");
+        print("[Storage] Local layout found for $storageKey, name: ${currentLayout!.layoutName}");
         return true;
       } catch (e) {
         print("[Storage] Error loading saved layout: $e");
@@ -438,89 +469,103 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     return false;
   }
 
-  List<ControllerElement> getDefaultLayout(double screenWidth, double screenHeight) {
-    return [
-      ControllerElement(
-        id: ControllerId.leftJoystick.name,
-        type: ControllerElementType.joystick,
-        joystickType: "left",
-        position: Offset(0.252, 0.75),
-        label: "left_joystick",
-        size: 55,
-      ),
-      ControllerElement(
-        id: ControllerId.rightJoystick.name,
-        type: ControllerElementType.joystick,
-        joystickType: "right",
-        position: Offset(0.76, 0.75),
-        label: "right_joystick",
-        size: 55,
-      ),
-      ControllerElement(
-        id: ControllerId.buttonSquare.name,
-        type: ControllerElementType.button,
-        position: Offset(0.804, 0.499),
-        size: 65,
-        buttonId: 1 << 2,
-        label: "square",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonCross.name,
-        type: ControllerElementType.button,
-        position: Offset(0.87, 0.642),
-        size: 65,
-        buttonId: 1 << 0,
-        label: "cross",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonCircle.name,
-        type: ControllerElementType.button,
-        position: Offset(0.935, 0.499),
-        size: 65,
-        buttonId: 1 << 1,
-        label: "circle",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonTriangle.name,
-        type: ControllerElementType.button,
-        position: Offset(0.87, 0.358),
-        size: 65,
-        buttonId: 1 << 3,
-        label: "triangle",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonUp.name,
-        type: ControllerElementType.button,
-        position: Offset(0.141, 0.358),
-        size: 65,
-        buttonId: 1 << 12,
-        label: "arrow_up",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonDown.name,
-        type: ControllerElementType.button,
-        position: Offset(0.141, 0.642),
-        size: 65,
-        buttonId: 1 << 13,
-        label: "arrow_down",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonLeft.name,
-        type: ControllerElementType.button,
-        position: Offset(0.075, 0.499),
-        size: 65,
-        buttonId: 1 << 14,
-        label: "arrow_left",
-      ),
-      ControllerElement(
-        id: ControllerId.buttonRight.name,
-        type: ControllerElementType.button,
-        position: Offset(0.206, 0.499),
-        size: 65,
-        buttonId: 1 << 15,
-        label: "arrow_right",
-      ),
-    ];
+  Future<ControllerLayout> getDefaultLayout() async {
+    return ControllerLayout(
+      gameId: "default_controller",
+      layoutName: "Default Layout",
+      version: "1",
+      backgroundColor: "FF121212", // Dark grey background
+      elements: [
+        ControllerElement(
+          id: ControllerId.leftJoystick.name,
+          type: ControllerElementType.joystick,
+          joystickType: "left",
+          position: Offset(0.252, 0.75),
+          label: "left_joystick",
+          size: 55,
+        ),
+        ControllerElement(
+          id: ControllerId.rightJoystick.name,
+          type: ControllerElementType.joystick,
+          joystickType: "right",
+          position: Offset(0.76, 0.75),
+          label: "right_joystick",
+          size: 55,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonSquare.name,
+          type: ControllerElementType.button,
+          position: Offset(0.804, 0.499),
+          size: 65,
+          buttonId: 1 << 2,
+          label: "square",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonCross.name,
+          type: ControllerElementType.button,
+          position: Offset(0.87, 0.642),
+          size: 65,
+          buttonId: 1 << 0,
+          label: "cross",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonCircle.name,
+          type: ControllerElementType.button,
+          position: Offset(0.935, 0.499),
+          size: 65,
+          buttonId: 1 << 1,
+          label: "circle",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonTriangle.name,
+          type: ControllerElementType.button,
+          position: Offset(0.87, 0.358),
+          size: 65,
+          buttonId: 1 << 3,
+          label: "triangle",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonUp.name,
+          type: ControllerElementType.button,
+          position: Offset(0.141, 0.358),
+          size: 65,
+          buttonId: 1 << 12,
+          label: "arrow_up",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonDown.name,
+          type: ControllerElementType.button,
+          position: Offset(0.141, 0.642),
+          size: 65,
+          buttonId: 1 << 13,
+          label: "arrow_down",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonLeft.name,
+          type: ControllerElementType.button,
+          position: Offset(0.075, 0.499),
+          size: 65,
+          buttonId: 1 << 14,
+          label: "arrow_left",
+          useSystemIcon: true,
+        ),
+        ControllerElement(
+          id: ControllerId.buttonRight.name,
+          type: ControllerElementType.button,
+          position: Offset(0.206, 0.499),
+          size: 65,
+          buttonId: 1 << 15,
+          label: "arrow_right",
+          useSystemIcon: true,
+        ),
+      ],
+    );
   }
 
   void processBackgroundImage(String? source) {
@@ -553,6 +598,369 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     }
   }
 
+  void cloneLayout() {
+    final String raw = jsonEncode(currentLayout!.toJson());
+    editLayoutCopy = ControllerLayout.fromJson(jsonDecode(raw));
+  }
+
+  void toggleEditMode() {
+    setState(() {
+      if (!isEditing) {
+        cloneLayout();
+      } else {
+        // EXITING EDIT MODE (from the toggle logic):
+        editLayoutCopy = null;
+      }
+      isEditing = !isEditing;
+      selectedElement = null; 
+    });
+    // Optionally disable BLE inputs while editing
+    bleManager.setInputPause(isEditing);
+  }
+
+  Widget _buildStandardToolbar() {
+    return Center(
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            onTap: () async {
+              setState(() => paused = !paused);
+              final sent = await bleManager.sendMessage(paused ? "PAUSE" : "RESUME");
+              if (!sent) {
+                setState(() => paused = !paused);
+              }
+            },
+            child: Container(
+              width: 36, height: 26,
+              decoration: const BoxDecoration(
+                color: Colors.white24,
+                shape: BoxShape.rectangle,
+                borderRadius: BorderRadius.all(Radius.circular(4)),
+              ),
+              child: Icon(paused ? Icons.play_arrow : Icons.pause, color: Colors.white, size: 18),
+            ),
+          ),
+          const SizedBox(width: 4),
+          GestureDetector(
+            onTap: () {
+              showDialog(
+                context: context,
+                barrierColor: Colors.black54, // Darkens the background
+                builder: (BuildContext context) {
+                  return Center(
+                    child: Material(
+                      color: Colors.transparent,
+                      child: Container(
+                        // Set your desired width/height for the center box
+                        width: MediaQuery.of(context).size.width * 0.4,
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1A1A1A), // Dark charcoal
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.white10),
+                          boxShadow: [
+                            BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
+                          ],
+                        ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text(
+                              "SETTINGS",
+                              style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                            ),
+                            const SizedBox(height: 20),
+                            // Button 1: Layout Customization
+                            _buildMenuButton(
+                              const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                              "Customize Layout", 
+                              () {
+                                Navigator.pop(context);
+                                toggleEditMode();
+                            }),
+                            const SizedBox(height: 10),
+                            // Close Button
+                            TextButton(
+                              onPressed: () => Navigator.pop(context),
+                              child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+            child: Container(
+              width: 36, height: 26,
+              decoration: const BoxDecoration(
+                color: Colors.white24,
+                shape: BoxShape.rectangle,
+                borderRadius: BorderRadius.all(Radius.circular(4)),
+              ),
+              child: Icon(Icons.settings, color: Colors.white, size: 18),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEditorToolbar() {
+    final double toolbarWidth = MediaQuery.of(context).size.width * 0.45;
+    return GestureDetector(
+      onPanUpdate: (details) {
+        setState(() {
+          final size = MediaQuery.of(context).size;
+          
+          // Update the position based on the drag delta
+          // We normalize the movement by dividing by screen size
+          double newX = editorPosition.dx + (details.delta.dx / size.width);
+          double newY = editorPosition.dy + (details.delta.dy / size.height);
+
+          // Clamp values so it doesn't leave the screen (optional)
+          editorPosition = Offset(
+            newX.clamp(0.1, 0.9), 
+            newY.clamp(0.01, 0.8)
+          );
+        });
+      },
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          // Use minWidth and maxWidth as the same value to "lock" the size
+          minWidth: toolbarWidth,
+          maxWidth: toolbarWidth, 
+          maxHeight: 130,
+        ),
+        child: Card(
+          color: Color(0xFF1A1A1A),
+          elevation: 8, // Adds a shadow to make it look "above" the buttons
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          child: Padding(
+            padding: const EdgeInsets.all(6.0),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 6,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          GestureDetector(
+                            onTap: () => setState(() {
+                              isEditing = false;
+                              selectedElement = null;
+                              editLayoutCopy = null;
+                            }),
+                            child: const Icon(Icons.close, color: Colors.white54, size: 16),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              editLayoutCopy!.layoutName,
+                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          GestureDetector(
+                            onTap: () async {
+                              bool isTurningOn = !editLayoutCopy!.favorite;
+                              if (isTurningOn) {
+                                final allKeys = prefs.getKeys();
+                                for (String key in allKeys) {
+                                  final jsonString = prefs.getString(key);
+                                  if (jsonString == null) continue;
+                                  try {
+                                    final Map<String, dynamic> data = jsonDecode(jsonString);
+                                    // Check if it's the same game/version AND it's already a favorite
+                                    if (data['gameId'] == editLayoutCopy!.gameId && 
+                                        data['version'] == editLayoutCopy!.version && 
+                                        data['favorite'] == true) {
+                                      final layout = ControllerLayout.fromJson(data);
+                                      layout.favorite = false;
+                                      await saveLayout(key, layout);
+                                    }
+                                  } catch (e) {
+                                    continue; // Skip keys that aren't valid layout JSON
+                                  }
+                                }
+                              }
+                              setState(() {
+                                editLayoutCopy!.favorite = !editLayoutCopy!.favorite;
+                              });
+                              await saveLayout(currentStorageKey!, editLayoutCopy!);
+                            },
+                            child: Icon(editLayoutCopy!.favorite ? Icons.star : Icons.star_border, color: Color.fromARGB(255, 243, 195, 3), size: 16),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      // Size slider
+                      Container(
+                        width: double.infinity,
+                        constraints: const BoxConstraints(minHeight: 48),
+                        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.05), // Darker subtle background
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: selectedElement == null
+                            ? const Center(
+                                child: Text(
+                                  "No Element Selected",
+                                  style: TextStyle(color: Colors.white38, fontSize: 10, fontStyle: FontStyle.italic),
+                                ),
+                              )
+                            : Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    "Size: ${selectedElement!.size.toInt()}",
+                                    style: const TextStyle(color: Colors.blueAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                                  ),
+                                  SliderTheme(
+                                    data: SliderTheme.of(context).copyWith(
+                                      trackHeight: 2,
+                                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                                    ),
+                                    child: Slider(
+                                      value: selectedElement!.size,
+                                      min: 40,
+                                      max: 100,
+                                      activeColor: Colors.blueAccent,
+                                      inactiveColor: Colors.white10,
+                                      onChanged: (val) => setState(() => selectedElement!.size = val),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            height: 25, // Smaller height
+                            child: TextButton(
+                              style: TextButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                                minimumSize: Size.zero, // Removes default min-width
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                side: const BorderSide(color: Color(0xFF505050), width: 1), 
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                              ),
+                              onPressed: () async {
+                                bool confirm = await confirmDialog();
+                                if (confirm && editLayoutCopy != null) {
+                                  await prefs.remove(currentStorageKey!);
+                                  var layoutName = editLayoutCopy!.layoutName;
+                                  setState(() {
+                                    selectedElement = null;
+                                    editLayoutCopy = defaultLayout;
+                                    currentLayout = defaultLayout;
+                                    currentStorageKey = defaultKey;
+                                    _processedBackground = null;
+                                    backgroundColor = null;
+                                  });
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(content: Text("Layout '$layoutName' deleted")),
+                                  );
+                                }
+                              },
+                              child: const Text("Delete", style: TextStyle(color: Colors.redAccent, fontSize: 11)),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          SizedBox(
+                            height: 25,
+                            child: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.blueAccent,
+                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                              ),
+                              onPressed: () async {
+                                String? newName = await showSaveDialog();
+                                if (newName != null && newName.isNotEmpty && editLayoutCopy != null) {
+                                  setState(() {
+                                    selectedElement = null;
+                                    editLayoutCopy!.layoutName = newName; // Update the name in the layout data
+                                    currentStorageKey = newName;
+                                  });
+                                  await saveLayout(newName, editLayoutCopy!);
+                                  _buildLayoutList(); // Refresh the list to show the new layout
+                                  loadLayout(newName);
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(content: Text("New Layout '$newName' Saved")),
+                                  );
+                                }
+                              },
+                              child: const Text("Save New", style: TextStyle(color: Colors.white, fontSize: 11)),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          SizedBox(
+                            height: 25,
+                            child: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.lightGreenAccent[700],
+                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                              ),
+                              onPressed: () async {
+                                setState(() {
+                                  selectedElement = null;
+                                });
+                                print("[UI] Saving layout to $currentStorageKey");
+                                await saveLayout(currentStorageKey!, editLayoutCopy!);
+                                loadLayout(currentStorageKey!);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text("Layout '${editLayoutCopy!.layoutName}' Saved")),
+                                );
+                              },
+                              child: const Text("Save", style: TextStyle(color: Colors.white, fontSize: 11)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const VerticalDivider(color: Color(0xFF505050), thickness: 1, width: 20),
+                Expanded(
+                  flex: 4,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("SAVED LAYOUTS", style: TextStyle(color: Colors.white38, fontSize: 9, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 4),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          child: Column(
+                            children: _buildLayoutList(), // Helper to list saved layouts
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   // Helper method to keep your buttons consistent
   Widget _buildMenuButton(Widget iconWidget, String label, VoidCallback onTap) {
     return InkWell(
@@ -579,8 +987,165 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     );
   }
 
+  List<Widget> _buildLayoutList() {
+    final allKeys = prefs.getKeys().toList();
+    allKeys.sort((a, b) {
+      if (a == "Default_Layout") return -1; // 'a' comes first
+      if (b == "Default_Layout") return 1;  // 'b' comes first
+      return 0; // maintain relative order for everything else
+    });
+    return allKeys.map((key) {
+      try {
+        final jsonString = prefs.getString(key);
+        if (jsonString == null) return const SizedBox();
+
+        // Convert the JSON string back into your ControllerLayout object
+        final layout = ControllerLayout.fromJson(jsonDecode(jsonString));
+        bool isSelected = currentStorageKey == key;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 4.0),
+          child: InkWell(
+            onTap: () {
+              setState(() {
+                currentStorageKey = key; // Update the reference
+              });
+              loadLayout(key); 
+            },
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+              decoration: BoxDecoration(
+                color: isSelected 
+                    ? Colors.blueAccent.withOpacity(0.2) // Highlight current
+                    : Colors.white.withOpacity(0.05),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: isSelected 
+                      ? Colors.blueAccent 
+                      : Colors.transparent,
+                  width: 0.5
+                ),
+              ),
+              child: Text(
+                layout.layoutName,
+                style: const TextStyle(color: Colors.white, fontSize: 10),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        );
+      } catch (e) {
+        // If a key isn't a valid JSON layout, skip it
+        return const SizedBox();
+      }
+    }).toList();
+  }
+
+  Future<String?> showSaveDialog() async {
+    String? errorText;
+    final TextEditingController nameController = TextEditingController();
+
+    return showDialog<String>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1A1A1A),
+            title: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text("Save New Layout", style: TextStyle(color: Colors.white, fontSize: 16), textAlign: TextAlign.center),
+                if (errorText != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      errorText!,
+                      style: const TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+              ],
+            ),
+            content: TextField(
+              controller: nameController,
+              autofocus: true,
+              style: const TextStyle(color: Colors.white),
+              decoration: const InputDecoration(
+                labelText: "Layout Name",
+                floatingLabelBehavior: FloatingLabelBehavior.always,
+                labelStyle: TextStyle(color: Colors.blueAccent, fontSize: 17),
+                floatingLabelStyle: TextStyle(color: Colors.blueAccent, fontSize: 17),
+                enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.blueAccent)),
+                hintText: "Enter name...",
+                hintStyle: TextStyle(color: Colors.white24, fontSize: 14),
+              ),
+              onChanged: (_) {
+                // Clear error when user starts typing again
+                if (errorText != null) {
+                  setDialogState(() => errorText = null);
+                }
+              },
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("Cancel", style: TextStyle(color: Colors.white54)),
+              ),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                onPressed: () => {
+                  if (nameController.text.isEmpty) {
+                    setDialogState(() => errorText = "Name cannot be empty")
+                  } else if (prefs.containsKey(nameController.text)) {
+                    setDialogState(() => errorText = "This name already exists. Please use a different name")
+                  } else {
+                    Navigator.pop(context, nameController.text)
+                  }
+                },
+                child: const Text("Save", style: TextStyle(color: Colors.white)),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<bool> confirmDialog() async {
+    return await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text(
+          "Delete Confirmation", 
+          style: TextStyle(color: Colors.white, fontSize: 16),
+          textAlign: TextAlign.center
+        ),
+        content: Text(
+          "Are you sure you want to delete '${editLayoutCopy?.layoutName}'?",
+          style: const TextStyle(color: Colors.white70, fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Cancel", style: TextStyle(color: Colors.white54)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text("Delete", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    ) ?? false; // Return false if user taps outside the dialog
+  }
+
   @override
   Widget build(BuildContext context) {
+    final List<ControllerElement> elementsToRender = isEditing 
+      ? (editLayoutCopy?.elements ?? []) 
+        : (currentLayout?.elements ?? []);
     if (isLoading) {
       return Scaffold(body: Center(child: CircularProgressIndicator()));
     }
@@ -594,158 +1159,76 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
               final double screenHeight = constraints.maxHeight;
               return Stack(
                 children: [
-                  if (isUsingCustomLayout)
-                    Positioned.fill(
-                      child: Opacity(
-                        opacity: 0.8, // Optional: dim it slightly so buttons pop
-                        child: _processedBackground ?? backgroundColor ?? Container(color: Colors.black87),
-                      ),
+                  Positioned.fill(
+                    child: Opacity(
+                      opacity: 0.8, // Optional: dim it slightly so buttons pop
+                      child: _processedBackground ?? backgroundColor ?? Container(color: Colors.black87),
                     ),
+                  ),
+                  ...elementsToRender.map((element) {
+                    // Check if this specific element is the one currently selected in the editor
+                    bool isSelected = selectedElement?.id == element.id;
+                    if (element.type == ControllerElementType.button) {
+                      return CustomButton(
+                        element: element,
+                        isEditing: isEditing,
+                        isSelected: isSelected,
+                        onSelect: () => setState(() => selectedElement = element),
+                        onPressed: (id, pressed) {
+                          // send button press/release to PC
+                          if (!isEditing) {
+                            final bit = element.buttonId;
+                            bleManager.updateButton(bit, pressed);
+                          }
+                        },
+                        onPositionChanged: (newOffset) => setState(() => element.position = newOffset),
+                      );
+                    } else {
+                      return CustomJoystick(
+                        element: element,
+                        deadzone: 0.20,
+                        isEditing: isEditing,
+                        isSelected: isSelected,
+                        onSelect: () => setState(() => selectedElement = element),
+                        onChange: (id, x, y) {
+                          if (!isEditing) {
+                            final type = element.joystickType ?? "left";
+                            bleManager.updateJoystick(type, x, y);
+                          }
+                        },
+                        onPositionChanged: (newOffset) => setState(() => element.position = newOffset),
+                      );
+                    }
+                  }),
                   // Top-center button
-                  Positioned(
-                    top: 5, // Adjust this value to move it higher or lower
-                    left: 16,
-                    right: 0,
-                    child: Center(
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min, // Keep buttons tightly packed
-                        children: [
-                          GestureDetector(
-                            onTap: () async {
-                              setState(() => paused = !paused);
-                              final sent = await bleManager.sendMessage(paused ? "PAUSE" : "RESUME");
-                              if (!sent) {
-                                setState(() => paused = !paused);
-                              }
-                            },
-                            child: Container(
-                              width: 36, height: 26,
-                              decoration: const BoxDecoration(
-                                color: Colors.white24,
-                                shape: BoxShape.rectangle,
-                                borderRadius: BorderRadius.all(Radius.circular(4)),
-                              ),
-                              child: Icon(paused ? Icons.play_arrow : Icons.pause, color: Colors.white, size: 18),
-                            ),
-                          ),
-                          const SizedBox(width: 4),
-                          GestureDetector(
-                            onTap: () {
-                              showDialog(
-                                context: context,
-                                barrierColor: Colors.black54, // Darkens the background
-                                builder: (BuildContext context) {
-                                  return Center(
-                                    child: Material(
-                                      color: Colors.transparent,
-                                      child: Container(
-                                        // Set your desired width/height for the center box
-                                        width: MediaQuery.of(context).size.width * 0.4,
-                                        padding: const EdgeInsets.all(20),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF1A1A1A), // Dark charcoal
-                                          borderRadius: BorderRadius.circular(12),
-                                          border: Border.all(color: Colors.white10),
-                                          boxShadow: [
-                                            BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
-                                          ],
-                                        ),
-                                        child: Column(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            const Text(
-                                              "SETTINGS",
-                                              style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
-                                            ),
-                                            const SizedBox(height: 20),
-                                            // Button 1: Layout Customization
-                                            _buildMenuButton(const Icon(Icons.tune, color: Colors.white54, size: 20), "Customize Layout", () {}),
-                                            const SizedBox(height: 10),
-                                            // Close Button
-                                            TextButton(
-                                              onPressed: () => Navigator.pop(context),
-                                              child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
-                                  );
-                                },
-                              );
-                            },
-                            child: Container(
-                              width: 36, height: 26,
-                              decoration: const BoxDecoration(
-                                color: Colors.white24,
-                                shape: BoxShape.rectangle,
-                                borderRadius: BorderRadius.all(Radius.circular(4)),
-                              ),
-                              child: Icon(Icons.settings, color: Colors.white, size: 18),
-                            ),
-                          ),
-                        ],
+                  if (isEditing) ...[
+                    Positioned(
+                      // Calculate pixels from normalized Offset
+                      left: (editorPosition.dx * screenWidth) - (screenWidth * 0.45 / 2), 
+                      top: editorPosition.dy * screenHeight,
+                      child: _buildEditorToolbar(),
+                    ),
+                  ] else ...[
+                    Positioned(
+                      top: 5, // Adjust this value to move it higher or lower
+                      left: 16,
+                      right: 16,
+                      child: _buildStandardToolbar(),
+                    ),
+                    // Connection status banner
+                    Positioned(
+                      bottom: 10, // Adjust as needed
+                      left: 16,
+                      right: 16,
+                      child: Center(
+                        child: ConnectionStatusBanner(
+                          status: _status,
+                          isError: _status.contains('Disconnected'),
+                          show: showStatusBanner,
+                        ),
                       ),
                     ),
-                  ),
-                  // Connection status banner
-                  Positioned(
-                    bottom: 10, // Adjust as needed
-                    left: 10,
-                    right: 16,
-                    child: Center(
-                      child: ConnectionStatusBanner(
-                        status: _status,
-                        isError: _status.contains('Disconnected'),
-                        show: showStatusBanner,
-                      ),
-                    ),
-                  ),
-                  // Render all customizable elements
-                  if (isUsingCustomLayout && customLayout != null)
-                    ...customLayout!.elements.map((element) {
-                      if (element.type == ControllerElementType.button) {
-                        return CustomButton(
-                          element: element,
-                          onPressed: (id, pressed) {
-                            // send button press/release to PC
-                            final bit = element.buttonId;
-                            bleManager.updateButton(bit, pressed);
-                          },
-                        );
-                      } else {
-                        return CustomJoystick(
-                          element: element,
-                          deadzone: 0.20,
-                          onChange: (id, x, y) {
-                            final type = element.joystickType ?? "left";
-                            bleManager.updateJoystick(type, x, y);
-                          },
-                        );
-                      }
-                    })
-                  else
-                    ...getDefaultLayout(screenWidth, screenHeight).map((element) {
-                      if (element.type == ControllerElementType.button) {
-                        return CustomButton(
-                          element: element,
-                          onPressed: (id, pressed) {
-                            // send button press/release to PC
-                            final bit = element.buttonId;
-                            bleManager.updateButton(bit, pressed);
-                          },
-                        );
-                      } else {
-                        return CustomJoystick(
-                          element: element,
-                          deadzone: 0.20,
-                          onChange: (id, x, y) {
-                            final type = element.joystickType ?? "left";
-                            bleManager.updateJoystick(type, x, y);
-                          },
-                        );
-                      }
-                    }),
+                  ],
                 ],
               );
             },
