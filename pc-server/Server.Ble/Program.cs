@@ -18,6 +18,9 @@ using System.Net.Sockets;
 using WebSocketSharp;
 using WebSocketSharp.Server;
 using WebSocketSharp.Net;
+using Nefarius.ViGEm.Client;
+using Nefarius.ViGEm.Client.Targets;
+using Nefarius.ViGEm.Client.Targets.Xbox360;
 
 namespace BleServer
 {
@@ -62,6 +65,10 @@ namespace BleServer
 
         // Timer for cleaning up stale connections
         private static System.Timers.Timer? disconnectTimer = null;
+
+        // ViGEmBus for virtual controller emulation
+        private static ViGEmClient? vigemClient = null;
+        public static bool IsVigemEnabled = true;
 
         static async Task Main(string[] args)
         {
@@ -113,6 +120,16 @@ namespace BleServer
                 });
             }
 
+            try 
+            {
+                vigemClient = new ViGEmClient();
+                Console.WriteLine("[PC] ViGEmBus initialized.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[!] ViGEmBus Error: {ex.Message}. Make sure drivers are installed.");
+            }
+
             // 1. Create GATT Service
             var createResult = await GattServiceProvider.CreateAsync(serviceUuid);
             if (createResult.ServiceProvider is null)
@@ -154,7 +171,6 @@ namespace BleServer
                     if (bytes.Length >= 16)
                     {
                         session.LastSeen = DateTime.Now;
-
                         var state = new InputState 
                         { 
                             PlayerId = session.PlayerId,
@@ -166,6 +182,12 @@ namespace BleServer
                             Steering = BitConverter.ToInt16(bytes, 12) / 32767f,
                             Stepping = BitConverter.ToInt16(bytes, 14) / 32767f
                         };
+
+                        // --- BRIDGE TO VIRTUAL CONTROLLER START ---
+                        if (IsVigemEnabled && session.Controller != null) 
+                        {
+                            UpdateViGEmController(session.Controller, state);
+                        }
 
                         // Broadcast the specific player's data
                         _ = BroadcastInputAsync(state);
@@ -379,10 +401,7 @@ namespace BleServer
                     .Where(kvp => !currentSubscribers.Contains(kvp.Value.Client))
                     .ToList();
                 foreach (var stale in stalePlayers) {
-                    if (ConnectedPlayers.TryRemove(stale.Key, out _)) {
-                        Console.WriteLine($"[BLE] Subscriber dropped: Player {stale.Key}");
-                        SendStatusToWSClients("DISCONNECTED", stale.Key);
-                    }
+                    RemovePlayer(stale.Key);
                 }
 
                 // B. ADD NEW SESSIONS + GHOST FILTERING
@@ -396,11 +415,14 @@ namespace BleServer
                             PlayerId = assignedId,
                             DeviceId = deviceId,
                             Client = client,
-                            LastSeen = DateTime.Now
+                            LastSeen = DateTime.Now,
+                            Controller = vigemClient?.CreateXbox360Controller()
                         };
 
                         if (ConnectedPlayers.TryAdd(assignedId, newSession)) {
                             try {
+                                newSession.Controller?.Connect(); // Plug it into Windows
+                                Console.WriteLine($"[ViGEm] Player {assignedId} virtual controller connected.");
                                 Console.WriteLine($"[BLE] Player {assignedId} Connected ({deviceId})");
                                 await Task.Delay(1000);
                                 SendStatusToWSClients("CONNECTED", assignedId);
@@ -418,16 +440,13 @@ namespace BleServer
         private static void OnHeartbeatElapsed(object? sender, System.Timers.ElapsedEventArgs e) {
             var now = DateTime.Now;
             
-            // Identify players who haven't been seen in over 3 seconds
+            // Identify players who haven't been seen in over 5 seconds
             var timedOutPlayers = ConnectedPlayers
-                .Where(kvp => (now - kvp.Value.LastSeen).TotalSeconds > 3)
+                .Where(kvp => (now - kvp.Value.LastSeen).TotalSeconds > 5)
                 .ToList();
 
             foreach (var timedOut in timedOutPlayers) {
-                if (ConnectedPlayers.TryRemove(timedOut.Key, out var session)) {
-                    Console.WriteLine($"[TIMEOUT] Player {timedOut.Key} (Device: {session.DeviceId}) timed out.");
-                    SendStatusToWSClients("DISCONNECTED", timedOut.Key);
-                }
+                RemovePlayer(timedOut.Key);
             }
 
             if (ConnectedPlayers.IsEmpty) {
@@ -445,17 +464,42 @@ namespace BleServer
 
         private static int GetStickyPlayerId(string deviceId)
         {
-            // 1. If we've seen this phone before, reuse the old ID
+            // 1. If the room is currently totally empty, reset the sequence
+            if (ConnectedPlayers.IsEmpty)
+            {
+                Console.WriteLine("[ID] Room is empty. Resetting Player ID sequence.");
+                _playerIdHistory.Clear();
+                _nextPlayerId = 0; 
+            }
+            // 2. If we've seen this phone before, reuse the old ID
             if (_playerIdHistory.TryGetValue(deviceId, out int existingId))
             {
                 Console.WriteLine($"[ID] Welcome back! Reassigning ID {existingId} to {deviceId}");
                 return existingId;
             }
-
-            // 2. If it's a brand new phone, generate a new ID
+            // 3. If it's a brand new phone, generate a new ID
             int newId = Interlocked.Increment(ref _nextPlayerId);
             _playerIdHistory.TryAdd(deviceId, newId);
             return newId;
+        }
+
+        private static void RemovePlayer(int playerId)
+        {
+            if (ConnectedPlayers.TryRemove(playerId, out var session)) {
+                // DISCONNECT THE CONTROLLER
+                session.Controller?.Disconnect();
+                Console.WriteLine($"[ViGEm] Player {playerId} virtual controller removed.");
+
+                Console.WriteLine($"[TIMEOUT] Player {playerId} (Device: {session.DeviceId}) timed out.");
+                SendStatusToWSClients("DISCONNECTED", playerId);
+                // Check if this was the last person
+                if (ConnectedPlayers.IsEmpty)
+                {
+                    Console.WriteLine("[BLE] All players gone. Clearing history for next session.");
+                    _playerIdHistory.Clear();
+                    _nextPlayerId = 0;
+                }
+            }
         }
 
         public static void CleanUp() 
@@ -463,6 +507,11 @@ namespace BleServer
             disconnectTimer?.Stop();
             if (provider != null) {
                 try {
+                    foreach(var player in ConnectedPlayers.Values) {
+                        player.Controller?.Disconnect();
+                    }
+                    vigemClient?.Dispose();
+                    vigemClient = null;
                     Console.WriteLine("[BLE] Stopping Advertisement...");
                     provider.StopAdvertising();
                     if (notifyChar != null) {
@@ -477,6 +526,8 @@ namespace BleServer
                         foreach (var ws in wsSessions) { try { ws.Close(); } catch { } }
                         wsSessions.Clear();
                     }
+                    wsServer?.Stop();
+                    wsServer = null;
                     Console.WriteLine("[BLE] Cleanup complete.");
                 } catch (Exception ex) {
                     Console.WriteLine($"[BLE] Error: {ex.Message}");
@@ -505,6 +556,28 @@ namespace BleServer
                     if (session.IsAlive) session.Send(statusData);
                 }
             }
+        }
+
+        private static void UpdateViGEmController(IXbox360Controller controller, InputState state)
+        {
+            if (controller == null) return;
+
+            // 1. Direct Mapping (Since Flutter now sends XInput bits)
+            // Cast the uint from Flutter to ushort for ViGEm
+            controller.SetButtonsFull((ushort)state.Buttons);
+
+            // 2. Map Joysticks
+            // Convert -1.0 -> 1.0 back to -32768 -> 32767
+            // NOTE: Windows Y-axis is inverted (Positive is UP). 
+            // If your character walks backwards, change state.JoyLY to -state.JoyLY
+            controller.SetAxisValue(Xbox360Axis.LeftThumbX, (short)(state.JoyLX * 32767));
+            controller.SetAxisValue(Xbox360Axis.LeftThumbY, (short)(-state.JoyLY * 32767));
+            
+            controller.SetAxisValue(Xbox360Axis.RightThumbX, (short)(state.JoyRX * 32767));
+            controller.SetAxisValue(Xbox360Axis.RightThumbY, (short)(-state.JoyRY * 32767));
+
+            // 3. Send to Windows Kernel
+            controller.SubmitReport();
         }
 
         // Helper to broadcast input to all games
@@ -575,7 +648,8 @@ namespace BleServer
         }
         protected override void OnOpen()
         {
-            Console.WriteLine("[WS] Cocos Creator client connected");
+            Console.WriteLine("[WS] Cocos Creator client connected. Disabling ViGEmBus.");
+            Program.IsVigemEnabled = false;
             lock (Program._wsLock)
             {
                 Program.wsSessions.RemoveAll(s => !s.IsAlive);
@@ -585,10 +659,14 @@ namespace BleServer
 
         protected override void OnClose(WebSocketSharp.CloseEventArgs e)
         {
-            Console.WriteLine("[WS] Cocos Creator client disconnected");
+            Console.WriteLine("[WS] Cocos Creator client disconnected. Re-enabling ViGEmBus.");
             lock (Program._wsLock)
             {
                 Program.wsSessions.Remove(Context.WebSocket);
+                if (Program.wsSessions.Count == 0)
+                {
+                    Program.IsVigemEnabled = true;
+                }
             }
         }
 
@@ -673,6 +751,7 @@ namespace BleServer
         public int PlayerId { get; set; }
         public required string DeviceId { get; set; }
         public required GattSubscribedClient Client { get; set; }
+        public IXbox360Controller? Controller { get; set; }
         public DateTime LastSeen { get; set; } = DateTime.Now;
 
         public async Task SendMessageViaBle(string message, GattLocalCharacteristic? notifyChar)

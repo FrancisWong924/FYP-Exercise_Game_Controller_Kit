@@ -455,10 +455,11 @@ class _CustomJoystickState extends State<CustomJoystick> {
 
   void _onPanEnd(DragEndDetails _) {
     _joystickTimer?.cancel();
-    delta = Offset.zero;
+    setState(() {
+      delta = Offset.zero;
+    });
     widget.onChange(widget.element.id, 0, 0);
     dragStartCenter = null;
-    setState(() {});
   }
 
   void _startContinuousSending() {

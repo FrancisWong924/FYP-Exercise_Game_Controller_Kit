@@ -13,14 +13,14 @@ export interface InputState {
 }
 
 export const DefaultButtonMasks = {
-    Cross: 1 << 0,    // 1
-    Circle: 1 << 1,   // 2
-    Square: 1 << 2,   // 4
-    Triangle: 1 << 3, // 8
-    Up: 1 << 12,       // 4096
-    Down: 1 << 13,     // 8192
-    Left: 1 << 14,     // 16384
-    Right: 1 << 15,    // 32768
+    Cross: 1 << 12,
+    Circle: 1 << 13,
+    Square: 1 << 14,
+    Triangle: 1 << 15,
+    Up: 1 << 0,
+    Down: 1 << 1,
+    Left: 1 << 2,
+    Right: 1 << 3,
 };
 
 export class ControllerInput {

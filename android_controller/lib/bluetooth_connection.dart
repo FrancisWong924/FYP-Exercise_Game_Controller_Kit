@@ -50,6 +50,7 @@ class BleManager {
   double currentSteering = 0.0;  // -1.0 to +1.0
   double currentStep = 0.0;  // -1.0 to 0.0
 
+  int _lastSentSequence = 0;
   Uint8List? _lastSentPacket;
   bool _isPausedForLargeData = false;
 
@@ -111,7 +112,8 @@ class BleManager {
       _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
         for (ScanResult r in results) {
           if (r.advertisementData.serviceUuids.contains(Guid(BleUuids.service))) {
-            FlutterBluePlus.stopScan();
+            await FlutterBluePlus.stopScan();
+            await Future.delayed(const Duration(milliseconds: 500));
             if (_isConnecting) return;
             print("[BLE] Found PC: ${r.device.platformName}");
             _isConnecting = true;
@@ -311,7 +313,7 @@ class BleManager {
     final bd = packet.buffer.asByteData();
 
     // Bytes 0–3: Buttons (32 little-endian
-    bd.setUint32(0, currentButtons, Endian.little);
+    bd.setUint16(0, currentButtons, Endian.little);
 
     // Bytes 4–11: Joysticks (4 × Int16)
     bd.setInt16(4, (currentJoy.joyLX * 32767).round(), Endian.little);
@@ -336,7 +338,12 @@ class BleManager {
       currentSteering.abs() < 0.001;
     bool stateChanged = _lastSentPacket == null || !_arePacketsEqual(_lastSentPacket!, packet);
     if (isNeutral && !stateChanged) {
-      return;
+      if (_lastSentSequence > 2) {
+        return;
+      }
+      _lastSentSequence++;
+    } else {
+      _lastSentSequence = 0;
     }
     _lastSentPacket = Uint8List.fromList(packet);
     try {
@@ -372,6 +379,7 @@ class BleManager {
 
   void setInputPause(bool pause) {
     _isPausedForLargeData = pause;
+    _lastSentSequence = 0;
     if (pause) {
       print("[BLE] Input loop throttled for incoming data...");
     } else {

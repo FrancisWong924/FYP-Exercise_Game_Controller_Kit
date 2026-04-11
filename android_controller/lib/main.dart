@@ -5,7 +5,6 @@ import 'dart:convert';
 import 'dart:math'as math;
 import 'bluetooth_connection.dart';
 import 'models/controller_element.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -69,6 +68,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
 
   bool isEditing = false;
   String? currentStorageKey;
+  String? originalLayoutJson;
   ControllerLayout? editLayoutCopy;
   ControllerElement? selectedElement;
 
@@ -112,6 +112,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
       case AppLifecycleState.resumed:
         // User came back to the app
         print("App Resumed");
+        if (bleManager.pcDevice == null) {
+          setState(() => paused = false);
+        }
         break;
       case AppLifecycleState.detached:
         // App is still hosted by a flutter engine but is detached from any host views
@@ -497,7 +500,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.804, 0.499),
           size: 65,
-          buttonId: 1 << 2,
+          buttonId: 1 << 14,
           label: "square",
           useSystemIcon: true,
         ),
@@ -506,7 +509,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.87, 0.642),
           size: 65,
-          buttonId: 1 << 0,
+          buttonId: 1 << 12,
           label: "cross",
           useSystemIcon: true,
         ),
@@ -515,7 +518,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.935, 0.499),
           size: 65,
-          buttonId: 1 << 1,
+          buttonId: 1 << 13,
           label: "circle",
           useSystemIcon: true,
         ),
@@ -524,7 +527,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.87, 0.358),
           size: 65,
-          buttonId: 1 << 3,
+          buttonId: 1 << 15,
           label: "triangle",
           useSystemIcon: true,
         ),
@@ -533,7 +536,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.141, 0.358),
           size: 65,
-          buttonId: 1 << 12,
+          buttonId: 1 << 0,
           label: "arrow_up",
           useSystemIcon: true,
         ),
@@ -542,7 +545,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.141, 0.642),
           size: 65,
-          buttonId: 1 << 13,
+          buttonId: 1 << 1,
           label: "arrow_down",
           useSystemIcon: true,
         ),
@@ -551,7 +554,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.075, 0.499),
           size: 65,
-          buttonId: 1 << 14,
+          buttonId: 1 << 2,
           label: "arrow_left",
           useSystemIcon: true,
         ),
@@ -560,7 +563,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           type: ControllerElementType.button,
           position: Offset(0.206, 0.499),
           size: 65,
-          buttonId: 1 << 15,
+          buttonId: 1 << 3,
           label: "arrow_right",
           useSystemIcon: true,
         ),
@@ -601,15 +604,21 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   void cloneLayout() {
     final String raw = jsonEncode(currentLayout!.toJson());
     editLayoutCopy = ControllerLayout.fromJson(jsonDecode(raw));
+    originalLayoutJson = jsonEncode(editLayoutCopy!.toJson());
   }
 
-  void toggleEditMode() {
+  void toggleEditMode() async {
+    if (isEditing) {
+      bool proceed = await _handleUnsavedChanges();
+      if (!proceed) return; // User cancelled or we shouldn't exit yet
+    }
     setState(() {
       if (!isEditing) {
         cloneLayout();
       } else {
         // EXITING EDIT MODE (from the toggle logic):
         editLayoutCopy = null;
+        originalLayoutJson = null;
       }
       isEditing = !isEditing;
       selectedElement = null; 
@@ -750,11 +759,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                       Row(
                         children: [
                           GestureDetector(
-                            onTap: () => setState(() {
-                              isEditing = false;
-                              selectedElement = null;
-                              editLayoutCopy = null;
-                            }),
+                            onTap: toggleEditMode,
                             child: const Icon(Icons.close, color: Colors.white54, size: 16),
                           ),
                           const SizedBox(width: 8),
@@ -864,6 +869,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                     editLayoutCopy = defaultLayout;
                                     currentLayout = defaultLayout;
                                     currentStorageKey = defaultKey;
+                                    originalLayoutJson = jsonEncode(editLayoutCopy!.toJson());
                                     _processedBackground = null;
                                     backgroundColor = null;
                                   });
@@ -895,6 +901,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                     currentStorageKey = newName;
                                   });
                                   await saveLayout(newName, editLayoutCopy!);
+                                  originalLayoutJson = jsonEncode(editLayoutCopy!.toJson());
                                   _buildLayoutList(); // Refresh the list to show the new layout
                                   loadLayout(newName);
                                   ScaffoldMessenger.of(context).showSnackBar(
@@ -922,6 +929,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                 });
                                 print("[UI] Saving layout to $currentStorageKey");
                                 await saveLayout(currentStorageKey!, editLayoutCopy!);
+                                originalLayoutJson = jsonEncode(editLayoutCopy!.toJson());
                                 loadLayout(currentStorageKey!);
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(content: Text("Layout '${editLayoutCopy!.layoutName}' Saved")),
@@ -1005,8 +1013,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         return Padding(
           padding: const EdgeInsets.only(bottom: 4.0),
           child: InkWell(
-            onTap: () {
+            onTap: () async {
+              bool proceed = await _handleUnsavedChanges(); // Wait for user choice
+              if (!proceed) return;
               setState(() {
+                selectedElement = null; // Clear any selected element when switching layouts
                 currentStorageKey = key; // Update the reference
               });
               loadLayout(key); 
@@ -1139,6 +1150,70 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         ],
       ),
     ) ?? false; // Return false if user taps outside the dialog
+  }
+
+  bool _hasUnsavedChanges() {
+    if (editLayoutCopy == null || originalLayoutJson == null) return false;
+    
+    // Encode the CURRENT state to JSON
+    String currentJson = jsonEncode(editLayoutCopy!.toJson());
+    
+    // If they are different, the user moved something or changed a size
+    return currentJson != originalLayoutJson;
+  }
+
+  Future<bool> _handleUnsavedChanges() async {
+    if (!_hasUnsavedChanges()) return true;
+
+    final bool? discard = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: Stack(
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 10, right: 30), // Space for the icon
+              child: const Text(
+                "Unsaved Changes",
+                style: TextStyle(color: Colors.white, fontSize: 16)
+              ),
+            ),
+            Positioned(
+              right: -10, // Adjust to fit your padding
+              top: -10,
+              child: IconButton(
+                icon: const Icon(Icons.close, size: 20, color: Colors.white54),
+                onPressed: () => Navigator.pop(context, null), // null = Same as clicking outside
+              ),
+            ),
+          ],
+        ),
+        content: const Text(
+          "You have made changes to the layout. Do you want to save them?",
+          style: TextStyle(color: Colors.white70, fontSize: 14)
+          ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, true), // Discard and exit
+            child: const Text("Discard", style: TextStyle(color: Colors.red)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Save", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (discard == null) return false;
+    if (discard == false) {
+      await saveLayout(currentStorageKey!, editLayoutCopy!);
+      originalLayoutJson = jsonEncode(editLayoutCopy!.toJson());
+      setState(() {
+        currentLayout = editLayoutCopy;
+      });
+    }
+    return true;
   }
 
   @override
