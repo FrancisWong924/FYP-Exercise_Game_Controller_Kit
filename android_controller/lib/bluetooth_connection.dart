@@ -268,6 +268,10 @@ class BleManager {
       final bytes = utf8.encode("$command\n");  // e.g., "PAUSE\n" or "RESUME\n"
       await pingCharacteristic!.write(bytes, withoutResponse: false);  // MUST be false!
       print("[BLE] → Sent command: $command");
+      if (command == "PAUSE") {
+        updateSteering(0.0);
+        updateStep(ControllerId.leftJoystick, 0.0, 0.0);
+      }
       return true;
     } catch (e) {
       print("[BLE] Failed to send $command: $e");
