@@ -1,6 +1,8 @@
 import { Color, native, sys } from 'cc';
 import { JSB } from 'cc/env';
 
+declare const GetCurrentProcessId: () => number;
+
 export interface InputState {
     PlayerId: number;
     JoyLX: number;
@@ -23,9 +25,15 @@ export const DefaultButtonMasks = {
     Right: 1 << 3,
 };
 
+export type ControllerServerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'cooldown';
+
 export class ControllerInput {
+    private serverName: string = "Server.Ble.exe";
     private socket: WebSocket | null = null;
     private buffer: string = '';
+    /** BLE stack needs a short cool-down after shutdown before relaunch is stable. Shared across instances. */
+    private static readonly minRestartDelayMs = 5000;
+    private static cooldownUntilMs = 0;
 
     public onInput: ((playerId: number, state: InputState) => void) | null = null;
     public onPause: (() => void) | null = null;
@@ -35,10 +43,20 @@ export class ControllerInput {
     public onControllerConnected: ((playerId: number) => void) | null = null;
     public onControllerDisconnected: ((playerId: number) => void) | null = null;
     public onError: ((err: any) => void) | null = null;
+    /** Fired when launch is blocked by post-shutdown restart cooldown. */
+    public onCooldown: ((remainingMs: number) => void) | null = null;
+    /** Fired when server lifecycle state changes. */
+    public onStateChanged: ((state: ControllerServerState, remainingCooldownMs?: number) => void) | null = null;
     public connectedConrollers: number[] = [];
 
+    /** WebSocket has opened at least once this session. */
     private serverStarted = false;
+    /** Native server process was launched successfully (CreateProcess). Used for reconnect policy. */
+    private processLaunchOk = false;
     private reconnectTimeout: any = null;
+    /** Cancels stacked `connect()` delays so a prior timer cannot call `disconnect()` on a good socket. */
+    private pendingConnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private connectGeneration = 0;
     private currentUrl: string = '';
     private isManualDisconnect: boolean = false;
 
@@ -47,38 +65,106 @@ export class ControllerInput {
     private myPredefinedLayout: any = null;
     private isSendingLargeData: boolean = false;
     private currentTransferId: number = 0;
+    private lifecycleState: ControllerServerState = 'stopped';
+    private cooldownTimer: ReturnType<typeof setTimeout> | null = null;
 
-    public launchServer(relativePath: string): boolean {
+    private setState(state: ControllerServerState, remainingCooldownMs?: number) {
+        if (this.lifecycleState === state) return;
+        this.lifecycleState = state;
+        this.onStateChanged?.(state, remainingCooldownMs);
+    }
+
+    public getRemainingCooldownMs(): number {
+        return Math.max(0, ControllerInput.cooldownUntilMs - Date.now());
+    }
+
+    public getState(): ControllerServerState {
+        return this.lifecycleState;
+    }
+
+    public isInCooldown(): boolean {
+        return this.getRemainingCooldownMs() > 0;
+    }
+
+    private startRestartCooldown() {
+        ControllerInput.cooldownUntilMs = Date.now() + ControllerInput.minRestartDelayMs;
+        const remaining = this.getRemainingCooldownMs();
+        this.onCooldown?.(remaining);
+        this.setState('cooldown', remaining);
+        if (this.cooldownTimer) {
+            clearTimeout(this.cooldownTimer);
+            this.cooldownTimer = null;
+        }
+        this.cooldownTimer = setTimeout(() => {
+            this.cooldownTimer = null;
+            if (this.getRemainingCooldownMs() <= 0 && this.lifecycleState === 'cooldown') {
+                this.setState('stopped');
+            }
+        }, remaining + 20);
+    }
+
+    public launchServer(isEditor: boolean = false): boolean {
+        if (this.lifecycleState === 'starting' || this.lifecycleState === 'running') {
+            console.log(`[SDK] launchServer ignored: server is already ${this.lifecycleState}.`);
+            return true;
+        }
+        if (this.lifecycleState === 'stopping') {
+            console.warn('[SDK] launchServer ignored: server is currently stopping.');
+            return false;
+        }
+        const cooldownMs = this.getRemainingCooldownMs();
+        if (cooldownMs > 0) {
+            const sec = (cooldownMs / 1000).toFixed(1);
+            console.warn(`[SDK] Launch blocked by cool-down (${sec}s left). This avoids rapid BLE restart failures.`);
+            this.onCooldown?.(cooldownMs);
+            this.setState('cooldown', cooldownMs);
+            this.processLaunchOk = false;
+            return false;
+        }
+        this.setState('starting');
         if (sys.isNative && sys.os === sys.OS.WINDOWS) {
             try {
-                // 1. Get the base path
                 const rootPath = native.fileUtils.getDefaultResourceRootPath();
+                const fullPath = (rootPath + this.serverName).replace(/\//g, "\\");
                 
-                // 2. Combine and format for Windows
-                const fullPath = (rootPath + relativePath).replace(/\//g, "\\");
-                
-                console.log("[SDK] Attempting to launch server:", fullPath);
+                const args = isEditor ? " --edit" : " --hidden";
+                const gamePid = (window as any).getGamePid ? (window as any).getGamePid() : 0;
+                const commandLine = `"${fullPath}" ${gamePid} ${args}`;
 
-                // 3. Trigger the C++ bridge
+                console.log("[SDK] Attempting to launch server:", commandLine);
+
+                // Trigger the C++ bridge
                 if ((window as any).launchExternalExe) {
-                    const didStart = (window as any).launchExternalExe(fullPath);
+                    const didStart = (window as any).launchExternalExe(commandLine);
 
                     if (didStart) {
-                        console.log("[SDK] Server process started successfully.");
+                        console.log("[SDK] Server process launched and still running (native check passed).");
+                        this.processLaunchOk = true;
+                        this.setState('running');
                     } else {
-                        console.error("[SDK] Server failed to start. Path might be wrong:", fullPath);
+                        console.error(
+                            "[SDK] Server did not stay running. Check: (1) Server.Ble.exe exists next to game data, " +
+                            "(2) run it manually from that folder to see errors, (3) rebuild native ble_controller after C++ changes."
+                        );
+                        console.error("[SDK] Intended path:", fullPath);
+                        this.processLaunchOk = false;
+                        this.setState('stopped');
                     }
                     return didStart;
                 } else {
                     console.error("[SDK] launchExternalExe not found! Is the C++ bridge linked?");
+                    this.setState('stopped');
                     return false;
                 }
             } catch (e) {
                 console.error("[SDK] Failed to launch server:", e);
+                this.setState('stopped');
                 return false;
             }
         } else {
             console.warn("[SDK] launchServer ignored: Not running on Native Windows.");
+            this.processLaunchOk = false;
+            this.setState('stopped');
             return false;
         }
     }
@@ -95,12 +181,36 @@ export class ControllerInput {
         this.currentUrl = url;
         this.isManualDisconnect = false;
         console.log('custom layout:', this.myPredefinedLayout);
+        const cooldownMs = this.getRemainingCooldownMs();
+        if (cooldownMs > 0) {
+            const sec = (cooldownMs / 1000).toFixed(1);
+            console.warn(`[ControllerInput] connect() blocked by cooldown (${sec}s left).`);
+            this.onCooldown?.(cooldownMs);
+            this.setState('cooldown', cooldownMs);
+            return;
+        }
         // Clear any pending reconnects
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
         }
-        this.establishConnection();
+        if (this.pendingConnectTimer) {
+            clearTimeout(this.pendingConnectTimer);
+            this.pendingConnectTimer = null;
+        }
+        this.connectGeneration++;
+        const generation = this.connectGeneration;
+        // Server may not bind the socket immediately after CreateProcess; small delay reduces first-connect failures.
+        const delayMs = this.processLaunchOk ? 500 : 0;
+        if (delayMs > 0) {
+            this.pendingConnectTimer = setTimeout(() => {
+                this.pendingConnectTimer = null;
+                if (generation !== this.connectGeneration) return;
+                this.establishConnection();
+            }, delayMs);
+        } else {
+            this.establishConnection();
+        }
     }
 
     private establishConnection() {
@@ -108,12 +218,14 @@ export class ControllerInput {
         console.log(`[ControllerInput] Attempting connection to ${this.currentUrl}...`);
 
         try {
-            this.socket = new WebSocket(this.currentUrl, []);
+            // Avoid passing an empty subprotocol list; some native WebSocket stacks behave badly with `[]`.
+            this.socket = new WebSocket(this.currentUrl);
             this.socket.binaryType = "arraybuffer";
 
             this.socket.onopen = () => {
                 console.log('[ControllerInput] Connected to controller server (WebSocket)');
                 this.serverStarted = true;
+                this.setState('running');
                 this.onConnected?.();
             };
 
@@ -125,6 +237,9 @@ export class ControllerInput {
                 this.abortOngoingTransfer();
                 this.socket = null;
                 this.connectedConrollers = [];
+                if (this.lifecycleState !== 'cooldown' && this.lifecycleState !== 'stopping') {
+                    this.setState('stopped');
+                }
 
                 // TRIGGER RECONNECT
                 if (!this.isManualDisconnect) {
@@ -161,15 +276,25 @@ export class ControllerInput {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
         }
+        if (this.pendingConnectTimer) {
+            clearTimeout(this.pendingConnectTimer);
+            this.pendingConnectTimer = null;
+        }
+        this.connectGeneration++;
         if (this.socket) {
             this.socket.close();
             this.socket = null;
         }
         this.buffer = '';
+        if (this.lifecycleState !== 'cooldown' && this.lifecycleState !== 'stopping') {
+            this.setState('stopped');
+        }
     }
 
     private scheduleReconnect() {
-        if (this.reconnectTimeout || !this.serverStarted || this.isManualDisconnect) return; // Already waiting
+        // After first onopen, serverStarted is true. Before that, processLaunchOk means we launched the EXE and should keep retrying.
+        if (this.reconnectTimeout || this.isManualDisconnect) return;
+        if (!this.serverStarted && !this.processLaunchOk) return;
 
         console.log(`[ControllerInput] Connection lost. Retrying in 3 seconds...`);
         this.reconnectTimeout = setTimeout(() => {
@@ -264,12 +389,8 @@ export class ControllerInput {
         }
 
         // Wrap the layout in a standard protocol so the server knows what to do with it
-        const message = {
-            gameId: this.gameId,
-            version: this.version,
-            data: layoutData
-        };
-
+        var message = { gameId: this.gameId, version: this.version, ...layoutData };
+        
         const jsonString = JSON.stringify(message);
         
         if (jsonString.length > 1000) {
@@ -385,16 +506,39 @@ export class ControllerInput {
     }
 
     public shutdownServer() {
-        if (this.serverStarted) {
+        if (this.serverStarted || this.processLaunchOk) {
+            this.setState('stopping');
             this.isManualDisconnect = true;
-            console.log('[ControllerInput] Requesting server shutdown...');
-            // Assuming your external server listens for a JSON command or string
-            this.sendCommand(-2, "SHUTDOWN");
-            
-            // Give it a moment to process before we close the local socket
-            setTimeout(() => {
-                this.disconnect();
-            }, 1000);
+            this.processLaunchOk = false;
+            this.startRestartCooldown();
+            console.log('[SDK] Initiating safe shutdown via Native Bridge...');
+            // Ask the server to shut itself down first so C# can run full cleanup.
+            if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                this.sendCommand(-2, "SHUTDOWN");
+            }
+            // 1. Trigger the C++ "Polite" Shutdown (CTRL+BREAK)
+            // This is the most reliable way to ensure the C# CleanUp() runs.
+            if ((window as any).closeExternalExe) {
+                const closed = (window as any).closeExternalExe();
+                console.log(`[SDK] closeExternalExe result: ${closed}`);
+                if ((window as any).isExternalExeAlive) {
+                    const alive = (window as any).isExternalExeAlive();
+                    console.log(`[SDK] Server alive after close request: ${alive}`);
+                }
+            }
+
+            // 2. Disconnect the local socket immediately
+            this.disconnect();
+            this.serverStarted = false;
+            console.log(`[SDK] Restart cool-down started (${(ControllerInput.minRestartDelayMs / 1000).toFixed(1)}s).`);
+        } else {
+            const cooldownMs = this.getRemainingCooldownMs();
+            if (cooldownMs > 0) {
+                this.setState('cooldown', cooldownMs);
+                this.onCooldown?.(cooldownMs);
+            } else {
+                this.setState('stopped');
+            }
         }
     }
 
