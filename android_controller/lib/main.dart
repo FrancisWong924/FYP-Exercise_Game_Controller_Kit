@@ -421,6 +421,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
       loadLayout(storageKey);
     } catch (e) {
       print("[UI] Failed to parse reassembled JSON: $e");
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Failed to Receive Custom Layout")),
+      );
       // If the image was too big and corrupted the JSON, the error will be caught here
     }
   }
@@ -502,7 +505,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 14,
           label: "square",
-          useSystemIcon: true,
+          useSystemIcon: "square",
         ),
         ControllerElement(
           id: ControllerId.buttonCross.name,
@@ -511,7 +514,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 12,
           label: "cross",
-          useSystemIcon: true,
+          useSystemIcon: "cross",
         ),
         ControllerElement(
           id: ControllerId.buttonCircle.name,
@@ -520,7 +523,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 13,
           label: "circle",
-          useSystemIcon: true,
+          useSystemIcon: "circle",
         ),
         ControllerElement(
           id: ControllerId.buttonTriangle.name,
@@ -529,7 +532,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 15,
           label: "triangle",
-          useSystemIcon: true,
+          useSystemIcon: "triangle",
         ),
         ControllerElement(
           id: ControllerId.buttonUp.name,
@@ -538,7 +541,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 0,
           label: "arrow_up",
-          useSystemIcon: true,
+          useSystemIcon: "arrow_up",
         ),
         ControllerElement(
           id: ControllerId.buttonDown.name,
@@ -547,7 +550,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 1,
           label: "arrow_down",
-          useSystemIcon: true,
+          useSystemIcon: "arrow_down",
         ),
         ControllerElement(
           id: ControllerId.buttonLeft.name,
@@ -556,7 +559,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 2,
           label: "arrow_left",
-          useSystemIcon: true,
+          useSystemIcon: "arrow_left",
         ),
         ControllerElement(
           id: ControllerId.buttonRight.name,
@@ -565,7 +568,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 65,
           buttonId: 1 << 3,
           label: "arrow_right",
-          useSystemIcon: true,
+          useSystemIcon: "arrow_right",
         ),
       ],
     );

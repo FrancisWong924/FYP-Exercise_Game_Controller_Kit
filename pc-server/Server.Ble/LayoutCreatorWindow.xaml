@@ -1,0 +1,208 @@
+<Window x:Class="BleServer.LayoutCreatorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Controller layout creator"
+        Width="1100" Height="720"
+        MinWidth="900" MinHeight="560"
+        Background="#FF1E1E1E">
+    <Grid Margin="16">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="340"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Preview -->
+        <DockPanel Grid.Column="0" LastChildFill="True">
+            <TextBlock DockPanel.Dock="Top"
+                       Text="Layout preview (normalized positions, landscape phone aspect)"
+                       Foreground="#FFB0B0B0"
+                       Margin="0,0,0,8"/>
+            <Viewbox Stretch="Uniform" Margin="4">
+                <Border Background="#FF0D0D0D" CornerRadius="28" Padding="12" Width="804" Height="384">
+                    <Border Background="#FF121212" CornerRadius="18" ClipToBounds="True">
+                        <Canvas x:Name="PreviewCanvas" Width="780" Height="360" Background="#FF1A1A1C"/>
+                    </Border>
+                </Border>
+            </Viewbox>
+        </DockPanel>
+
+        <!-- Sidebar -->
+        <Grid Grid.Column="1" Margin="16,0,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="80"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0"
+                       Text="Layout &amp; elements"
+                       FontSize="18"
+                       Foreground="#FFF3F3F3"
+                       Margin="0,0,0,12"/>
+
+            <StackPanel Grid.Row="1" Margin="0,0,0,12">
+                <TextBlock Text="Layout name" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                <TextBox x:Name="LayoutNameBox" Text="New layout" Margin="0,0,0,8"/>
+                <TextBlock Text="backgroundColor (ARGB hex, or #RRGGBB / #RRGGBBAA)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                <TextBox x:Name="LayoutBackgroundColorBox" Margin="0,0,0,8" TextChanged="LayoutBackgroundColorBox_OnTextChanged"/>
+                <TextBlock Text="backgroundImage (URL or uploaded file)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                <Grid Margin="0,0,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="LayoutBackgroundImageBox"
+                             Grid.Column="0"
+                             Height="32"
+                             Margin="0,0,8,0"
+                             TextWrapping="NoWrap"
+                             HorizontalScrollBarVisibility="Hidden"
+                             VerticalScrollBarVisibility="Hidden"
+                             TextChanged="LayoutBackgroundImageBox_OnTextChanged"/>
+                    <StackPanel Grid.Column="1" Orientation="Vertical" VerticalAlignment="Top">
+                        <Button MinWidth="72"
+                                Margin="0,0,0,4"
+                                Content="Upload..."
+                                Click="PickBackgroundImage_OnClick"/>
+                        <Button MinWidth="72"
+                                Content="Clear"
+                                Click="ClearBackgroundImage_OnClick"/>
+                    </StackPanel>
+                </Grid>
+                <TextBlock x:Name="BackgroundImageSourceHint"
+                           Foreground="#FF8E8E8E"
+                           Margin="0,4,0,0"
+                           TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <TextBlock Grid.Row="2" Text="Elements" Foreground="#FFAAAAAA" Margin="0,0,0,6"/>
+            <ListBox x:Name="ElementsList"
+                     Grid.Row="3"
+                     Background="#FF252526"
+                     Foreground="#FFF3F3F3"
+                     BorderBrush="#FF3F3F46"
+                     Margin="0,0,0,12"
+                     DisplayMemberPath="Summary"
+                     SelectionChanged="ElementsList_OnSelectionChanged"/>
+
+            <ScrollViewer Grid.Row="4" VerticalScrollBarVisibility="Auto" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="Element settings" Foreground="#FFCCCCCC" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                    <StackPanel x:Name="EditorPanel" DataContext="{Binding SelectedItem, ElementName=ElementsList}">
+                        <StackPanel.Style>
+                            <Style TargetType="StackPanel">
+                                <Setter Property="Visibility" Value="Visible"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedItem, ElementName=ElementsList}" Value="{x:Null}">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </StackPanel.Style>
+                        <TextBlock Text="Type" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <ComboBox x:Name="TypeCombo"
+                                Margin="0,0,0,8"
+                                SelectionChanged="TypeCombo_OnSelectionChanged"
+                                PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                        <TextBlock Text="Id" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <TextBox Text="{Binding Id, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                        <TextBlock Text="Label" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <TextBox Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                        <TextBlock Text="x (0–1, normalized)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <Slider Minimum="0" Maximum="1" SmallChange="0.01" LargeChange="0.05"
+                                Value="{Binding X, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,4"/>
+                        <TextBlock Text="y (0–1, normalized)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <Slider Minimum="0" Maximum="1" SmallChange="0.01" LargeChange="0.05"
+                                Value="{Binding Y, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                        <TextBlock Text="size" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <Slider Minimum="24" Maximum="200" Value="{Binding Size, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+
+                        <StackPanel x:Name="JoystickFieldsPanel" Visibility="Collapsed">
+                            <TextBlock Text="joystickType (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                            <ComboBox Margin="0,0,0,8"
+                                    ItemsSource="{Binding JoystickSideOptions, RelativeSource={RelativeSource AncestorType=Window}}"
+                                    SelectedItem="{Binding JoystickType, UpdateSourceTrigger=PropertyChanged}"
+                                    PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                        </StackPanel>
+
+                        <StackPanel x:Name="ButtonFieldsPanel" Visibility="Collapsed">
+                            <TextBlock Text="buttonId" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                            <ComboBox Margin="0,0,0,8"
+                                    ItemsSource="{Binding ButtonIdMaskOptions, RelativeSource={RelativeSource AncestorType=Window}}"
+                                    DisplayMemberPath="DisplayName"
+                                    SelectedValuePath="Value"
+                                    SelectedValue="{Binding ButtonId, UpdateSourceTrigger=PropertyChanged}"
+                                    PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                            <TextBlock Text="image (URL or uploaded file)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox Grid.Column="0"
+                                        Text="{Binding ButtonImageUrl, UpdateSourceTrigger=PropertyChanged}"
+                                        Height="32"
+                                        Margin="0,0,8,0"
+                                        TextWrapping="NoWrap"
+                                        HorizontalScrollBarVisibility="Hidden"
+                                        VerticalScrollBarVisibility="Hidden"/>
+                                <StackPanel Grid.Column="1" Orientation="Vertical" VerticalAlignment="Top">
+                                    <Button MinWidth="72"
+                                            Margin="0,0,0,4"
+                                            Content="Upload..."
+                                            Click="PickSelectedButtonImage_OnClick"/>
+                                    <Button MinWidth="72"
+                                            Content="Clear"
+                                            Click="ClearSelectedButtonImage_OnClick"/>
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="{Binding ButtonImageHint}"
+                                    Foreground="#FF8E8E8E"
+                                    Margin="0,0,0,8"
+                                    TextWrapping="Wrap"/>
+                            <TextBlock Text="System Icon" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                            <ComboBox ItemsSource="{Binding SystemIconOptions, RelativeSource={RelativeSource AncestorType=Window}}" 
+                                    SelectedItem="{Binding UseSystemIcon, UpdateSourceTrigger=PropertyChanged}" 
+                                    Margin="0,0,0,8"
+                                    PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                        </StackPanel>
+
+                        <TextBlock Text="backgroundColor (ARGB hex)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <TextBox Text="{Binding BackgroundColor, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                        <TextBlock Text="color (ARGB hex)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <TextBox Text="{Binding Color, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                        <TextBlock Text="opacity" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <Slider Minimum="0" Maximum="1" SmallChange="0.05"
+                                Value="{Binding Opacity, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                    </StackPanel>
+                    <TextBlock Text="Select an element from the list to edit properties" 
+                        Foreground="#FF666666" 
+                        FontStyle="Italic" 
+                        TextWrapping="Wrap"
+                        Margin="0,10,0,0">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding SelectedItem, ElementName=ElementsList}" Value="{x:Null}">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                </StackPanel>
+            </ScrollViewer>
+
+            <StackPanel Grid.Row="5" Orientation="Vertical">
+                <Button Content="Add button" Margin="0,0,0,8" Click="AddButton_OnClick"/>
+                <Button Content="Add joystick" Margin="0,0,0,8" Click="AddJoystick_OnClick"/>
+                <Button Content="Remove selected" Margin="0,0,0,8" Click="RemoveSelected_OnClick"/>
+                <Button Content="Export JSON…" Margin="0,0,0,8" Click="ExportJson_OnClick"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

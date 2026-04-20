@@ -90,7 +90,7 @@ class ControllerElement {
   final String backgroundColor;
   final String color;
   final String? image;    // For Base64 encoded strings
-  final bool useSystemIcon;   // If true, use your local assets/icons/
+  final String? useSystemIcon;   // If true, use your local assets/icons/
   final double opacity;       // Some buttons should be faint
   double size;
   Offset position;              // Center position (or bottom-left for joystick)
@@ -106,7 +106,7 @@ class ControllerElement {
     this.color = "FFFFFFFF",
     this.backgroundColor = "33FFFFFF",
     this.image,
-    this.useSystemIcon = false, 
+    this.useSystemIcon = null, 
     this.opacity = 1.0,
   });
 
@@ -159,7 +159,7 @@ class ControllerElement {
       backgroundColor: backgroundColorData ?? "33FFFFFF",
       color: colorData ?? "FFFFFFFF",
       image: json['image']?.toString(),
-      useSystemIcon: json['useSystemIcon'] ?? false,
+      useSystemIcon: json['useSystemIcon'],
       opacity: (json['opacity'] ?? 1.0).toDouble(),
     );
   }
@@ -260,15 +260,15 @@ class _CustomButtonState extends State<CustomButton> {
     }
  
     // System Icons
-    if (element.useSystemIcon && element.image == null) {
-      return _buildSvgLabel(element.label, element.size, element.color);
+    if (element.useSystemIcon != null && element.useSystemIcon != "None" && element.image == null) {
+      return _buildSvgLabel(element.useSystemIcon!, element.size, element.color);
     }
 
     return Text(
       element.label,
       style: TextStyle(
         color: isPressed ? Colors.black : Colors.white,
-        fontSize: element.size * 0.25,
+        fontSize: element.size * 0.35,
         fontWeight: FontWeight.bold,
       ),
     );

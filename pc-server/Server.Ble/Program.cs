@@ -12,6 +12,8 @@ using System.Threading.Tasks;
 using System.Text;
 using System.Text.Json;
 using System.Timers;
+using System.Windows;
+using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Net;
 using System.Net.Sockets;
@@ -45,6 +47,15 @@ namespace BleServer
         // private static TcpListener? _tcpListener;
         // private static readonly List<TcpClient> _connectedClients = new();
         // private static readonly object _clientsLock = new();
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        const int SW_HIDE = 0;
+        const int SW_SHOW = 5;
+
         // --- BLE Configuration ---
         private static readonly Guid serviceUuid = Guid.Parse("12345678-1234-5678-1234-56789abcdef0");
         private static readonly Guid notifyUuid  = Guid.Parse("12345678-1234-5678-1234-56789abcdef2"); // PC → Phone
@@ -65,18 +76,95 @@ namespace BleServer
 
         // Timer for cleaning up stale connections
         private static System.Timers.Timer? disconnectTimer = null;
+        private static bool _isCleaningUp = false;
+        private static readonly object _cleanupLock = new object();
 
-        // ViGEmBus for virtual controller emulation
-        private static ViGEmClient? vigemClient = null;
+        // ViGEm Client
         public static bool IsVigemEnabled = true;
+        public static ViGEmClient? vigemClient;
 
-        static async Task Main(string[] args)
+        private static int _shutdownDone;
+
+        /// <summary>Stops BLE, WebSocket, and ViGEm without terminating the process. Safe to call multiple times.</summary>
+        public static void PerformServerShutdown()
         {
+            if (Interlocked.Exchange(ref _shutdownDone, 1) == 1) return;
+
+            disconnectTimer?.Stop();
+            try {
+                foreach(var player in ConnectedPlayers.Values) {
+                    try { player.Controller?.Disconnect(); } catch { }
+                }
+                vigemClient?.Dispose();
+                vigemClient = null;
+
+                if (provider != null) {
+                    Console.WriteLine("[BLE] Stopping Advertisement...");
+                    provider.StopAdvertising();
+                    if (notifyChar != null) {
+                        notifyChar.SubscribedClientsChanged -= OnSubscribedClientsChanged;
+                    }
+                    provider = null;
+                    notifyChar = null;
+                    ConnectedPlayers.Clear();
+                    _playerIdHistory.Clear();
+                }
+                
+                lock (_wsLock)
+                {
+                    foreach (var ws in wsSessions.ToList()) { try { ws.Close(); } catch { } }
+                    wsSessions.Clear();
+                }
+                wsServer?.Stop();
+                wsServer = null;
+                Console.WriteLine("[BLE] Cleanup complete.");
+            } catch (Exception ex) {
+                Console.WriteLine($"[BLE] Error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Must be synchronous void Main (not async Task Main): WPF requires an STA thread for windows/controls.
+        /// async Task Main runs the body on a thread-pool continuation, which throws when constructing MainWindow.
+        /// </summary>
+        [STAThread]
+        static void Main(string[] args)
+        {
+            bool isCreatorMode = args.Contains("--edit");
+            bool isHiddenMode = args.Contains("--hidden");
+
+            if (isHiddenMode)
+            {
+                // Hide the console window immediately for players
+                ShowWindow(GetConsoleWindow(), SW_HIDE);
+                RunServerAsync(args, CancellationToken.None).GetAwaiter().GetResult();
+            }
+
+            if (isCreatorMode)
+            {
+                // Use the custom WPF App so OnStartup can:
+                // - redirect Console output to MainWindow via TeeTextWriter
+                // - start RunServerAsync with cancellation tied to app shutdown
+                var app = new App();
+                app.Run();
+            }
+            else
+            {
+                RunServerAsync(args, CancellationToken.None).GetAwaiter().GetResult();
+            }
+        }
+
+        /// <summary>Runs the BLE + WebSocket server until <paramref name="cancellationToken"/> is cancelled.</summary>
+        public static async Task RunServerAsync(string[] args, CancellationToken cancellationToken)
+        {
+            try
+            {
             // KILL OLD GHOSTS
             var current = Process.GetCurrentProcess();
             var duplicates = Process.GetProcessesByName(current.ProcessName)
                                 .Where(p => p.Id != current.Id);
             if (duplicates.Any()) {
+                Console.WriteLine($"[SERVER] Found {duplicates.Count()} other '{current.ProcessName}' process(es); stopping them so this instance owns BLE/WebSocket (game WS will drop until this server is ready).");
                 foreach (var duplicate in duplicates) {
                     try { 
                         duplicate.Kill(); 
@@ -311,6 +399,13 @@ namespace BleServer
                 }
             };
 
+            // 4. Start WebSocket Server for Game Engine
+            wsServer = new WebSocketServer(IPAddress.Parse("127.0.0.1"), 38421);
+            wsServer.AllowForwardedRequest = true;
+            wsServer.AddWebSocketService<ControllerWsBehavior>("/controller");
+            wsServer.Start();
+            Console.WriteLine("[WS] WebSocket server started on ws://127.0.0.1:38421/controller");
+
             // 5. Start advertising
             var advParams = new GattServiceProviderAdvertisingParameters
             {
@@ -375,20 +470,18 @@ namespace BleServer
             //     }
             // });
 
-            wsServer = new WebSocketServer(IPAddress.Parse("127.0.0.1"), 38421);
-            wsServer.AllowForwardedRequest = true;
-            wsServer.AddWebSocketService<ControllerWsBehavior>("/controller");
-            wsServer.Start();
-            Console.WriteLine("[WS] WebSocket server started on ws://127.0.0.1:38421/controller");
-
-            Console.WriteLine("Press Enter to stop...");
-            Console.ReadLine();
-
-            provider.StopAdvertising();
-            Console.WriteLine("Server stopped.");
-
-            // Keep the app alive
-            await Task.Delay(-1);
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // normal shutdown when the UI closes or token is cancelled
+            }
+            finally
+            {
+                Console.WriteLine("Server stopped.");
+                PerformServerShutdown();
+                Interlocked.Exchange(ref _shutdownDone, 0);
+            }
         }
 
         private static async void OnSubscribedClientsChanged(GattLocalCharacteristic sender, object args) {
@@ -504,39 +597,17 @@ namespace BleServer
 
         public static void CleanUp() 
         {
-            disconnectTimer?.Stop();
-            if (provider != null) {
-                try {
-                    foreach(var player in ConnectedPlayers.Values) {
-                        player.Controller?.Disconnect();
-                    }
-                    vigemClient?.Dispose();
-                    vigemClient = null;
-                    Console.WriteLine("[BLE] Stopping Advertisement...");
-                    provider.StopAdvertising();
-                    if (notifyChar != null) {
-                        notifyChar.SubscribedClientsChanged -= OnSubscribedClientsChanged;
-                    }
-                    provider = null;
-                    notifyChar = null;
-                    ConnectedPlayers.Clear();
-                    _playerIdHistory.Clear();
-                    lock (_wsLock)
-                    {
-                        foreach (var ws in wsSessions) { try { ws.Close(); } catch { } }
-                        wsSessions.Clear();
-                    }
-                    wsServer?.Stop();
-                    wsServer = null;
-                    Console.WriteLine("[BLE] Cleanup complete.");
-                } catch (Exception ex) {
-                    Console.WriteLine($"[BLE] Error: {ex.Message}");
-                }
+            lock (_cleanupLock)
+            {
+                if (_isCleaningUp) return;
+                _isCleaningUp = true;
             }
-            System.Threading.Thread.Sleep(1500);
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            Task.Delay(500).Wait();
+            Console.WriteLine("[SERVER] Cleaning up resources...");
+            PerformServerShutdown();
+            Thread.Sleep(500);
+            // GC.Collect();
+            // GC.WaitForPendingFinalizers();
+            // Task.Delay(500).Wait();
             Environment.Exit(0);
         }
 
