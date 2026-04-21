@@ -10,8 +10,6 @@ export interface InputState {
     JoyRX: number;
     JoyRY: number;
     Buttons: number;
-    Stepping: number;
-    Steering: number;
 }
 
 export const DefaultButtonMasks = {

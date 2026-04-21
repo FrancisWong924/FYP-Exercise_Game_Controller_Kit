@@ -47,7 +47,6 @@ class BleManager {
 
   int currentButtons = 0;           // Live button state
   InputState currentJoy = InputState();  // Live joystick state
-  double currentSteering = 0.0;  // -1.0 to +1.0
   double currentStep = 0.0;  // -1.0 to 0.0
 
   int _lastSentSequence = 0;
@@ -270,7 +269,7 @@ class BleManager {
       print("[BLE] → Sent command: $command");
       if (command == "PAUSE") {
         updateSteering(0.0);
-        updateStep(ControllerId.leftJoystick, 0.0, 0.0);
+        updateStep(ControllerId.leftJoystick, 0.0);
       }
       return true;
     } catch (e) {
@@ -296,11 +295,11 @@ class BleManager {
   }
 
   void updateSteering(double steering) {
-    currentSteering = steering;
+    currentJoy = currentJoy.copyWith(joyRX: steering);
   }
 
-  void updateStep(ControllerId id, double x, double y) {
-    currentStep = y;
+  void updateStep(ControllerId id, double y) {
+    currentJoy = currentJoy.copyWith(joyLY: y);
   }
 
   void sendCombinedInputPacket() async {
@@ -326,10 +325,10 @@ class BleManager {
     bd.setInt16(10, (currentJoy.joyRY * 32767).round(), Endian.little);
 
     // Bytes 12–13: Steering (Int16)
-    bd.setInt16(12, (currentSteering * 32767).round(), Endian.little);
+    // bd.setInt16(12, (currentSteering * 32767).round(), Endian.little);
 
     // Bytes 14–15: NEW Step Variable
-    bd.setInt16(14, (currentStep * 32767).round(), Endian.little);
+    // bd.setInt16(14, (currentStep * 32767).round(), Endian.little);
 
     // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
     // print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
@@ -337,9 +336,7 @@ class BleManager {
       currentJoy.joyLX.abs() < 0.001 &&
       currentJoy.joyLY.abs() < 0.001 &&
       currentJoy.joyRX.abs() < 0.001 &&
-      currentJoy.joyRY.abs() < 0.001 &&
-      currentStep.abs() < 0.001 &&
-      currentSteering.abs() < 0.001;
+      currentJoy.joyRY.abs() < 0.001;
     bool stateChanged = _lastSentPacket == null || !_arePacketsEqual(_lastSentPacket!, packet);
     if (isNeutral && !stateChanged) {
       if (_lastSentSequence > 2) {

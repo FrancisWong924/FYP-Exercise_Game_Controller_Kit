@@ -35,11 +35,9 @@ namespace BleServer
         public float JoyRX { get; set; } = 0f;
         public float JoyRY { get; set; } = 0f;
         public uint Buttons { get; set; } = 0;
-        public float Stepping { get; set; } = 0f;
-        public float Steering { get; set; } = 0f;
 
         public override string ToString()
-            => $"Player:{PlayerId} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4} GYRO:[{Steering,6:F1}]";
+            => $"Player:{PlayerId} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4}]";
     }
 
     class Program
@@ -266,9 +264,7 @@ namespace BleServer
                             JoyLX = BitConverter.ToInt16(bytes, 4) / 32767f,
                             JoyLY = BitConverter.ToInt16(bytes, 6) / 32767f,
                             JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f,
-                            JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f,
-                            Steering = BitConverter.ToInt16(bytes, 12) / 32767f,
-                            Stepping = BitConverter.ToInt16(bytes, 14) / 32767f
+                            JoyRY = BitConverter.ToInt16(bytes, 10) / 32767f
                         };
 
                         // --- BRIDGE TO VIRTUAL CONTROLLER START ---
@@ -281,7 +277,7 @@ namespace BleServer
                         _ = BroadcastInputAsync(state);
                         
                         // Optional: Console log with Player ID
-                        Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X} LX: {state.JoyLX:F2} LY: {state.JoyLY:F2} RX: {state.JoyRX:F2} RY: {state.JoyRY:F2} STR: {state.Steering:F2} STP: {state.Stepping:F2}");
+                        Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X} LX: {state.JoyLX:F2} LY: {state.JoyLY:F2} RX: {state.JoyRX:F2} RY: {state.JoyRY:F2}");
                     }
                 }
                 catch (Exception ex)

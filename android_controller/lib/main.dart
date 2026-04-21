@@ -51,6 +51,8 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   double lastAccelZ = 0.0;
   Timer? stepTimer;  // Debounce steps
   bool isWalking = false;  // True if forward motion detected
+  bool steeringEnabled = false; // New: toggle for steering control
+  bool steppingEnabled = false; // New: true if stepping is enabled
 
   String messageBuffer = ""; // Buffer for large transmissions
   bool isReceivingLayout = false;
@@ -271,6 +273,26 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           triggerVibration();
           return;
         }
+
+        if (message == "ENABLE_STEERING") {
+          setState(() => steeringEnabled = true);
+          return;
+        }
+
+        if (message == "DISABLE_STEERING") {
+          setState(() => steeringEnabled = false);
+          return;
+        }
+
+        if (message == "ENABLE_STEP") {
+          setState(() => steppingEnabled = true);
+          return;
+        }
+
+        if (message == "DISABLE_STEP") {
+          setState(() => steppingEnabled = false);
+          return;
+        }
       } catch (e) {
         print("[UI] Error decoding incoming BLE data: $e");
       }
@@ -368,7 +390,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         double steering = filteredSteering;
         if (steering.abs() < 0.08) steering = 0.0;
         // print("steering: ${steering.toStringAsFixed(3)}");
-        if ((steering - steeringValue).abs() > 0.01) {
+        if ((steering - steeringValue).abs() > 0.01 && steeringEnabled) {
           steeringValue = steering;
           bleManager.updateSteering(steeringValue);
         }
@@ -385,11 +407,12 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
             isWalking = false;
           });
         }
-
-        if (isWalking) {
-          bleManager.updateStep(ControllerId.leftJoystick, 0.0, -1.0);
-        } else {
-          bleManager.updateStep(ControllerId.leftJoystick, 0.0, 0.0);
+        if (steppingEnabled) {
+          if (isWalking) {
+            bleManager.updateStep(ControllerId.leftJoystick, -1.0);
+          } else {
+            bleManager.updateStep(ControllerId.leftJoystick, 0.0);
+          }
         }
     });
   }
@@ -660,47 +683,69 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                 context: context,
                 barrierColor: Colors.black54, // Darkens the background
                 builder: (BuildContext context) {
-                  return Center(
-                    child: Material(
-                      color: Colors.transparent,
-                      child: Container(
-                        // Set your desired width/height for the center box
-                        width: MediaQuery.of(context).size.width * 0.4,
-                        padding: const EdgeInsets.all(20),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF1A1A1A), // Dark charcoal
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.white10),
-                          boxShadow: [
-                            BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
-                          ],
-                        ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Text(
-                              "SETTINGS",
-                              style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                  return StatefulBuilder(
+                    builder: (context, setDialogState) {
+                      return Center(
+                        child: Material(
+                          color: Colors.transparent,
+                          child: Container(
+                            // Set your desired width/height for the center box
+                            width: MediaQuery.of(context).size.width * 0.4,
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1A1A1A), // Dark charcoal
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.white10),
+                              boxShadow: [
+                                BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
+                              ],
                             ),
-                            const SizedBox(height: 20),
-                            // Button 1: Layout Customization
-                            _buildMenuButton(
-                              const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                              "Customize Layout", 
-                              () {
-                                Navigator.pop(context);
-                                toggleEditMode();
-                            }),
-                            const SizedBox(height: 10),
-                            // Close Button
-                            TextButton(
-                              onPressed: () => Navigator.pop(context),
-                              child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Text(
+                                  "SETTINGS",
+                                  style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                                ),
+                                const SizedBox(height: 20),
+                                // Button 1: Layout Customization
+                                _buildMenuButton(
+                                  const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                  "Customize Layout", 
+                                  () {
+                                    Navigator.pop(context);
+                                    toggleEditMode();
+                                }),
+                                const SizedBox(height: 10),
+                                _buildMenuButton(
+                                  const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                  steeringEnabled ? "Disable Tilt Steering" : "Enable Tilt Steering",
+                                  () {
+                                    setDialogState(() {
+                                      steeringEnabled = !steeringEnabled;
+                                    });
+                                }),
+                                const SizedBox(height: 10),
+                                _buildMenuButton(
+                                  const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                  steppingEnabled ? "Disable Step Detection" : "Enable Step Detection",
+                                  () {
+                                    setDialogState(() {
+                                      steppingEnabled = !steppingEnabled;
+                                    });
+                                }),
+                                const SizedBox(height: 10),
+                                // Close Button
+                                TextButton(
+                                  onPressed: () => Navigator.pop(context),
+                                  child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                                ),
+                              ],
                             ),
-                          ],
+                          ),
                         ),
-                      ),
-                    ),
+                      );
+                    },
                   );
                 },
               );
@@ -974,25 +1019,32 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
 
   // Helper method to keep your buttons consistent
   Widget _buildMenuButton(Widget iconWidget, String label, VoidCallback onTap) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.05),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          children: [
-            SizedBox(
-            width: 24, 
-              height: 24, 
-              child: Center(child: iconWidget)
-            ),
-            const SizedBox(width: 15),
-            Text(label, style: const TextStyle(color: Colors.white, fontSize: 16)),
-          ],
+    return Material(
+      color: Colors.transparent, // Required for InkWell to show effects
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        splashColor: Colors.white.withOpacity(0.1),
+        highlightColor: Colors.black.withOpacity(0.2),
+        child: Ink(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.05),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            children: [
+              SizedBox(
+              width: 24, 
+                height: 24, 
+                child: Center(child: iconWidget)
+              ),
+              const SizedBox(width: 15),
+              Expanded( // Expanded ensures the text doesn't overflow
+                child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 16)),
+              ),
+            ],
+          ),
         ),
       ),
     );

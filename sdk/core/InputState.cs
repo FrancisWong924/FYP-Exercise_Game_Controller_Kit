@@ -7,6 +7,4 @@ public class InputState
     public float JoyRX { get; set; }
     public float JoyRY { get; set; }
     public uint Buttons { get; set; }
-    public float Stepping { get; set; }
-    public float Steering { get; set; }
 }
