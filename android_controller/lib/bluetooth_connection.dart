@@ -257,7 +257,11 @@ class BleManager {
     }
   }
 
-  Future<bool> sendMessage(String command) async {
+  Future<bool> sendMessage(String command, {
+    ControllerId tiltTarget = ControllerId.rightJoystick,
+    ControllerId stepTarget = ControllerId.leftJoystick,
+    int stepBitmask = 0,
+  }) async {
     if (pingCharacteristic == null) {
       print("[BLE] Cannot send $command — PING characteristic not available");
       return false;
@@ -268,8 +272,9 @@ class BleManager {
       await pingCharacteristic!.write(bytes, withoutResponse: false);  // MUST be false!
       print("[BLE] → Sent command: $command");
       if (command == "PAUSE") {
-        updateSteering(0.0);
-        updateStep(ControllerId.leftJoystick, 0.0);
+        updateSteering(0.0, tiltTarget);
+        updateStep(0.0, jid: stepTarget, bitmask: stepBitmask);
+        updateSteering(0.0, tiltTarget == ControllerId.leftJoystick ? ControllerId.rightJoystick : ControllerId.leftJoystick);
       }
       return true;
     } catch (e) {
@@ -294,12 +299,32 @@ class BleManager {
     }
   }
 
-  void updateSteering(double steering) {
-    currentJoy = currentJoy.copyWith(joyRX: steering);
+  void updateSteering(double steering, ControllerId target) {
+    if (target == ControllerId.leftJoystick) {
+      // Update the Left Joystick X-axis
+      currentJoy = currentJoy.copyWith(joyLX: steering);
+    } else {
+      // Update the Right Joystick X-axis (Default)
+      currentJoy = currentJoy.copyWith(joyRX: steering);
+    }
   }
 
-  void updateStep(ControllerId id, double y) {
-    currentJoy = currentJoy.copyWith(joyLY: y);
+  void updateStep(double y, {ControllerId? jid, int? bitmask}) {
+    // 1. Handle Joystick Mapping
+    if (bitmask == null || bitmask == 0) {
+      if (jid == ControllerId.leftJoystick) {
+        currentJoy = currentJoy.copyWith(joyLY: y);
+      } else {
+        currentJoy = currentJoy.copyWith(joyRY: y);
+      }
+    } 
+    // 2. Handle Button Mapping
+    else {
+      // If y is -1.0, the "button" is pressed. If 0.0, it is released.
+      bool isPressed = (y != 0.0);
+      // You would call your bitmask update logic here
+      updateButton(bitmask, isPressed);
+    }
   }
 
   void sendCombinedInputPacket() async {

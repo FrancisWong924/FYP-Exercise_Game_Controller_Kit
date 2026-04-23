@@ -532,6 +532,51 @@ public partial class LayoutCreatorWindow : Window
         MessageBox.Show(this, $"Saved to:\n{dlg.FileName}", "Export", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
+    async void SendLayoutToPhone_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (!ValidateElementsForExport(_elements, out var err))
+        {
+            MessageBox.Show(this, err, "Cannot send layout", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (!TryGetBackgroundImageForExport(out var backgroundImage, out var backgroundErr))
+        {
+            MessageBox.Show(this, backgroundErr, "Cannot send layout", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            var exported = ControllerLayoutDocument.Serialize(
+                _elements,
+                LayoutNameBox.Text.Trim(),
+                LayoutBackgroundColorBox.Text,
+                backgroundImage);
+            var wireJson = Program.BuildPhoneLayoutJsonFromExportedLayout(exported);
+            var sent = await Program.TryBroadcastLayoutToPhonesAsync(wireJson);
+            if (!sent)
+            {
+                MessageBox.Show(this,
+                    "No phone is connected right now. Connect your device over Bluetooth to this PC server, then try again.",
+                    "Send layout to phone",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
+            MessageBox.Show(this,
+                "Layout sent to connected phone(s).",
+                "Send layout to phone",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Failed to send layout", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
     void PickBackgroundImage_OnClick(object sender, RoutedEventArgs e)
     {
         var dlg = new OpenFileDialog

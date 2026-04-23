@@ -11,9 +11,9 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Timers;
 using System.Windows;
-using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Net;
 using System.Net.Sockets;
@@ -45,14 +45,6 @@ namespace BleServer
         // private static TcpListener? _tcpListener;
         // private static readonly List<TcpClient> _connectedClients = new();
         // private static readonly object _clientsLock = new();
-        [DllImport("kernel32.dll")]
-        static extern IntPtr GetConsoleWindow();
-
-        [DllImport("user32.dll")]
-        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        const int SW_HIDE = 0;
-        const int SW_SHOW = 5;
 
         // --- BLE Configuration ---
         private static readonly Guid serviceUuid = Guid.Parse("12345678-1234-5678-1234-56789abcdef0");
@@ -123,33 +115,13 @@ namespace BleServer
 
         /// <summary>
         /// Must be synchronous void Main (not async Task Main): WPF requires an STA thread for windows/controls.
-        /// async Task Main runs the body on a thread-pool continuation, which throws when constructing MainWindow.
+        /// Always hosts the WPF UI (layout creator + log); <see cref="App"/> starts <see cref="RunServerAsync"/> on startup.
         /// </summary>
         [STAThread]
         static void Main(string[] args)
         {
-            bool isCreatorMode = args.Contains("--edit");
-            bool isHiddenMode = args.Contains("--hidden");
-
-            if (isHiddenMode)
-            {
-                // Hide the console window immediately for players
-                ShowWindow(GetConsoleWindow(), SW_HIDE);
-                RunServerAsync(args, CancellationToken.None).GetAwaiter().GetResult();
-            }
-
-            if (isCreatorMode)
-            {
-                // Use the custom WPF App so OnStartup can:
-                // - redirect Console output to MainWindow via TeeTextWriter
-                // - start RunServerAsync with cancellation tied to app shutdown
-                var app = new App();
-                app.Run();
-            }
-            else
-            {
-                RunServerAsync(args, CancellationToken.None).GetAwaiter().GetResult();
-            }
+            var app = new App();
+            app.Run();
         }
 
         /// <summary>Runs the BLE + WebSocket server until <paramref name="cancellationToken"/> is cancelled.</summary>
@@ -701,6 +673,55 @@ namespace BleServer
 
             var tasks = uniqueSessions.Select(player => player.SendMessageViaBle(message, notifyChar));
             await Task.WhenAll(tasks);
+        }
+
+        /// <summary>Default <c>gameId</c> when <c>layoutName</c> is missing from the export.</summary>
+        public const string LayoutCreatorPhoneGameId = "layout_creator";
+
+        /// <summary>Version number paired with <c>gameId</c> for phone storage key.</summary>
+        public const int LayoutCreatorPhoneVersion = 1;
+
+        /// <summary>
+        /// Wraps JSON from <see cref="ControllerLayoutDocument.Serialize"/> with <c>gameId</c> and <c>version</c> as required by the Flutter app.
+        /// </summary>
+        public static string BuildPhoneLayoutJsonFromExportedLayout(string exportedLayoutJson)
+        {
+            var root = JsonNode.Parse(exportedLayoutJson)!.AsObject();
+            // Cannot assign root["layoutName"] directly: that node already belongs to this object under "layoutName".
+            root["gameId"] = root["layoutName"]?.DeepClone() ?? JsonValue.Create(LayoutCreatorPhoneGameId);
+            root["version"] = LayoutCreatorPhoneVersion;
+            return root.ToJsonString();
+        }
+
+        /// <summary>
+        /// Sends layout JSON to every connected phone using the same protocol as Cocos <c>sendLayout</c> (LAYOUT: or START_MSG / CHUNK / END_MSG).
+        /// </summary>
+        /// <returns><c>true</c> if at least one session existed and sending was attempted; <c>false</c> if no phones are connected.</returns>
+        public static async Task<bool> TryBroadcastLayoutToPhonesAsync(string fullLayoutJson)
+        {
+            if (ConnectedPlayers.IsEmpty)
+                return false;
+
+            const int chunkSize = 500;
+            const int smallThreshold = 1000;
+            const int delayMs = 50;
+
+            if (fullLayoutJson.Length <= smallThreshold)
+                await BroadcastToAllPlayers($"LAYOUT:{fullLayoutJson}");
+            else
+            {
+                await BroadcastToAllPlayers("START_MSG");
+                for (int i = 0; i < fullLayoutJson.Length; i += chunkSize)
+                {
+                    var len = Math.Min(chunkSize, fullLayoutJson.Length - i);
+                    var chunk = fullLayoutJson.Substring(i, len);
+                    await BroadcastToAllPlayers($"CHUNK:{chunk}");
+                    await Task.Delay(delayMs);
+                }
+                await BroadcastToAllPlayers("END_MSG");
+            }
+
+            return true;
         }
     }
 

@@ -202,6 +202,7 @@
                 <Button Content="Add joystick" Margin="0,0,0,8" Click="AddJoystick_OnClick"/>
                 <Button Content="Remove selected" Margin="0,0,0,8" Click="RemoveSelected_OnClick"/>
                 <Button Content="Export JSON…" Margin="0,0,0,8" Click="ExportJson_OnClick"/>
+                <Button Content="Send layout to phone" Margin="0,0,0,8" Click="SendLayoutToPhone_OnClick"/>
             </StackPanel>
         </Grid>
     </Grid>

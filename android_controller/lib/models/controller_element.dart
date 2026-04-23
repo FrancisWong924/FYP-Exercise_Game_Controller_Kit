@@ -31,6 +31,9 @@ class ControllerLayout {
   final String version;
   final String? backgroundImage;  // The game dev might want a custom skin
   final String? backgroundColor;  // Optional solid color background (hex ARGB)
+  ControllerId tiltTarget;
+  ControllerId stepTarget;
+  int stepButtonBitmask;
   final List<ControllerElement> elements;
 
   ControllerLayout({
@@ -41,6 +44,9 @@ class ControllerLayout {
     this.backgroundImage,
     this.backgroundColor,
     this.favorite = false,
+    this.tiltTarget = ControllerId.rightJoystick,
+    this.stepTarget = ControllerId.leftJoystick,
+    this.stepButtonBitmask = 0,
   });
 
   Map<String, dynamic> toJson() => {
@@ -51,6 +57,9 @@ class ControllerLayout {
     'data': {
       'backgroundImage': backgroundImage,
       'backgroundColor': backgroundColor,
+      "tiltTarget": tiltTarget.index, // Store as int
+      "stepTarget": stepTarget.index,
+      "stepButtonBitmask": stepButtonBitmask,
       'elements': elements.map((e) => e.toJson()).toList(),
     }
   };
@@ -69,6 +78,8 @@ class ControllerLayout {
         hexColor = alpha + hexColor.substring(0, 6);
       }
     }
+    int tiltIdx = data['tiltTarget'] ?? ControllerId.rightJoystick.index;
+    int stepIdx = data['stepTarget'] ?? ControllerId.leftJoystick.index;
     return ControllerLayout(
       gameId: json['gameId'].toString(),
       layoutName: json['layoutName'] ?? "Default Layout",
@@ -76,6 +87,9 @@ class ControllerLayout {
       backgroundImage: data['backgroundImage'],
       backgroundColor: hexColor,
       favorite: json['favorite'] ?? false,
+      tiltTarget: ControllerId.values[tiltIdx],
+      stepTarget: ControllerId.values[stepIdx],
+      stepButtonBitmask: data['stepButtonBitmask'] ?? 0,
       elements: elementList,
     );
   }
@@ -84,7 +98,6 @@ class ControllerLayout {
 class ControllerElement {
   final String id;                    // Unique ID
   final ControllerElementType type;
-  final int buttonId;                 // For buttons: bitmask value
   final String? joystickType;
   final String label;                 // Optional: "A", "X", "Fire", etc.
   final String backgroundColor;
@@ -92,6 +105,7 @@ class ControllerElement {
   final String? image;    // For Base64 encoded strings
   final String? useSystemIcon;   // If true, use your local assets/icons/
   final double opacity;       // Some buttons should be faint
+  int buttonId;                 // For buttons: bitmask value
   double size;
   Offset position;              // Center position (or bottom-left for joystick)
 

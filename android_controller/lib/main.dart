@@ -35,6 +35,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   String _status = 'Connecting...';
   bool showStatusBanner = true;
   bool isLoading = true;
+  bool isSettingsOpen = false;
   bool paused = false;
   Timer? bannerTimer;
   Offset editorPosition = const Offset(0.5, 0.05);
@@ -73,6 +74,26 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   String? originalLayoutJson;
   ControllerLayout? editLayoutCopy;
   ControllerElement? selectedElement;
+  double lastSentStepValue = 0.0;
+
+  final Map<String, int> buttonBitmasks = {
+    "UP": 1 << 0,
+    "DOWN": 1 << 1,
+    "LEFT": 1 << 2,
+    "RIGHT": 1 << 3,
+    "START": 1 << 4,
+    "SELECT": 1 << 5,
+    "L1": 1 << 6,
+    "R1": 1 << 7,
+    "L2": 1 << 8,
+    "R2": 1 << 9,
+    "L3": 1 << 10,
+    "R3": 1 << 11,
+    "CROSS / A": 1 << 12,
+    "CIRCLE / B": 1 << 13,
+    "SQUARE / X": 1 << 14,
+    "TRIANGLE / Y": 1 << 15,
+  };
 
   @override
   void initState() {
@@ -133,10 +154,12 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     if (!prefs.containsKey(defaultKey)) {
       print("[Init] Default layout not found. Creating it now...");
       await saveLayout(defaultKey, defaultLayout!);
+      setState(() {
+        currentLayout = defaultLayout;
+      });
+    } else {
+      await loadLayout(defaultKey);
     }
-    setState(() {
-      currentLayout = defaultLayout;
-    });
     // Listen to connection status
     bleManager.statusStream.listen((status) {
       String text = statusToString(status);
@@ -265,6 +288,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         }
 
         if (message.startsWith("LAYOUT:")) {
+          message = message.replaceFirst("LAYOUT:", "");
           handleFullJsonPayload(message);
         }
       
@@ -352,7 +376,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     // Logic to prevent the car/character from driving off forever
     if (!paused) {
       setState(() => paused = true);
-      bleManager.sendMessage("PAUSE");
+      bleManager.sendMessage("PAUSE", 
+        tiltTarget: currentLayout!.tiltTarget,
+        stepTarget: currentLayout!.stepTarget,
+        stepBitmask: currentLayout!.stepButtonBitmask
+      );
     }
   }
 
@@ -375,7 +403,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
 
     accelSubscription = accelerometerEventStream(samplingPeriod: SensorInterval.gameInterval)
       .listen((AccelerometerEvent event) {
-        if (paused) return;
+        if (paused || isSettingsOpen) return;
 
         // ── STEERING (landscape left/right tilt) ───────────────────────────────
         double roll = math.atan2(event.z, event.y);
@@ -390,9 +418,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         double steering = filteredSteering;
         if (steering.abs() < 0.08) steering = 0.0;
         // print("steering: ${steering.toStringAsFixed(3)}");
-        if ((steering - steeringValue).abs() > 0.01 && steeringEnabled) {
-          steeringValue = steering;
-          bleManager.updateSteering(steeringValue);
+        if (steeringEnabled) {
+          if ((steering - steeringValue).abs() > 0.01) {
+            steeringValue = steering;
+            bleManager.updateSteering(steeringValue, currentLayout!.tiltTarget);
+          }
         }
 
         // ── WALKING DETECTION ──────────────────────────────────────────────────
@@ -408,10 +438,17 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           });
         }
         if (steppingEnabled) {
-          if (isWalking) {
-            bleManager.updateStep(ControllerId.leftJoystick, -1.0);
-          } else {
-            bleManager.updateStep(ControllerId.leftJoystick, 0.0);
+          double stepValue = isWalking ? -1.0 : 0.0;
+  
+          // We check if the state actually changed to prevent spamming BLE
+          if (stepValue != lastSentStepValue) {
+            lastSentStepValue = stepValue;
+            
+            bleManager.updateStep(
+              stepValue, 
+              jid: currentLayout!.stepTarget, 
+              bitmask: currentLayout!.stepButtonBitmask
+            );
           }
         }
     });
@@ -441,7 +478,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
       print('Saving layout...');
       // Save to SharedPreferences
       await saveLayout(storageKey, layout);
-      loadLayout(storageKey);
+      await loadLayout(storageKey);
     } catch (e) {
       print("[UI] Failed to parse reassembled JSON: $e");
       ScaffoldMessenger.of(context).showSnackBar(
@@ -455,18 +492,18 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     prefs = await SharedPreferences.getInstance();   // ← initialize here
     // await prefs.clear();
     // final allKeys = prefs.getKeys();
-  // print("--- [DEBUG] SharedPreferences Content ---");
-  // if (allKeys.isEmpty) {
-  //   print("Storage is empty.");
-  // } else {
-  //   for (String key in allKeys) {
-  //     // Log the key and a preview of the value
-  //     final value = prefs.get(key).toString();
-  //     final preview = value.length > 50 ? "${value.substring(0, 50)}..." : value;
-  //     print("Key: [$key] | Value: $preview");
-  //   }
-  // }
-  // print("-----------------------------------------");
+    // print("--- [DEBUG] SharedPreferences Content ---");
+    // if (allKeys.isEmpty) {
+    //   print("Storage is empty.");
+    // } else {
+    //   for (String key in allKeys) {
+    //     // Log the key and a preview of the value
+    //     final value = prefs.get(key).toString();
+    //     final preview = value.length > 50 ? "${value.substring(0, 50)}..." : value;
+    //     print("Key: [$key] | Value: $preview");
+    //   }
+    // }
+    // print("-----------------------------------------");
     setState(() => isLoading = false);
   }
 
@@ -483,6 +520,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         // Use the fromJson factory we created earlier
         cachedLayout = ControllerLayout.fromJson(jsonDecode(jsonString));
         currentLayout = cachedLayout; // Set current layout to the loaded cached layout
+        currentStorageKey = storageKey;
         if (isEditing) {
           cloneLayout();
         }
@@ -490,6 +528,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         buildBackgroundColor(currentLayout!.backgroundColor);
         print("--------------------------------------------");
         print("[Storage] Local layout found for $storageKey, name: ${currentLayout!.layoutName}");
+        if (mounted) {
+          setState(() {});
+        }
         return true;
       } catch (e) {
         print("[Storage] Error loading saved layout: $e");
@@ -661,7 +702,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           GestureDetector(
             onTap: () async {
               setState(() => paused = !paused);
-              final sent = await bleManager.sendMessage(paused ? "PAUSE" : "RESUME");
+              final sent = await bleManager.sendMessage(paused ? "PAUSE" : "RESUME", 
+                tiltTarget: currentLayout!.tiltTarget,
+                stepTarget: currentLayout!.stepTarget,
+                stepBitmask: currentLayout!.stepButtonBitmask
+              );
               if (!sent) {
                 setState(() => paused = !paused);
               }
@@ -679,6 +724,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           const SizedBox(width: 4),
           GestureDetector(
             onTap: () {
+              setState(() => isSettingsOpen = true);
               showDialog(
                 context: context,
                 barrierColor: Colors.black54, // Darkens the background
@@ -692,6 +738,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                             // Set your desired width/height for the center box
                             width: MediaQuery.of(context).size.width * 0.4,
                             padding: const EdgeInsets.all(20),
+                            constraints: BoxConstraints(
+                              maxHeight: MediaQuery.of(context).size.height * 0.85,
+                            ),
                             decoration: BoxDecoration(
                               color: const Color(0xFF1A1A1A), // Dark charcoal
                               borderRadius: BorderRadius.circular(12),
@@ -700,47 +749,56 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                 BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
                               ],
                             ),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Text(
-                                  "SETTINGS",
-                                  style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
-                                ),
-                                const SizedBox(height: 20),
-                                // Button 1: Layout Customization
-                                _buildMenuButton(
-                                  const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                  "Customize Layout", 
-                                  () {
-                                    Navigator.pop(context);
-                                    toggleEditMode();
-                                }),
-                                const SizedBox(height: 10),
-                                _buildMenuButton(
-                                  const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                  steeringEnabled ? "Disable Tilt Steering" : "Enable Tilt Steering",
-                                  () {
-                                    setDialogState(() {
-                                      steeringEnabled = !steeringEnabled;
-                                    });
-                                }),
-                                const SizedBox(height: 10),
-                                _buildMenuButton(
-                                  const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                  steppingEnabled ? "Disable Step Detection" : "Enable Step Detection",
-                                  () {
-                                    setDialogState(() {
-                                      steppingEnabled = !steppingEnabled;
-                                    });
-                                }),
-                                const SizedBox(height: 10),
-                                // Close Button
-                                TextButton(
-                                  onPressed: () => Navigator.pop(context),
-                                  child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
-                                ),
-                              ],
+                            child: SingleChildScrollView(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Text(
+                                    "SETTINGS",
+                                    style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                                  ),
+                                  const SizedBox(height: 20),
+                                  _buildMenuButton(
+                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                    "Customize Layout", 
+                                    () {
+                                      Navigator.pop(context);
+                                      toggleEditMode();
+                                  }),
+                                  const SizedBox(height: 10),
+                                  _buildMenuButton(
+                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                    "Element Mapping Customization", 
+                                    () {
+                                      Navigator.pop(context);
+                                      mappingSetting();
+                                  }),
+                                  const SizedBox(height: 10),
+                                  _buildMenuButton(
+                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                    steeringEnabled ? "Disable Tilt Steering" : "Enable Tilt Steering",
+                                    () {
+                                      setDialogState(() {
+                                        steeringEnabled = !steeringEnabled;
+                                      });
+                                  }),
+                                  const SizedBox(height: 10),
+                                  _buildMenuButton(
+                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
+                                    steppingEnabled ? "Disable Step Detection" : "Enable Step Detection",
+                                    () {
+                                      setDialogState(() {
+                                        steppingEnabled = !steppingEnabled;
+                                      });
+                                  }),
+                                  const SizedBox(height: 10),
+                                  // Close Button
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context),
+                                    child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
@@ -748,7 +806,10 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                     },
                   );
                 },
-              );
+              ).then((_) {
+                // This runs when the dialog is closed
+                setState(() => isSettingsOpen = false);
+              });
             },
             child: Container(
               width: 36, height: 26,
@@ -1013,6 +1074,190 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  void mappingSetting() {
+    // Assuming these are your available bitmask/command options
+    final List<String> availableCommands = buttonBitmasks.keys.toList();
+    cloneLayout();
+
+    showDialog(
+      context: context,
+      barrierColor: Colors.black54,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return StatefulBuilder( // The 'setDialogState' is born here
+          builder: (context, setDialogState) {
+            return GestureDetector(
+              // This detects clicks on the semi-transparent barrier
+              onTap: () async {
+                bool canExit = await _handleUnsavedChanges();
+                if (canExit) Navigator.of(context).pop();
+              },
+              behavior: HitTestBehavior.opaque,
+              child: PopScope(
+                canPop: false, // Prevent back button from closing immediately
+                onPopInvokedWithResult: (didPop, result) async {
+                  if (didPop) return;
+                  bool canExit = await _handleUnsavedChanges();
+                  if (canExit) Navigator.of(context).pop();
+                },
+                child: GestureDetector(
+                  // This prevents clicks inside the dialog from triggering the "close" logic
+                  onTap: () {},
+                  child: Center(
+                    child: Material(
+                      color: Colors.transparent,
+                      child: Container(
+                        width: MediaQuery.of(context).size.width * 0.5, // Slightly wider for two columns
+                        // maxHeight: MediaQuery.of(context).size.height * 0.8,
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1A1A1A),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.white10),
+                          boxShadow: [
+                            BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
+                          ],
+                        ),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text(
+                                "ELEMENT MAPPING",
+                                style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                              ),
+                              const SizedBox(height: 20),
+                              // --- Section: Buttons ---
+                              _buildSectionHeader("BUTTONS"),
+                              ...editLayoutCopy!.elements.where((e) => e.type == ControllerElementType.button).map((btn) {
+                                String currentLabel = buttonBitmasks.entries
+                                  .firstWhere((entry) => entry.value == btn.buttonId, 
+                                    orElse: () => buttonBitmasks.entries.first).key;
+                                return _buildMappingRow(
+                                  btn.label, 
+                                  currentLabel, 
+                                  availableCommands,
+                                  (String newLabel) {
+                                    setDialogState(() {
+                                      btn.buttonId = buttonBitmasks[newLabel]!;
+                                    });
+                                  }
+                                );
+                              }),
+                              const SizedBox(height: 20),
+                              // --- Section: Tilt ---
+                              _buildSectionHeader("TILT"),
+                              _buildMappingRow(
+                                "Steering Target", 
+                                editLayoutCopy!.tiltTarget == ControllerId.leftJoystick ? "LEFT JOYSTICK" : "RIGHT JOYSTICK", 
+                                ["LEFT JOYSTICK", "RIGHT JOYSTICK"], 
+                                (String selected) {
+                                  setDialogState(() {
+                                    editLayoutCopy!.tiltTarget = (selected == "LEFT JOYSTICK") 
+                                        ? ControllerId.leftJoystick 
+                                        : ControllerId.rightJoystick;
+                                  });
+                                }
+                              ),
+                              const SizedBox(height: 20),
+                              // --- Section: Step ---
+                              _buildSectionHeader("STEP"),
+                              _buildMappingRow(
+                                "Step Output", 
+                                // Determine display label
+                                editLayoutCopy!.stepButtonBitmask != 0 
+                                    ? buttonBitmasks.entries.firstWhere((e) => e.value == editLayoutCopy!.stepButtonBitmask).key 
+                                    : (editLayoutCopy!.stepTarget == ControllerId.leftJoystick ? "LEFT JOYSTICK (LY)" : "RIGHT JOYSTICK (RY)"),
+                                ["LEFT JOYSTICK (LY)", "RIGHT JOYSTICK (RY)", ...availableCommands], 
+                                (String selected) {
+                                  setDialogState(() {
+                                    if (selected.contains("JOYSTICK")) {
+                                      editLayoutCopy!.stepButtonBitmask = 0;
+                                      editLayoutCopy!.stepTarget = (selected.contains("LEFT")) 
+                                          ? ControllerId.leftJoystick 
+                                          : ControllerId.rightJoystick;
+                                    } else {
+                                      editLayoutCopy!.stepButtonBitmask = buttonBitmasks[selected]!;
+                                    }
+                                  });
+                                }
+                              ),
+                              const SizedBox(height: 20),
+                              TextButton(
+                                onPressed: () async {
+                                  // Manual save trigger
+                                  await saveLayout(currentStorageKey!, editLayoutCopy!);
+                                  originalLayoutJson = jsonEncode(editLayoutCopy!.toJson());
+                                  setState(() => currentLayout = editLayoutCopy);
+                                  Navigator.pop(context);
+                                },
+                                child: const Text("SAVE & CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildSectionHeader(String title) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        children: [
+          Text(title, style: const TextStyle(color: Colors.blueAccent, fontSize: 12, fontWeight: FontWeight.bold)),
+          const SizedBox(width: 10),
+          const Expanded(child: Divider(color: Colors.white10, thickness: 1)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMappingRow(String label, String currentValue, List<String> options, Function(String) onChanged) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label.replaceAll('_', ' ').toUpperCase(), style: const TextStyle(color: Colors.white, fontSize: 14)),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: Colors.white10),
+            ),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: currentValue,
+                dropdownColor: const Color(0xFF2A2A2A),
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                icon: const Icon(Icons.arrow_drop_down, color: Colors.white54),
+                items: options.map((String value) {
+                  return DropdownMenuItem<String>(
+                    value: value,
+                    child: Text(value),
+                  );
+                }).toList(),
+                onChanged: (val) {
+                  if (val != null) onChanged(val);
+                },
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
