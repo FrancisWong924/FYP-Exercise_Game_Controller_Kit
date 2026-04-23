@@ -334,6 +334,21 @@ namespace BleServer
                             session.LastSeen = DateTime.Now;
                             Console.WriteLine($"[P{session.PlayerId}] COMMAND RECEIVED: {text}");
 
+                            if (IsVigemEnabled && session.Controller != null && (text == "PAUSE" || text == "RESUME"))
+                            {
+                                // Press the Menu/Start button
+                                session.Controller.SetButtonState(Xbox360Button.Start, true);
+                                session.Controller.SubmitReport();
+
+                                // Small delay or immediate release to simulate a physical click
+                                // If you don't release it, the game thinks you are holding Start down forever
+                                _ = Task.Run(async () => {
+                                    await Task.Delay(100); 
+                                    session.Controller.SetButtonState(Xbox360Button.Start, false);
+                                    session.Controller.SubmitReport();
+                                });
+                            }
+
                             // Include the PlayerId in the JSON so Cocos knows who sent it
                             var cmdObj = new { 
                                 type = "command", 
