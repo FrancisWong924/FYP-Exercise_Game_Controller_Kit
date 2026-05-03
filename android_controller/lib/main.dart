@@ -1,15 +1,20 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math'as math;
+import 'dart:io';
+import 'dart:math' as math;
 import 'bluetooth_connection.dart';
+import 'simulated_gpx_generator.dart';
 import 'models/controller_element.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:pedometer/pedometer.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -76,6 +81,14 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   ControllerElement? selectedElement;
   double lastSentStepValue = 0.0;
 
+  bool _gpxExerciseRecording = false;
+  StreamSubscription<StepCount>? _gpxPedometerSub;
+  int? _gpxStepBaseline;
+  int? _gpxLastPedometerSteps;
+  double? _gpxSessionStartLat;
+  double? _gpxSessionStartLon;
+  DateTime? _gpxRecordingStartedAtUtc;
+
   final Map<String, int> buttonBitmasks = {
     "UP": 1 << 0,
     "DOWN": 1 << 1,
@@ -111,6 +124,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     currentLayout = null;
     currentStorageKey = null;
     accelSubscription?.cancel();
+    _gpxPedometerSub?.cancel();
     stepTimer?.cancel();
     bleManager.stopInputSending();
     bleManager.dispose();
@@ -176,12 +190,12 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         _resetLoadingState();
         accelSubscription?.cancel();
         // Stop tilt steering
-        setState(() {
+        setState(() async {
           steeringValue = 0.0;
-          currentLayout = defaultLayout;
-          currentStorageKey = defaultKey;
           _processedBackground = null;
           backgroundColor = null;
+          currentStorageKey = defaultKey;
+          await loadLayout(defaultKey);
           final allKeys = prefs.getKeys();
           for (String key in allKeys) {
             final jsonString = prefs.getString(key);
@@ -454,6 +468,169 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     });
   }
 
+  Future<void> _onExerciseGpxMenuPressed() async {
+    if (_gpxExerciseRecording) {
+      await _stopExerciseGpxRecording();
+    } else {
+      await _startExerciseGpxRecording();
+    }
+  }
+
+  Future<void> _startExerciseGpxRecording() async {
+    Navigator.pop(context);
+    if (!mounted) return;
+
+    if (bleManager.pcDevice == null || !bleManager.pcDevice!.isConnected) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Not connected to the PC server. Please connect to the PC server, then start exercise GPX again.'),
+        ),
+      );
+      return;
+    }
+
+    if (Platform.isAndroid) {
+      final ar = await Permission.activityRecognition.request();
+      if (!ar.isGranted) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Physical activity permission is required for step counting.')),
+        );
+        return;
+      }
+    } else if (Platform.isIOS) {
+      final s = await Permission.sensors.request();
+      if (!s.isGranted) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Motion permission is required for step counting.')),
+        );
+        return;
+      }
+    }
+
+    var locPerm = await Geolocator.checkPermission();
+    if (locPerm == LocationPermission.denied) {
+      locPerm = await Geolocator.requestPermission();
+    }
+    if (locPerm == LocationPermission.denied || locPerm == LocationPermission.deniedForever) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Location permission is required for the GPX start point.')),
+      );
+      return;
+    }
+
+    late Position pos;
+    try {
+      pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+      ).timeout(const Duration(seconds: 25));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not get GPS fix: $e')),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+
+    late StepCount firstStep;
+    try {
+      firstStep = await Pedometer.stepCountStream.first.timeout(const Duration(seconds: 12));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Step counter unavailable: $e')),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+
+    await _gpxPedometerSub?.cancel();
+    _gpxStepBaseline = firstStep.steps;
+    _gpxLastPedometerSteps = firstStep.steps;
+    _gpxSessionStartLat = pos.latitude;
+    _gpxSessionStartLon = pos.longitude;
+    _gpxRecordingStartedAtUtc = DateTime.now().toUtc();
+    _gpxExerciseRecording = true;
+    _gpxPedometerSub = Pedometer.stepCountStream.listen((StepCount e) {
+      if (!_gpxExerciseRecording) return;
+      _gpxLastPedometerSteps = e.steps;
+    });
+
+    setState(() {});
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Exercise GPX recording started. Open settings and tap the same item when finished.'),
+        duration: Duration(seconds: 4),
+      ),
+    );
+  }
+
+  Future<void> _stopExerciseGpxRecording() async {
+    Navigator.pop(context);
+    if (!mounted) return;
+
+    await _gpxPedometerSub?.cancel();
+    _gpxPedometerSub = null;
+
+    final baseline = _gpxStepBaseline;
+    final startLat = _gpxSessionStartLat ?? SimulatedGpxGenerator.defaultLat;
+    final startLon = _gpxSessionStartLon ?? SimulatedGpxGenerator.defaultLon;
+    final recordingEndUtc = DateTime.now().toUtc();
+    final recordingStartUtc = _gpxRecordingStartedAtUtc ?? recordingEndUtc;
+    int steps = 0;
+    if (baseline != null && _gpxLastPedometerSteps != null) {
+      steps = (_gpxLastPedometerSteps! - baseline).clamp(0, 0x7fffffff);
+    }
+
+    _gpxExerciseRecording = false;
+    _gpxStepBaseline = null;
+    _gpxLastPedometerSteps = null;
+    _gpxSessionStartLat = null;
+    _gpxSessionStartLon = null;
+    _gpxRecordingStartedAtUtc = null;
+    setState(() {});
+
+    if (!mounted) return;
+
+    try {
+      final xml = SimulatedGpxGenerator.buildXml(
+        recordingStartUtc: recordingStartUtc,
+        recordingEndUtc: recordingEndUtc,
+        hardwareStepCount: steps,
+        startLat: startLat,
+        startLon: startLon,
+      );
+      var pcOk = false;
+      if (bleManager.pcDevice != null && bleManager.pcDevice!.isConnected) {
+        pcOk = await bleManager.sendGpxExportToPc(xml);
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            pcOk
+                ? 'Exercise GPX sent to PC.'
+                : 'Could not send GPX to PC (connection lost or send failed).',
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Exercise GPX failed: $e')),
+      );
+    }
+  }
+
   // NEW: Vibration function
   Future<void> triggerVibration() async {
     // Check if device supports vibration
@@ -701,6 +878,22 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         children: [
           GestureDetector(
             onTap: () async {
+              await bleManager.sendMessage("SCREENSHOT");
+              HapticFeedback.mediumImpact();
+            },
+            child: Container(
+              width: 36, height: 26,
+              decoration: const BoxDecoration(
+                color: Colors.white24,
+                shape: BoxShape.rectangle,
+                borderRadius: BorderRadius.all(Radius.circular(4)),
+              ),
+              child: const Icon(Icons.crop_free, color: Colors.white, size: 18),
+            ),
+          ),
+          const SizedBox(width: 4),
+          GestureDetector(
+            onTap: () async {
               setState(() => paused = !paused);
               final sent = await bleManager.sendMessage(paused ? "PAUSE" : "RESUME", 
                 tiltTarget: currentLayout!.tiltTarget,
@@ -736,7 +929,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                           color: Colors.transparent,
                           child: Container(
                             // Set your desired width/height for the center box
-                            width: MediaQuery.of(context).size.width * 0.4,
+                            width: MediaQuery.of(context).size.width * 0.45,
                             padding: const EdgeInsets.all(20),
                             constraints: BoxConstraints(
                               maxHeight: MediaQuery.of(context).size.height * 0.85,
@@ -780,6 +973,10 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                     () {
                                       setDialogState(() {
                                         steeringEnabled = !steeringEnabled;
+                                        if (!steeringEnabled) {
+                                          // Force immediate reset so we don't wait for the sensor loop
+                                          bleManager.updateSteering(0.0, currentLayout!.tiltTarget);
+                                        }
                                       });
                                   }),
                                   const SizedBox(height: 10),
@@ -789,8 +986,28 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                     () {
                                       setDialogState(() {
                                         steppingEnabled = !steppingEnabled;
+                                        if (!steppingEnabled) {
+                                          // Force immediate reset so we don't wait for the sensor loop
+                                          bleManager.updateStep(
+                                            0.0, 
+                                            jid: currentLayout!.stepTarget, 
+                                            bitmask: currentLayout!.stepButtonBitmask
+                                          );
+                                        }
                                       });
                                   }),
+                                  const SizedBox(height: 10),
+                                  _buildMenuButton(
+                                    Icon(
+                                      _gpxExerciseRecording ? Icons.stop_circle_outlined : Icons.fiber_manual_record,
+                                      color: _gpxExerciseRecording ? Colors.redAccent : Colors.white54,
+                                      size: 20,
+                                    ),
+                                    _gpxExerciseRecording ? 'Stop exercise GPX' : 'Start exercise GPX recording',
+                                    () async {
+                                      await _onExerciseGpxMenuPressed();
+                                    },
+                                  ),
                                   const SizedBox(height: 10),
                                   // Close Button
                                   TextButton(

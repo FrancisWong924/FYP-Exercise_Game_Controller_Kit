@@ -7,13 +7,18 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Threading;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Timers;
 using System.Windows;
+using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.Net;
 using System.Net.Sockets;
@@ -26,6 +31,16 @@ using Nefarius.ViGEm.Client.Targets.Xbox360;
 
 namespace BleServer
 {
+    static class ProgramDiagnostics
+    {
+        /// <summary>Writes to <see cref="Console"/> (Tee → UI when alive) and <see cref="Trace"/> (not stripped in Release, unlike Debug).</summary>
+        internal static void LogDiag(string message)
+        {
+            try { Console.WriteLine(message); } catch { /* stdout closed */ }
+            try { Trace.WriteLine(message); } catch { }
+        }
+    }
+
     public class InputState
     {
         public string Type { get; set; } = "input";
@@ -56,6 +71,8 @@ namespace BleServer
 
         // --- Session Management ---
         public static ConcurrentDictionary<int, PlayerSession> ConnectedPlayers = new ConcurrentDictionary<int, PlayerSession>();
+        /// <summary>Phone → PC GPX export: UTF-8 chunks reassembled per BLE device id.</summary>
+        private static readonly ConcurrentDictionary<string, StringBuilder> _phoneGpxBuffers = new();
         private static ConcurrentDictionary<string, int> _playerIdHistory = new ConcurrentDictionary<string, int>();
         private static int _nextPlayerId = 0;
 
@@ -75,22 +92,123 @@ namespace BleServer
 
         private static int _shutdownDone;
 
+        /// <summary>
+        /// Set when the main window is closing (or <see cref="PerformServerShutdown"/> runs) before the GATT stack is fully gone.
+        /// PING still ACKs the write, but we skip sending PONG over notify so the phone does not treat the server as alive during teardown.
+        /// </summary>
+        static int _bleUiTeardownRequested;
+
+        /// <summary>Wall-clock from UI close to end of <see cref="PerformServerShutdown"/> (for diagnosing “ghost” perception).</summary>
+        static Stopwatch? _uiCloseToCleanupDoneSw;
+
+        /// <summary>Call from <see cref="MainWindow"/> as soon as the UI begins closing (before <see cref="App.OnExit"/>).</summary>
+        public static void SignalBleUiClosing()
+        {
+            Volatile.Write(ref _bleUiTeardownRequested, 1);
+            _uiCloseToCleanupDoneSw = Stopwatch.StartNew();
+        }
+
+        /// <summary>
+        /// Ensures no other <see cref="Process.ProcessName"/> copy is alive so Windows releases BLE + WebSocket port.
+        /// Previous 1s wait + single kill round was too weak after heavier server shutdown paths.
+        /// </summary>
+        static async Task EnsureExclusiveBleServerProcessAsync()
+        {
+            var swAll = Stopwatch.StartNew();
+            var current = Process.GetCurrentProcess();
+            var processName = current.ProcessName;
+            var killedAny = false;
+
+            for (var round = 0; round < 12; round++)
+            {
+                var others = Process.GetProcessesByName(processName)
+                    .Where(p => p.Id != current.Id)
+                    .ToList();
+                if (others.Count == 0)
+                    break;
+
+                killedAny = true;
+                Console.WriteLine($"[SERVER] Exclusive mode: round {round + 1} — terminating {others.Count} other '{processName}' instance(s).");
+                foreach (var p in others)
+                {
+                    try
+                    {
+                        try
+                        {
+                            p.Kill(entireProcessTree: true);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            try { p.Kill(); } catch { /* already exiting */ }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[SERVER] Kill PID {p.Id}: {ex.Message}");
+                    }
+                }
+
+                foreach (var p in others)
+                {
+                    try
+                    {
+                        if (!p.WaitForExit(20000))
+                            Console.WriteLine($"[SERVER] Warning: PID {p.Id} did not exit within 20s.");
+                    }
+                    catch { /* process object may be stale */ }
+                    finally
+                    {
+                        try { p.Dispose(); } catch { }
+                    }
+                }
+
+                await Task.Delay(600);
+                if (Process.GetProcessesByName(processName).All(p => p.Id == current.Id))
+                    break;
+            }
+
+            var survivors = Process.GetProcessesByName(processName).Count(p => p.Id != current.Id);
+            if (survivors > 0)
+                Console.WriteLine($"[SERVER] Warning: {survivors} '{processName}' process(es) still running; BLE may be unstable.");
+
+            if (killedAny)
+            {
+                await Task.Delay(1800);
+                Console.WriteLine("[SERVER] Post-kill settle delay complete — continuing startup.");
+            }
+
+            ProgramDiagnostics.LogDiag($"[SERVER][Timing] EnsureExclusiveBleServerProcessAsync total: {swAll.ElapsedMilliseconds} ms (killedAny={killedAny})");
+        }
+
         /// <summary>Stops BLE, WebSocket, and ViGEm without terminating the process. Safe to call multiple times.</summary>
         public static void PerformServerShutdown()
         {
             if (Interlocked.Exchange(ref _shutdownDone, 1) == 1) return;
 
+            var sw = Stopwatch.StartNew();
+            ProgramDiagnostics.LogDiag($"[BLE][Timing] PerformServerShutdown started");
+
+            Volatile.Write(ref _bleUiTeardownRequested, 1);
             disconnectTimer?.Stop();
             try {
+                long t = sw.ElapsedMilliseconds;
                 foreach(var player in ConnectedPlayers.Values) {
                     try { player.Controller?.Disconnect(); } catch { }
                 }
+                ProgramDiagnostics.LogDiag($"[BLE][Timing]   ViGEm per-controller Disconnect: {sw.ElapsedMilliseconds - t} ms");
+
+                t = sw.ElapsedMilliseconds;
                 vigemClient?.Dispose();
                 vigemClient = null;
+                ProgramDiagnostics.LogDiag($"[BLE][Timing]   ViGEmClient.Dispose: {sw.ElapsedMilliseconds - t} ms");
 
                 if (provider != null) {
                     Console.WriteLine("[BLE] Stopping Advertisement...");
+                    t = sw.ElapsedMilliseconds;
                     provider.StopAdvertising();
+                    ProgramDiagnostics.LogDiag($"[BLE][Timing]   Gatt StopAdvertising: {sw.ElapsedMilliseconds - t} ms");
+
+                    t = sw.ElapsedMilliseconds;
                     if (notifyChar != null) {
                         notifyChar.SubscribedClientsChanged -= OnSubscribedClientsChanged;
                     }
@@ -98,18 +216,32 @@ namespace BleServer
                     notifyChar = null;
                     ConnectedPlayers.Clear();
                     _playerIdHistory.Clear();
+                    ProgramDiagnostics.LogDiag($"[BLE][Timing]   Unhook notify + null provider + clear players: {sw.ElapsedMilliseconds - t} ms");
                 }
                 
+                t = sw.ElapsedMilliseconds;
                 lock (_wsLock)
                 {
                     foreach (var ws in wsSessions.ToList()) { try { ws.Close(); } catch { } }
                     wsSessions.Clear();
                 }
+                ProgramDiagnostics.LogDiag($"[BLE][Timing]   WebSocket session Close loop: {sw.ElapsedMilliseconds - t} ms");
+
+                t = sw.ElapsedMilliseconds;
                 wsServer?.Stop();
                 wsServer = null;
+                ProgramDiagnostics.LogDiag($"[BLE][Timing]   WebSocketServer.Stop: {sw.ElapsedMilliseconds - t} ms");
+
+                if (_uiCloseToCleanupDoneSw is { } uiSw)
+                {
+                    ProgramDiagnostics.LogDiag($"[BLE][Timing]   Wall MainWindow.OnClosing -> end of synchronous cleanup: {uiSw.ElapsedMilliseconds} ms");
+                    _uiCloseToCleanupDoneSw = null;
+                }
+
+                ProgramDiagnostics.LogDiag($"[BLE][Timing] PerformServerShutdown TOTAL (sync part): {sw.ElapsedMilliseconds} ms");
                 Console.WriteLine("[BLE] Cleanup complete.");
             } catch (Exception ex) {
-                Console.WriteLine($"[BLE] Error: {ex.Message}");
+                ProgramDiagnostics.LogDiag($"[BLE] Error after {sw.ElapsedMilliseconds} ms: {ex.Message}");
             }
         }
 
@@ -129,21 +261,9 @@ namespace BleServer
         {
             try
             {
-            // KILL OLD GHOSTS
-            var current = Process.GetCurrentProcess();
-            var duplicates = Process.GetProcessesByName(current.ProcessName)
-                                .Where(p => p.Id != current.Id);
-            if (duplicates.Any()) {
-                Console.WriteLine($"[SERVER] Found {duplicates.Count()} other '{current.ProcessName}' process(es); stopping them so this instance owns BLE/WebSocket (game WS will drop until this server is ready).");
-                foreach (var duplicate in duplicates) {
-                    try { 
-                        duplicate.Kill(); 
-                        duplicate.WaitForExit(1000); // Wait up to 1s for it to actually die
-                    } catch { }
-                }
-                // Small sleep to let the OS cleanup the WebSocket port
-                await Task.Delay(1000);
-            }
+            Volatile.Write(ref _bleUiTeardownRequested, 0);
+            _uiCloseToCleanupDoneSw = null;
+            await EnsureExclusiveBleServerProcessAsync();
 
             // SIGNAL HANDLER: Catches the CTRL_BREAK signal from C++ closeServer()
             Console.CancelKeyPress += (s, e) => {
@@ -188,14 +308,25 @@ namespace BleServer
                 Console.WriteLine($"[!] ViGEmBus Error: {ex.Message}. Make sure drivers are installed.");
             }
 
-            // 1. Create GATT Service
-            var createResult = await GattServiceProvider.CreateAsync(serviceUuid);
-            if (createResult.ServiceProvider is null)
+            // 1. Create GATT Service (retry: null provider is common if the previous process just released the radio)
+            GattServiceProvider? newProvider = null;
+            for (var attempt = 1; attempt <= 10; attempt++)
             {
-                Console.WriteLine("Failed to create service (null provider). Check Bluetooth permissions and run as Admin.");
+                var createResult = await GattServiceProvider.CreateAsync(serviceUuid);
+                if (createResult.ServiceProvider is not null)
+                {
+                    newProvider = createResult.ServiceProvider;
+                    break;
+                }
+                Console.WriteLine($"[BLE] GattServiceProvider.CreateAsync returned null (attempt {attempt}/10). Waiting for stack…");
+                await Task.Delay(2500);
+            }
+            if (newProvider is null)
+            {
+                Console.WriteLine("Failed to create GATT service after retries. Check Bluetooth, admin rights, and stray Server.Ble processes.");
                 return;
             }
-            provider = createResult.ServiceProvider;
+            provider = newProvider;
 
             // 2. Notify characteristic
             var notifyResult = await provider.Service.CreateCharacteristicAsync(notifyUuid, 
@@ -221,7 +352,13 @@ namespace BleServer
                     string deviceId = args.Session.DeviceId.Id;
                     var session = ConnectedPlayers.Values.FirstOrDefault(p => p.DeviceId == deviceId);
                     if (session == null) return; // Ignore input from untracked devices
-                    
+
+                    if (!IsDeviceIdPresentOnNotifySubscriptions(deviceId))
+                    {
+                        RemovePlayerIfDeviceIdPresent(deviceId);
+                        return;
+                    }
+
                     var request = await args.GetRequestAsync();
                     if (request.Value == null) return;
 
@@ -247,9 +384,11 @@ namespace BleServer
 
                         // Broadcast the specific player's data
                         _ = BroadcastInputAsync(state);
-                        
-                        // Optional: Console log with Player ID
-                        Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X} LX: {state.JoyLX:F2} LY: {state.JoyLY:F2} RX: {state.JoyRX:F2} RY: {state.JoyRY:F2}");
+
+                        // Only log when ViGEm owns input; when a WS game is connected, IsVigemEnabled is false
+                        // but the phone still sends BLE → JSON, so logging here looked like a ghost controller.
+                        if (IsVigemEnabled)
+                            Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X} LX: {state.JoyLX:F2} LY: {state.JoyLY:F2} RX: {state.JoyRX:F2} RY: {state.JoyRY:F2}");
                     }
                 }
                 catch (Exception ex)
@@ -314,16 +453,109 @@ namespace BleServer
                         }
                     }
 
+                    // GPX export from phone (chunked UTF-8, base64 per line)
+                    if (text == "GPX_EXPORT_START")
+                    {
+                        _phoneGpxBuffers[deviceId] = new StringBuilder();
+                        if (session != null) session.LastSeen = DateTime.Now;
+                        request.Respond();
+                        return;
+                    }
+                    if (text.StartsWith("GPX_CHUNK:", StringComparison.Ordinal))
+                    {
+                        try
+                        {
+                            var b64 = text["GPX_CHUNK:".Length..];
+                            var chunkBytes = Convert.FromBase64String(b64);
+                            var chunk = Encoding.UTF8.GetString(chunkBytes);
+                            _phoneGpxBuffers.AddOrUpdate(
+                                deviceId,
+                                _ => new StringBuilder(chunk),
+                                (_, sb) =>
+                                {
+                                    sb.Append(chunk);
+                                    return sb;
+                                });
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[GPX] Chunk decode error: {ex.Message}");
+                        }
+                        if (session != null) session.LastSeen = DateTime.Now;
+                        request.Respond();
+                        return;
+                    }
+                    if (text == "GPX_EXPORT_END")
+                    {
+                        if (_phoneGpxBuffers.TryRemove(deviceId, out var sb))
+                        {
+                            try
+                            {
+                                var dir = Path.Combine(
+                                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                                    "ControllerExerciseGpx");
+                                Directory.CreateDirectory(dir);
+                                var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                                var pid = session?.PlayerId.ToString() ?? "unknown";
+                                var path = Path.Combine(dir, $"exercise_{stamp}_player{pid}.gpx");
+                                await File.WriteAllTextAsync(path, sb.ToString());
+                                Console.WriteLine($"[GPX] Saved from phone: {path} ({sb.Length} chars)");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[GPX] Save failed: {ex.Message}");
+                            }
+                        }
+                        if (session != null) session.LastSeen = DateTime.Now;
+                        request.Respond();
+                        return;
+                    }
+                    [DllImport("user32.dll")]
+                    static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+
+                    const byte VK_LWIN = 0x5B;
+                    const byte VK_SNAPSHOT = 0x2C;
+                    const uint KEYEVENTF_KEYUP = 0x02;
+                    if (text == "SCREENSHOT")
+                    {
+                        _ = Task.Run(() => 
+                        {
+                            // 1. Press Windows Key
+                            keybd_event(VK_LWIN, 0, 0, 0); 
+                            // 2. Press PrintScreen
+                            keybd_event(VK_SNAPSHOT, 0, 0, 0); 
+                            
+                            // 3. Release PrintScreen
+                            keybd_event(VK_SNAPSHOT, 0, KEYEVENTF_KEYUP, 0); 
+                            // 4. Release Windows Key
+                            keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+
+                            Console.WriteLine("[SERVER] Fullscreen capture saved to Pictures/Screenshots");
+                        });
+                        
+                        request.Respond();
+                    }
+
                     // Handle Heartbeat (PING)
                     if (text == "PING") 
                     {
                         if (session != null) 
                         {
-                            // Update the timestamp (Heartbeat)
                             session.LastSeen = DateTime.Now;
-                            await session.SendMessageViaBle("PONG", notifyChar);   
-                            request.Respond(); 
-                            Console.WriteLine($"[P{session.PlayerId}] PING → PONG");
+                            if (Volatile.Read(ref _bleUiTeardownRequested) == 0)
+                            {
+                                await session.SendMessageViaBle("PONG", notifyChar);
+                                // Console.WriteLine($"[P{session.PlayerId}] PING → PONG");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[P{session.PlayerId}] PING → ACK only (UI / server teardown — no PONG)");
+                            }
+                            request.Respond();
+                        }
+                        else
+                        {
+                            request.Respond();
                         }
                     }
                     // 3. Handle Commands (PAUSE, RESUME, NEED_LAYOUT)
@@ -453,7 +685,13 @@ namespace BleServer
             //     }
             // });
 
-            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            // Wait for shutdown without throwing (Task.Delay+cancel raises TaskCanceledException and clutters first-chance debugging).
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                var shutdownWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using (cancellationToken.Register(() => shutdownWait.TrySetResult()))
+                    await shutdownWait.Task.ConfigureAwait(false);
+            }
             }
             catch (OperationCanceledException)
             {
@@ -461,9 +699,37 @@ namespace BleServer
             }
             finally
             {
+                var swFinally = Stopwatch.StartNew();
                 Console.WriteLine("Server stopped.");
                 PerformServerShutdown();
                 Interlocked.Exchange(ref _shutdownDone, 0);
+                ProgramDiagnostics.LogDiag($"[BLE][Timing] RunServerAsync finally (after PerformServerShutdown): {swFinally.ElapsedMilliseconds} ms");
+            }
+        }
+
+        /// <summary>
+        /// INPUT writes must match an active notify (CCCD) subscriber. Otherwise we can keep a
+        /// <see cref="PlayerSession"/> while the central dropped notify, or show INPUT logs after the
+        /// user considers the link dead — <see cref="GattSubscribedClient"/> reference equality in
+        /// stale checks is not always reliable across callbacks.
+        /// </summary>
+        private static bool IsDeviceIdPresentOnNotifySubscriptions(string deviceId)
+        {
+            if (notifyChar is null || string.IsNullOrEmpty(deviceId)) return false;
+            foreach (var sub in notifyChar.SubscribedClients)
+            {
+                if (sub.Session.DeviceId.Id == deviceId) return true;
+            }
+            return false;
+        }
+
+        private static void RemovePlayerIfDeviceIdPresent(string deviceId)
+        {
+            foreach (var kvp in ConnectedPlayers)
+            {
+                if (kvp.Value.DeviceId != deviceId) continue;
+                RemovePlayer(kvp.Key);
+                return;
             }
         }
 
@@ -566,7 +832,7 @@ namespace BleServer
                 session.Controller?.Disconnect();
                 Console.WriteLine($"[ViGEm] Player {playerId} virtual controller removed.");
 
-                Console.WriteLine($"[TIMEOUT] Player {playerId} (Device: {session.DeviceId}) timed out.");
+                Console.WriteLine($"[BLE] Player {playerId} removed (Device: {session.DeviceId}).");
                 SendStatusToWSClients("DISCONNECTED", playerId);
                 // Check if this was the last person
                 if (ConnectedPlayers.IsEmpty)
@@ -867,7 +1133,7 @@ namespace BleServer
                 writer.WriteString(message + "\n");
                 // Use the specific client stored in this session
                 await notifyChar.NotifyValueAsync(writer.DetachBuffer(), Client);
-                Console.WriteLine($"[PC] → Sent to Player {PlayerId}: {message}");
+                // Console.WriteLine($"[PC] → Sent to Player {PlayerId}: {message}");
             }
             catch (Exception ex)
             {

@@ -27,6 +27,7 @@ class BleManager {
   BluetoothCharacteristic? inputCharacteristic;  // For fast input (WithoutResponse)
 
   bool _isConnecting = false;
+  bool _reconnectBusy = false;
   Timer? _heartbeatTimer;
   Timer? _disconnectWatcher;
   Timer? _inputTimer;
@@ -57,7 +58,7 @@ class BleManager {
     _heartbeatTimer?.cancel();
     _lastPongTime = DateTime.now();
 
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (pingCharacteristic != null) {
         sendPing();  // silent ping
       }
@@ -71,11 +72,12 @@ class BleManager {
 
   void _startDisconnectWatcher() {
     _disconnectWatcher?.cancel();
-    _disconnectWatcher = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (DateTime.now().difference(_lastPongTime) > const Duration(seconds: 3)) {
+    _disconnectWatcher = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (DateTime.now().difference(_lastPongTime) > const Duration(milliseconds: 2500)) {
         print("[BLE] HEARTBEAT TIMEOUT - PC is gone!");
         _stopHeartbeat();
         _disconnectWatcher?.cancel();
+        _statusController.add(BleConnectionStatus.disconnected);
         pcDevice?.disconnect();  // Force disconnect → triggers connectionState listener
       }
     });
@@ -229,31 +231,47 @@ class BleManager {
     }
   }
 
-  void _handleCleanupAndReconnect() async {
-    stopInputSending();
-    _stopHeartbeat();
-    _disconnectWatcher?.cancel();
-    
-    pcDevice = null;
-    pingCharacteristic = null;
-    inputCharacteristic = null;
-    
-    _isConnecting = false;
-    _statusController.add(BleConnectionStatus.failed);
-    await Future.delayed(const Duration(seconds: 5)); // Increased delay for Windows release
-    if (!_statusController.isClosed) {
-      print("[BLE] Attempting to reconnect...");
-      startScanningAndConnect();
+  Future<void> _handleCleanupAndReconnect() async {
+    if (_reconnectBusy) return;
+    _reconnectBusy = true;
+    try {
+      stopInputSending();
+      _stopHeartbeat();
+      _disconnectWatcher?.cancel();
+
+      pcDevice = null;
+      pingCharacteristic = null;
+      inputCharacteristic = null;
+
+      _isConnecting = false;
+      _statusController.add(BleConnectionStatus.failed);
+      // Short backoff: Windows server kills duplicate processes + retries GATT; long phone waits hurt UX.
+      await Future.delayed(const Duration(milliseconds: 900));
+      if (!_statusController.isClosed) {
+        print("[BLE] Attempting to reconnect...");
+        startScanningAndConnect();
+      }
+    } finally {
+      _reconnectBusy = false;
     }
   }
 
   Future<void> sendPing() async {
     try {
       final bytes = utf8.encode("PING\n");
-      print("[BLE] → Sending PING (${bytes.length} bytes)");
+      // print("[BLE] → Sending PING (${bytes.length} bytes)");
       await pingCharacteristic!.write(bytes, withoutResponse: false); // ← MUST be false!
     } catch (e) {
-      print("[BLE] PING send failed: $e");
+      print("[BLE] PING send failed: $e — forcing disconnect");
+      _stopHeartbeat();
+      _disconnectWatcher?.cancel();
+      try {
+        final d = pcDevice;
+        if (d != null) await d.disconnect();
+      } catch (e2) {
+        print("[BLE] disconnect after ping failure: $e2");
+        await _handleCleanupAndReconnect();
+      }
     }
   }
 
@@ -279,6 +297,30 @@ class BleManager {
       return true;
     } catch (e) {
       print("[BLE] Failed to send $command: $e");
+      return false;
+    }
+  }
+
+  /// Sends full GPX XML to the PC server (chunked base64 on the reliable ping characteristic).
+  Future<bool> sendGpxExportToPc(String gpxXml) async {
+    if (pingCharacteristic == null) {
+      print('[BLE] Cannot send GPX — ping characteristic not available');
+      return false;
+    }
+    try {
+      if (!await sendMessage('GPX_EXPORT_START')) return false;
+      final bytes = utf8.encode(gpxXml);
+      const rawChunk = 240;
+      for (var i = 0; i < bytes.length; i += rawChunk) {
+        final end = i + rawChunk > bytes.length ? bytes.length : i + rawChunk;
+        final slice = bytes.sublist(i, end);
+        final line = 'GPX_CHUNK:${base64Encode(slice)}';
+        if (!await sendMessage(line)) return false;
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+      }
+      return await sendMessage('GPX_EXPORT_END');
+    } catch (e) {
+      print('[BLE] GPX export to PC failed: $e');
       return false;
     }
   }
@@ -355,8 +397,6 @@ class BleManager {
     // Bytes 14–15: NEW Step Variable
     // bd.setInt16(14, (currentStep * 32767).round(), Endian.little);
 
-    // print("→ Joy L:${currentJoy.joyLX.toStringAsFixed(2)},${currentJoy.joyLY.toStringAsFixed(2)} R:${currentJoy.joyRX.toStringAsFixed(2)},${currentJoy.joyRY.toStringAsFixed(2)}");
-    // print("→ Steering: ${currentSteering.toStringAsFixed(3)}");
     bool isNeutral = currentButtons == 0 &&
       currentJoy.joyLX.abs() < 0.001 &&
       currentJoy.joyLY.abs() < 0.001 &&
@@ -374,14 +414,21 @@ class BleManager {
     _lastSentPacket = Uint8List.fromList(packet);
     try {
       if (pcDevice!.isConnected) {
+        print("→ Button: ${currentButtons.toString()} LX:${currentJoy.joyLX.toStringAsFixed(2)} LY:${currentJoy.joyLY.toStringAsFixed(2)} RX:${currentJoy.joyRX.toStringAsFixed(2)} RY:${currentJoy.joyRY.toStringAsFixed(2)}");
         // Fast path: no response
         inputCharacteristic!.write(packet, withoutResponse: true);
       }
     } catch (e) {
       // If a write fails, the link is dead. Kill the loop immediately.
       print("[BLE] Write Error: $e");
-      stopInputSending(); 
+      stopInputSending();
       _stopHeartbeat();
+      _disconnectWatcher?.cancel();
+      try {
+        if (pcDevice != null) await pcDevice!.disconnect();
+      } catch (_) {
+        await _handleCleanupAndReconnect();
+      }
     }
   }
 
