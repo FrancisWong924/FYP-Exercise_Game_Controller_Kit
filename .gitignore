@@ -12,3 +12,8 @@ obj/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Android build artifacts
+**/build/
+**/reports/
+*.html
