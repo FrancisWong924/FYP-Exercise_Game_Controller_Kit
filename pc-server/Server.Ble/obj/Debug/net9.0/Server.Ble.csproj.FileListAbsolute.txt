@@ -1,4 +1,0 @@
-C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0\Server.Ble.GeneratedMSBuildEditorConfig.editorconfig
-C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0\Server.Ble.AssemblyInfoInputs.cache
-C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0\Server.Ble.AssemblyInfo.cs
-C:\Users\Acer\Desktop\FYP-Exercise_Game_Controller_Kit\pc-server\Server.Ble\obj\Debug\net9.0\Server.Ble.csproj.CoreCompileInputs.cache
