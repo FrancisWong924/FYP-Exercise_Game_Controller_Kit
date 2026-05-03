@@ -4,10 +4,15 @@
 
 # Dependencies
 node_modules/
-bin/
-obj/
+
+# Ignore all build output folders recursively
+**/bin/
+**/obj/
+
+# Ignore specific executable types
 *.exe
 *.dll
+*.pdb
 
 # OS generated files
 .DS_Store
