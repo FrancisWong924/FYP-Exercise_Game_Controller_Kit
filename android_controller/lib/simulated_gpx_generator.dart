@@ -2,8 +2,8 @@ import 'dart:math' as math;
 
 import 'package:gpx/gpx.dart';
 
-/// Synthetic GPX trail matching the Python `randomTrail` / argparse script logic
-/// (Haversine distance, random walk in small steps, time stepped backward from [endTimeUtc]).
+/// Synthetic GPX trail: Haversine random walk in small steps; timestamps run **forward**
+/// from [recordingStartUtc] to [recordingEndUtc] so the first track point matches the chosen start.
 ///
 /// Geometry is still a synthetic random walk from [startLat]/[startLon]; total length and
 /// point timestamps follow session step count and recording start/end time.
@@ -80,7 +80,7 @@ class SimulatedGpxGenerator {
           'No steps recorded; track is stationary from session start to end. '
           'Session ${durationSeconds.toStringAsFixed(1)} s. ';
     } else {
-      var currentTime = endUtc;
+      var currentTime = startUtc;
       final speed = durationSeconds / (totalDistanceKm / distBetweenPoints);
 
       final lat = <double>[startLat, 0.0];
@@ -88,7 +88,7 @@ class SimulatedGpxGenerator {
 
       var distance = 0.0;
       var i = 1;
-      var angle = 0.0;
+      var angle = rnd.nextDouble() * 2 * math.pi;
 
       final inserted = <_SimPoint>[];
 
@@ -102,14 +102,17 @@ class SimulatedGpxGenerator {
           lat[(i + 1) % 2],
         );
         i++;
-        currentTime = currentTime.subtract(
+        currentTime = currentTime.add(
           Duration(microseconds: (speed * 1e6).round()),
         );
         inserted.add(_SimPoint(lat[i % 2], lon[i % 2], currentTime));
         angle += rnd.nextDouble() * _angleVariability - _angleVariability / 2.0;
       }
 
-      inserted.sort((a, b) => a.time.compareTo(b.time));
+      if (inserted.isNotEmpty) {
+        final last = inserted.removeLast();
+        inserted.add(_SimPoint(last.lat, last.lon, endUtc));
+      }
       reportedPathKm = distance;
       descExtra =
           'Synthetic path length matches step-based estimate (~${totalDistanceKm.toStringAsFixed(3)} km). '
@@ -147,7 +150,26 @@ class SimulatedGpxGenerator {
       ),
     ];
 
-    return GpxWriter().asString(gpx, pretty: true);
+    final body = GpxWriter().asString(gpx, pretty: true);
+    return _injectRecordingWindowComment(body, startUtc, endUtc);
+  }
+
+  /// Machine-readable session bounds for the PC server (ignored by typical GPX parsers).
+  static String _injectRecordingWindowComment(
+    String gpxXml,
+    DateTime recordingStartUtc,
+    DateTime recordingEndUtc,
+  ) {
+    final start = recordingStartUtc.toUtc().toIso8601String();
+    final end = recordingEndUtc.toUtc().toIso8601String();
+    final comment = '<!-- fyp-recording-window start=$start end=$end -->';
+    final firstNl = gpxXml.indexOf('\n');
+    if (firstNl == -1) return '$comment\n$gpxXml';
+    final firstLine = gpxXml.substring(0, firstNl).trimLeft();
+    if (firstLine.startsWith('<?xml')) {
+      return '${gpxXml.substring(0, firstNl + 1)}$comment\n${gpxXml.substring(firstNl + 1)}';
+    }
+    return '$comment\n$gpxXml';
   }
 }
 

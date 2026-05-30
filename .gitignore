@@ -22,3 +22,6 @@ Thumbs.db
 **/build/
 **/reports/
 *.html
+
+# Ignore any folder named demos and all of its contents
+**/demos/

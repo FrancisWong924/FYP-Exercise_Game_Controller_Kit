@@ -4,12 +4,12 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
-using System.Globalization;
 using System.IO;
 using System.Net.Http;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
@@ -21,6 +21,11 @@ public partial class LayoutCreatorWindow : Window
 {
     /// <summary>Logical width of the preview canvas; scales element sizes like Flutter density.</summary>
     const double PhoneRefWidth = 780.0;
+    const double ResizeHitLogical = 36.0;
+    const double JoystickMinRadius = 40.0;
+    const double ButtonSquareMinSize = 40.0;
+    const double ButtonRectMinWidth = 24.0;
+    const double ButtonRectMinHeight = 24.0;
     static readonly HttpClient Http = new();
     readonly ObservableCollection<LayoutElementModel> _elements = new();
     bool _suppressTypeCombo;
@@ -29,9 +34,25 @@ public partial class LayoutCreatorWindow : Window
     string? _uploadedBackgroundImageDataUri;
     string? _uploadedBackgroundImageDisplayName;
     bool _suppressBackgroundImageInputEvents;
+    const double PreviewDragActivateDistance = 4.0;
+    bool _isPreviewDragging;
+    bool _isPreviewResizing;
+    bool _previewDragArmed;
+    bool _previewResizeArmed;
+    LayoutElementModel? _previewDragElement;
+    LayoutElementModel? _previewResizeElement;
+    Point _previewPressCanvasPoint;
+    LayoutElementModel? _selectedElement;
 
     /// <summary>Joystick <c>joystickType</c> values accepted by the Flutter controller (dropdown only).</summary>
     public IReadOnlyList<string> JoystickSideOptions { get; } = new[] { "left", "right" };
+
+    public Array ButtonShapeOptions { get; } = Enum.GetValues(typeof(LayoutButtonShape));
+
+    /// <summary>Joystick index values for <c>tiltTarget</c> / <c>stepTarget</c> (matches Flutter <c>ControllerId</c>).</summary>
+    public IReadOnlyList<string> TiltTargetOptions { get; } = new[] { "LEFT JOYSTICK", "RIGHT JOYSTICK" };
+
+    public IReadOnlyList<StepTargetOption> StepTargetOptions { get; } = CreateStepTargetOptions();
 
     /// <summary>buttonId choices <c>1 &lt;&lt; 0</c> … <c>1 &lt;&lt; 15</c> for the layout editor.</summary>
     public IReadOnlyList<ButtonIdMaskOption> ButtonIdMaskOptions { get; } = CreateButtonIdMaskOptions();
@@ -42,10 +63,16 @@ public partial class LayoutCreatorWindow : Window
         1 => $"1 << {i} (arrow down)",
         2 => $"1 << {i} (arrow left)",
         3 => $"1 << {i} (arrow right)",
-        12 => $"1 << {i} (cross / A)",
-        13 => $"1 << {i} (circle / B)",
-        14 => $"1 << {i} (square / X)",
-        15 => $"1 << {i} (triangle / Y)",
+        6 => $"1 << {i} (LS)",
+        7 => $"1 << {i} (RS)",
+        8 => $"1 << {i} (LB)",
+        9 => $"1 << {i} (RB)",
+        10 => $"1 << {i} (LT)",
+        11 => $"1 << {i} (RT)",
+        12 => $"1 << {i} (A)",
+        13 => $"1 << {i} (B)",
+        14 => $"1 << {i} (X)",
+        15 => $"1 << {i} (Y)",
         _ => $"1 << {i}"
     };
 
@@ -69,11 +96,29 @@ public partial class LayoutCreatorWindow : Window
         return opts;
     }
 
+    static StepTargetOption[] CreateStepTargetOptions()
+    {
+        var options = new List<StepTargetOption>
+        {
+            new() { DisplayName = "LEFT JOYSTICK (LY)", StepTarget = 0, StepButtonBitmask = 0 },
+            new() { DisplayName = "RIGHT JOYSTICK (RY)", StepTarget = 1, StepButtonBitmask = 0 },
+        };
+        ReadOnlySpan<string> buttons = ["UP", "DOWN", "LEFT", "RIGHT", "START", "BACK", "LS", "RS", "LB", "RB", "LT", "RT", "A", "B", "X", "Y"];
+        for (var i = 0; i < buttons.Length; i++)
+            options.Add(new() { DisplayName = buttons[i], StepTarget = 0, StepButtonBitmask = 1 << i });
+        return options.ToArray();
+    }
+
     public LayoutCreatorWindow()
     {
         InitializeComponent();
+        LayoutBackgroundColorPicker.HexValueChanged += LayoutBackgroundColorPicker_OnHexValueChanged;
         TypeCombo.ItemsSource = Enum.GetValues(typeof(LayoutElementKind));
-        ElementsList.ItemsSource = _elements;
+        TiltTargetCombo.ItemsSource = TiltTargetOptions;
+        TiltTargetCombo.SelectedIndex = 1;
+        StepTargetCombo.ItemsSource = StepTargetOptions;
+        StepTargetCombo.DisplayMemberPath = "DisplayName";
+        StepTargetCombo.SelectedIndex = 0;
         _elements.CollectionChanged += Elements_CollectionChanged;
 
         if (_elements.Count == 0)
@@ -96,10 +141,10 @@ public partial class LayoutCreatorWindow : Window
 
         UpdateBackgroundImageSourceHint();
         RefreshPreview();
-        if (ElementsList.SelectedItem is LayoutElementModel sel)
-            UpdateEditorFieldVisibility(sel.Type);
-        else if (_elements.Count > 0)
-            UpdateEditorFieldVisibility(_elements[0].Type);
+        if (_elements.Count > 0)
+            SetSelectedElement(_elements[0]);
+        else
+            SetSelectedElement(null);
     }
 
     void Elements_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -131,6 +176,21 @@ public partial class LayoutCreatorWindow : Window
 
     void Model_OnPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (_isPreviewDragging && sender is LayoutElementModel &&
+            (e.PropertyName == nameof(LayoutElementModel.X) || e.PropertyName == nameof(LayoutElementModel.Y)))
+        {
+            UpdatePreviewElementPosition((LayoutElementModel)sender);
+            return;
+        }
+
+        if (_isPreviewResizing && sender is LayoutElementModel &&
+            (e.PropertyName == nameof(LayoutElementModel.Size) ||
+             e.PropertyName == nameof(LayoutElementModel.ButtonWidth) ||
+             e.PropertyName == nameof(LayoutElementModel.ButtonHeight)))
+        {
+            return;
+        }
+
         Dispatcher.BeginInvoke(RefreshPreview);
     }
 
@@ -141,136 +201,530 @@ public partial class LayoutCreatorWindow : Window
 
     void RefreshPreview()
     {
-        PreviewCanvas.Background = ToBrush(LayoutBackgroundColorBox.Text, Color.FromArgb(0xFF, 0x1A, 0x1A, 0x1C));
+        PreviewCanvas.Background = ToBrush(LayoutBackgroundColorPicker.HexValue, Color.FromArgb(0xFF, 0x1A, 0x1A, 0x1C));
         ApplyBackgroundImagePreview();
         PreviewCanvas.Children.Clear();
         var w = PreviewCanvas.Width;
         var h = PreviewCanvas.Height;
         var scale = w / PhoneRefWidth;
+        var selected = _selectedElement;
 
         foreach (var el in _elements)
+            PreviewCanvas.Children.Add(BuildPreviewElementHost(el, ReferenceEquals(el, selected), w, h, scale));
+    }
+
+    static (double hitW, double hitH) GetPreviewHitSize(LayoutElementModel el, double scale)
+    {
+        if (el.Type == LayoutElementKind.joystick)
         {
-            var cx = el.X * w;
-            var cy = el.Y * h;
             var size = el.Size * scale;
+            return (size * 2, size * 2);
+        }
 
-            var fill = ToBrush(el.BackgroundColor, Color.FromArgb(0x33, 0xFF, 0xFF, 0xFF));
-            var stroke = ToBrush(el.Color, Colors.White);
-            var op = Math.Clamp(el.Opacity, 0, 1);
+        if (el.Type == LayoutElementKind.button)
+        {
+            var (w, h) = el.GetButtonLayoutSize();
+            return (w * scale, h * scale);
+        }
 
-            if (el.Type == LayoutElementKind.joystick)
+        var s = el.Size * scale;
+        return (s, s);
+    }
+
+    static (double faceW, double faceH, double visualScale) GetButtonPreviewMetrics(LayoutElementModel el, double scale)
+    {
+        var (w, h) = el.GetButtonLayoutSize();
+        var faceW = w * scale;
+        var faceH = h * scale;
+        return (faceW, faceH, Math.Min(faceW, faceH));
+    }
+
+    static FrameworkElement CreateButtonFaceShape(
+        LayoutElementModel el,
+        double faceW,
+        double faceH,
+        Brush fill,
+        Brush stroke,
+        double opacity,
+        bool hideDecoration)
+    {
+        if (el.ButtonShape == LayoutButtonShape.circle)
+        {
+            return new Ellipse
             {
-                var outer = new Ellipse
-                {
-                    Width = size * 2,
-                    Height = size * 2,
-                    Fill = fill,
-                    Stroke = stroke,
-                    StrokeThickness = 2,
-                    Opacity = op
-                };
-                Canvas.SetLeft(outer, cx - size);
-                Canvas.SetTop(outer, cy - size);
-                PreviewCanvas.Children.Add(outer);
+                Width = faceW,
+                Height = faceH,
+                Fill = hideDecoration ? Brushes.Transparent : fill,
+                Stroke = hideDecoration ? Brushes.Transparent : stroke,
+                StrokeThickness = 2,
+                Opacity = opacity
+            };
+        }
 
-                var knob = new Ellipse
-                {
-                    Width = size * 0.55,
-                    Height = size * 0.55,
-                    Fill = stroke,
-                    Opacity = op * 0.95
-                };
-                Canvas.SetLeft(knob, cx - size * 0.275);
-                Canvas.SetTop(knob, cy - size * 0.275);
-                PreviewCanvas.Children.Add(knob);
-            }
-            else
+        var corner = Math.Min(faceW, faceH) * (el.ButtonShape == LayoutButtonShape.square ? 0.14 : 0.22);
+        return new Border
+        {
+            Width = faceW,
+            Height = faceH,
+            CornerRadius = new CornerRadius(corner),
+            Background = hideDecoration ? Brushes.Transparent : fill,
+            BorderBrush = hideDecoration ? Brushes.Transparent : stroke,
+            BorderThickness = new Thickness(2),
+            Opacity = opacity
+        };
+    }
+
+    void UpdatePreviewElementPosition(LayoutElementModel el)
+    {
+        var w = PreviewCanvas.Width;
+        var h = PreviewCanvas.Height;
+        var scale = w / PhoneRefWidth;
+        var (hitW, hitH) = GetPreviewHitSize(el, scale);
+        var cx = el.X * w;
+        var cy = el.Y * h;
+
+        foreach (UIElement child in PreviewCanvas.Children)
+        {
+            if (child is FrameworkElement fe && ReferenceEquals(fe.Tag, el))
             {
-                string? imageInput = null;
-                bool hasImage = el.Type == LayoutElementKind.button && 
-                    el.TryGetButtonImageForExport(out imageInput, out _) && 
-                    !string.IsNullOrEmpty(imageInput);
-
-                bool hasSystemIcon = !string.IsNullOrEmpty(el.UseSystemIcon) && el.UseSystemIcon != "None";
-                Brush iconBrush = Brushes.White; 
-                try {
-                    var color = (Color)ColorConverter.ConvertFromString("#" + el.Color);
-                    iconBrush = new SolidColorBrush(color);
-                } catch { /* Fallback to white if hex is invalid */ }
-
-                var circle = new Ellipse
-                {
-                    Width = size,
-                    Height = size,
-                    Fill = hasImage ? Brushes.Transparent : fill,
-                    Stroke = hasImage ? Brushes.Transparent : stroke,
-                    StrokeThickness = 2,
-                    Opacity = op
-                };
-                Canvas.SetLeft(circle, cx - size / 2);
-                Canvas.SetTop(circle, cy - size / 2);
-                PreviewCanvas.Children.Add(circle);
-
-                if (hasSystemIcon && !hasImage)
-                {
-                    if (SystemIconGeometries.TryGetValue(el.UseSystemIcon!, out var geom))
-                    {
-                        var iconPath = new System.Windows.Shapes.Path
-                        {
-                            Data = geom,
-                            Stroke = iconBrush, // Determine color from el.Color
-                            StrokeThickness = 2.5,
-                            Stretch = Stretch.Uniform,
-                            Width = size * 0.5,
-                            Height = size * 0.5,
-                            Opacity = op,
-                            StrokeEndLineCap = PenLineCap.Round,
-                            StrokeStartLineCap = PenLineCap.Round
-                        };
-                        
-                        // Center the icon in the button
-                        Canvas.SetLeft(iconPath, cx - (size * 0.5) / 2);
-                        Canvas.SetTop(iconPath, cy - (size * 0.5) / 2);
-                        PreviewCanvas.Children.Add(iconPath);
-                    }
-                }
-
-                var label = new TextBlock
-                {
-                    Text = string.IsNullOrEmpty(el.Label) ? el.Type.ToString() : el.Label,
-                    Foreground = iconBrush,
-                    FontSize = Math.Clamp(size * 0.35, 10, 32),
-                    Opacity = op,
-                    Visibility = (hasImage || hasSystemIcon) ? Visibility.Collapsed : Visibility.Visible
-                };
-                label.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-                Canvas.SetLeft(label, cx - label.DesiredSize.Width / 2);
-                Canvas.SetTop(label, cy - label.DesiredSize.Height / 2);
-                PreviewCanvas.Children.Add(label);
-
-                if (hasImage)
-                {
-                    var targetCircle = circle;
-                    string capturedInput = imageInput!;
-                    _ = Task.Run(async () =>
-                    {
-                        var brush = await CreateImageBrushAsync(capturedInput);
-                        if (brush != null)
-                        {
-                            Dispatcher.Invoke(() => targetCircle.Fill = brush);
-                        }
-                        else
-                        {
-                            // FALLBACK: If the image failed to load, show the label and border again
-                            Dispatcher.Invoke(() => {
-                                targetCircle.Stroke = stroke;
-                                label.Visibility = Visibility.Visible;
-                            });
-                        }
-                    });
-                }
+                Canvas.SetLeft(fe, cx - hitW / 2);
+                Canvas.SetTop(fe, cy - hitH / 2);
+                break;
             }
         }
+    }
+
+    Border BuildPreviewElementHost(LayoutElementModel el, bool isSelected, double canvasW, double canvasH, double scale)
+    {
+        var (hitW, hitH) = GetPreviewHitSize(el, scale);
+        var cx = el.X * canvasW;
+        var cy = el.Y * canvasH;
+        var size = el.Size * scale;
+
+        var fill = ToBrush(el.BackgroundColor, Color.FromArgb(0x33, 0xFF, 0xFF, 0xFF));
+        var stroke = ToBrush(el.Color, Colors.White);
+        var op = Math.Clamp(el.Opacity, 0, 1);
+
+        var inner = new Canvas { Width = hitW, Height = hitH, IsHitTestVisible = false };
+        var centerX = hitW / 2;
+        var centerY = hitH / 2;
+
+        if (el.Type == LayoutElementKind.joystick)
+        {
+            var outer = new Ellipse
+            {
+                Width = size * 2,
+                Height = size * 2,
+                Fill = fill,
+                Stroke = stroke,
+                StrokeThickness = 2,
+                Opacity = op
+            };
+            Canvas.SetLeft(outer, centerX - size);
+            Canvas.SetTop(outer, centerY - size);
+            inner.Children.Add(outer);
+
+            var knob = new Ellipse
+            {
+                Width = size * 0.55,
+                Height = size * 0.55,
+                Fill = stroke,
+                Opacity = op * 0.95
+            };
+            Canvas.SetLeft(knob, centerX - size * 0.275);
+            Canvas.SetTop(knob, centerY - size * 0.275);
+            inner.Children.Add(knob);
+        }
+        else
+        {
+            string? imageInput = null;
+            bool hasImage = el.Type == LayoutElementKind.button &&
+                el.TryGetButtonImageForExport(out imageInput, out _) &&
+                !string.IsNullOrEmpty(imageInput);
+
+            bool hasSystemIcon = !string.IsNullOrEmpty(el.UseSystemIcon) && el.UseSystemIcon != "None";
+            Brush iconBrush = Brushes.White;
+            try
+            {
+                var color = (Color)ColorConverter.ConvertFromString("#" + el.Color);
+                iconBrush = new SolidColorBrush(color);
+            }
+            catch { /* invalid hex */ }
+
+            var (faceW, faceH, visualScale) = GetButtonPreviewMetrics(el, scale);
+            var hideDecoration = hasImage;
+            var buttonBorder = GetButtonFaceBorderBrush(el.BackgroundColor);
+            var face = CreateButtonFaceShape(el, faceW, faceH, fill, buttonBorder, op, hideDecoration);
+            Canvas.SetLeft(face, centerX - faceW / 2);
+            Canvas.SetTop(face, centerY - faceH / 2);
+            inner.Children.Add(face);
+
+            if (hasSystemIcon && !hasImage)
+            {
+                if (SystemIconGeometries.TryGetValue(el.UseSystemIcon!, out var geom))
+                {
+                    var iconSize = visualScale * 0.5;
+                    var iconPath = new System.Windows.Shapes.Path
+                    {
+                        Data = geom,
+                        Stroke = iconBrush,
+                        StrokeThickness = 2.5,
+                        Stretch = Stretch.Uniform,
+                        Width = iconSize,
+                        Height = iconSize,
+                        Opacity = op,
+                        StrokeEndLineCap = PenLineCap.Round,
+                        StrokeStartLineCap = PenLineCap.Round
+                    };
+                    Canvas.SetLeft(iconPath, centerX - iconSize / 2);
+                    Canvas.SetTop(iconPath, centerY - iconSize / 2);
+                    inner.Children.Add(iconPath);
+                }
+            }
+
+            var label = new TextBlock
+            {
+                Text = string.IsNullOrEmpty(el.Label) ? el.Type.ToString() : el.Label,
+                Foreground = iconBrush,
+                FontSize = Math.Clamp(visualScale * 0.35, 10, 32),
+                Opacity = op,
+                Visibility = (hasImage || hasSystemIcon) ? Visibility.Collapsed : Visibility.Visible
+            };
+            label.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            Canvas.SetLeft(label, centerX - label.DesiredSize.Width / 2);
+            Canvas.SetTop(label, centerY - label.DesiredSize.Height / 2);
+            inner.Children.Add(label);
+
+            if (hasImage)
+            {
+                var targetFace = face;
+                var capturedBorder = buttonBorder;
+                string capturedInput = imageInput!;
+                _ = Task.Run(async () =>
+                {
+                    var brush = await CreateImageBrushAsync(capturedInput);
+                    if (brush != null)
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            if (targetFace is Ellipse ellipse)
+                                ellipse.Fill = brush;
+                            else if (targetFace is Border border)
+                                border.Background = brush;
+                        });
+                    }
+                    else
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            if (targetFace is Ellipse ellipse)
+                                ellipse.Stroke = capturedBorder;
+                            else if (targetFace is Border border)
+                                border.BorderBrush = capturedBorder;
+                            label.Visibility = Visibility.Visible;
+                        });
+                    }
+                });
+            }
+        }
+
+        if (isSelected && (el.Type == LayoutElementKind.button || el.Type == LayoutElementKind.joystick))
+        {
+            const double grip = 10;
+            var gripFill = new SolidColorBrush(Color.FromArgb(0xE6, 0x4F, 0xA3, 0xFF));
+            var gripBorder = new SolidColorBrush(Color.FromArgb(0xFF, 0xF3, 0xF3, 0xF3));
+            var resizeGrip = new Border
+            {
+                Width = grip,
+                Height = grip,
+                Background = gripFill,
+                BorderBrush = gripBorder,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(2),
+                Cursor = Cursors.SizeNWSE,
+                IsHitTestVisible = false
+            };
+            Canvas.SetLeft(resizeGrip, hitW - grip);
+            Canvas.SetTop(resizeGrip, hitH - grip);
+            inner.Children.Add(resizeGrip);
+        }
+
+        var host = new Border
+        {
+            Tag = el,
+            Width = hitW,
+            Height = hitH,
+            Background = Brushes.Transparent,
+            BorderBrush = isSelected ? new SolidColorBrush(Color.FromArgb(0xE6, 0x4F, 0xA3, 0xFF)) : Brushes.Transparent,
+            BorderThickness = new Thickness(2),
+            Cursor = Cursors.Hand,
+            Child = inner
+        };
+        Canvas.SetLeft(host, cx - hitW / 2);
+        Canvas.SetTop(host, cy - hitH / 2);
+        return host;
+    }
+
+    LayoutElementModel? HitTestPreviewElement(Point canvasPoint)
+    {
+        for (var i = PreviewCanvas.Children.Count - 1; i >= 0; i--)
+        {
+            if (PreviewCanvas.Children[i] is not FrameworkElement fe || fe.Tag is not LayoutElementModel el)
+                continue;
+
+            var left = Canvas.GetLeft(fe);
+            var top = Canvas.GetTop(fe);
+            if (double.IsNaN(left)) left = 0;
+            if (double.IsNaN(top)) top = 0;
+            var width = fe.ActualWidth > 0 ? fe.ActualWidth : fe.Width;
+            var height = fe.ActualHeight > 0 ? fe.ActualHeight : fe.Height;
+            if (canvasPoint.X >= left && canvasPoint.X <= left + width &&
+                canvasPoint.Y >= top && canvasPoint.Y <= top + height)
+                return el;
+        }
+
+        return null;
+    }
+
+    void SelectPreviewElement(LayoutElementModel el) => SetSelectedElement(el);
+
+    void SetSelectedElement(LayoutElementModel? el)
+    {
+        _selectedElement = el;
+        EditorPanel.DataContext = el;
+        EditorPanel.Visibility = el == null ? Visibility.Collapsed : Visibility.Visible;
+        NoSelectionHint.Visibility = el == null ? Visibility.Visible : Visibility.Collapsed;
+
+        if (el != null)
+        {
+            _suppressTypeCombo = true;
+            TypeCombo.SelectedItem = el.Type;
+            _suppressTypeCombo = false;
+            UpdateEditorFieldVisibility(el.Type);
+        }
+
+        if (!_isPreviewDragging && !_isPreviewResizing)
+            RefreshPreview();
+    }
+
+    double GetPreviewScale() => PreviewCanvas.Width / PhoneRefWidth;
+
+    static (double left, double top, double hitW, double hitH) GetPreviewHostBounds(
+        LayoutElementModel el, double canvasW, double canvasH, double scale)
+    {
+        var (hitW, hitH) = GetPreviewHitSize(el, scale);
+        var cx = el.X * canvasW;
+        var cy = el.Y * canvasH;
+        return (cx - hitW / 2, cy - hitH / 2, hitW, hitH);
+    }
+
+    static bool IsInResizeZone(LayoutElementModel el, Point canvasPoint, double canvasW, double canvasH, double scale)
+    {
+        if (el.Type is not (LayoutElementKind.button or LayoutElementKind.joystick))
+            return false;
+
+        var (left, top, hitW, hitH) = GetPreviewHostBounds(el, canvasW, canvasH, scale);
+        var localX = canvasPoint.X - left;
+        var localY = canvasPoint.Y - top;
+        var resizeSize = ResizeHitLogical * scale;
+        return localX >= hitW - resizeSize && localY >= hitH - resizeSize;
+    }
+
+    static void ApplyResizeFromCanvasPoint(
+        LayoutElementModel el,
+        Point canvasPoint,
+        double canvasW,
+        double canvasH,
+        double scale,
+        double gridSize)
+    {
+        var cx = el.X * canvasW;
+        var cy = el.Y * canvasH;
+        var logicalDx = Math.Max((canvasPoint.X - cx) / scale, 0);
+        var logicalDy = Math.Max((canvasPoint.Y - cy) / scale, 0);
+
+        if (el.Type == LayoutElementKind.joystick)
+        {
+            var next = Math.Max(Math.Max(logicalDx, logicalDy), JoystickMinRadius);
+            el.Size = Math.Max(SnapToGrid(next, gridSize), JoystickMinRadius);
+            return;
+        }
+
+        if (el.Type != LayoutElementKind.button)
+            return;
+
+        if (el.ButtonShape == LayoutButtonShape.rectangle)
+        {
+            var nextW = Math.Max(logicalDx * 2, ButtonRectMinWidth);
+            var nextH = Math.Max(logicalDy * 2, ButtonRectMinHeight);
+            el.ButtonWidth = Math.Max(SnapToGrid(nextW, gridSize), ButtonRectMinWidth);
+            el.ButtonHeight = Math.Max(SnapToGrid(nextH, gridSize), ButtonRectMinHeight);
+            return;
+        }
+
+        var nextSize = Math.Max(Math.Max(logicalDx, logicalDy) * 2, ButtonSquareMinSize);
+        el.Size = Math.Max(SnapToGrid(nextSize, gridSize), ButtonSquareMinSize);
+    }
+
+    double GetResizeGridSize()
+    {
+        if (double.TryParse(ResizeGridSizeBox.Text, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var grid) && grid >= 0)
+            return grid;
+        if (double.TryParse(ResizeGridSizeBox.Text, out grid) && grid >= 0)
+            return grid;
+        return 8;
+    }
+
+    static int GetJoystickTargetIndex(ComboBox combo) => combo.SelectedIndex <= 0 ? 0 : 1;
+
+    int GetTiltTargetIndex() => GetJoystickTargetIndex(TiltTargetCombo);
+
+    StepTargetOption GetSelectedStepTargetOption() =>
+        StepTargetCombo.SelectedItem as StepTargetOption ?? StepTargetOptions[0];
+
+    static double SnapToGrid(double value, double gridSize)
+    {
+        if (gridSize <= 0)
+            return value;
+        return Math.Round(value / gridSize) * gridSize;
+    }
+
+    void PreviewCanvas_OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        var pos = e.GetPosition(PreviewCanvas);
+        var hit = HitTestPreviewElement(pos);
+        if (hit == null)
+            return;
+
+        SelectPreviewElement(hit);
+        _previewPressCanvasPoint = pos;
+        _previewDragArmed = false;
+        _previewResizeArmed = false;
+
+        var canvasW = PreviewCanvas.Width;
+        var canvasH = PreviewCanvas.Height;
+        var scale = GetPreviewScale();
+
+        if (IsInResizeZone(hit, pos, canvasW, canvasH, scale))
+        {
+            _previewResizeArmed = true;
+            _previewResizeElement = hit;
+        }
+        else
+        {
+            _previewDragArmed = true;
+            _previewDragElement = hit;
+        }
+
+        PreviewCanvas.CaptureMouse();
+        e.Handled = true;
+    }
+
+    void PreviewCanvas_OnMouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed)
+            return;
+
+        var pos = e.GetPosition(PreviewCanvas);
+        var scale = GetPreviewScale();
+
+        if (_previewResizeArmed && _previewResizeElement != null)
+        {
+            if (!_isPreviewResizing && !HasExceededDragThreshold(pos))
+                return;
+
+            _isPreviewResizing = true;
+            PreviewCanvas.Cursor = Cursors.SizeNWSE;
+            var canvasW = PreviewCanvas.Width;
+            var canvasH = PreviewCanvas.Height;
+            ApplyResizeFromCanvasPoint(
+                _previewResizeElement,
+                pos,
+                canvasW,
+                canvasH,
+                scale,
+                GetResizeGridSize());
+            RefreshPreview();
+            e.Handled = true;
+            return;
+        }
+
+        if (!_previewDragArmed || _previewDragElement == null)
+            return;
+
+        if (!_isPreviewDragging && !HasExceededDragThreshold(pos))
+            return;
+
+        _isPreviewDragging = true;
+        PreviewCanvas.Cursor = Cursors.SizeAll;
+        SetNormalizedPositionFromCanvasPoint(_previewDragElement, pos);
+        e.Handled = true;
+    }
+
+    bool HasExceededDragThreshold(Point currentCanvasPoint)
+    {
+        var dx = currentCanvasPoint.X - _previewPressCanvasPoint.X;
+        var dy = currentCanvasPoint.Y - _previewPressCanvasPoint.Y;
+        return dx * dx + dy * dy >= PreviewDragActivateDistance * PreviewDragActivateDistance;
+    }
+
+    void ClearPreviewPointerState()
+    {
+        _previewDragArmed = false;
+        _previewResizeArmed = false;
+        _previewDragElement = null;
+        _previewResizeElement = null;
+        if (PreviewCanvas.IsMouseCaptured)
+            PreviewCanvas.ReleaseMouseCapture();
+        PreviewCanvas.Cursor = Cursors.Arrow;
+    }
+
+    void PreviewCanvas_OnMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        EndPreviewDrag();
+        EndPreviewResize();
+        ClearPreviewPointerState();
+        e.Handled = true;
+    }
+
+    void PreviewCanvas_OnMouseLeave(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed)
+        {
+            EndPreviewDrag();
+            EndPreviewResize();
+            ClearPreviewPointerState();
+        }
+    }
+
+    void EndPreviewDrag()
+    {
+        if (!_isPreviewDragging)
+            return;
+
+        _isPreviewDragging = false;
+        RefreshPreview();
+    }
+
+    void EndPreviewResize()
+    {
+        if (!_isPreviewResizing)
+            return;
+
+        _isPreviewResizing = false;
+        RefreshPreview();
+    }
+
+    void SetNormalizedPositionFromCanvasPoint(LayoutElementModel el, Point canvasPoint)
+    {
+        var w = PreviewCanvas.Width;
+        var h = PreviewCanvas.Height;
+        if (w <= 0 || h <= 0)
+            return;
+
+        el.X = Math.Clamp(canvasPoint.X / w, 0, 1);
+        el.Y = Math.Clamp(canvasPoint.Y / h, 0, 1);
     }
 
     private void ComboBox_PreviewMouseWheel(object sender, System.Windows.Input.MouseWheelEventArgs e)
@@ -390,35 +844,24 @@ public partial class LayoutCreatorWindow : Window
 
     static Brush ToBrush(string? hex, Color fallback)
     {
-        var c = ParseArgb(hex);
+        var c = HexColorPicker.TryParseArgb(hex);
         return new SolidColorBrush(c ?? fallback);
     }
 
-    static Color? ParseArgb(string? hex)
+    /// <summary>Matches Flutter <c>_buttonFaceDecoration</c>: border from backgroundColor, or white54 for default.</summary>
+    static Brush GetButtonFaceBorderBrush(string? backgroundColor)
     {
-        if (string.IsNullOrWhiteSpace(hex)) return null;
-        var s = hex.Trim();
-        var hasHashPrefix = s.StartsWith("#", StringComparison.Ordinal);
-        if (hasHashPrefix)
-            s = s[1..];
-        if (s.Length == 6)
-            s = "FF" + s;
-        else if (s.Length == 8 && hasHashPrefix)
+        const string defaultBackground = "33FFFFFF";
+        if (string.IsNullOrWhiteSpace(backgroundColor) ||
+            string.Equals(backgroundColor.Trim(), defaultBackground, StringComparison.OrdinalIgnoreCase))
         {
-            // Accept web-style #RRGGBBAA by converting to ARGB.
-            s = s[6..] + s[..6];
+            return new SolidColorBrush(Color.FromArgb(0x8A, 0xFF, 0xFF, 0xFF));
         }
-        if (s.Length != 8 || !uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var raw))
-            return null;
 
-        var a = (byte)((raw >> 24) & 0xFF);
-        var r = (byte)((raw >> 16) & 0xFF);
-        var g = (byte)((raw >> 8) & 0xFF);
-        var b = (byte)(raw & 0xFF);
-        return Color.FromArgb(a, r, g, b);
+        return ToBrush(backgroundColor, Color.FromArgb(0x8A, 0xFF, 0xFF, 0xFF));
     }
 
-    void LayoutBackgroundColorBox_OnTextChanged(object sender, TextChangedEventArgs e)
+    void LayoutBackgroundColorPicker_OnHexValueChanged(object? sender, EventArgs e)
     {
         RefreshPreview();
     }
@@ -437,20 +880,9 @@ public partial class LayoutCreatorWindow : Window
         RefreshPreview();
     }
 
-    void ElementsList_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (ElementsList.SelectedItem is not LayoutElementModel m)
-            return;
-
-        _suppressTypeCombo = true;
-        TypeCombo.SelectedItem = m.Type;
-        _suppressTypeCombo = false;
-        UpdateEditorFieldVisibility(m.Type);
-    }
-
     void TypeCombo_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_suppressTypeCombo || ElementsList.SelectedItem is not LayoutElementModel m)
+        if (_suppressTypeCombo || _selectedElement is not LayoutElementModel m)
             return;
         if (TypeCombo.SelectedItem is not LayoutElementKind kind)
             return;
@@ -483,22 +915,29 @@ public partial class LayoutCreatorWindow : Window
     void AddButton_OnClick(object sender, RoutedEventArgs e)
     {
         var id = $"btn_{Guid.NewGuid().ToString("N")[..6]}";
-        _elements.Add(LayoutElementModel.CreateButton(id));
-        ElementsList.SelectedIndex = _elements.Count - 1;
+        var added = LayoutElementModel.CreateButton(id);
+        _elements.Add(added);
+        SetSelectedElement(added);
     }
 
     void AddJoystick_OnClick(object sender, RoutedEventArgs e)
     {
         var id = $"joy_{Guid.NewGuid().ToString("N")[..6]}";
-        _elements.Add(LayoutElementModel.CreateJoystick(id, "left"));
-        ElementsList.SelectedIndex = _elements.Count - 1;
+        var added = LayoutElementModel.CreateJoystick(id, "left");
+        _elements.Add(added);
+        SetSelectedElement(added);
     }
 
     void RemoveSelected_OnClick(object sender, RoutedEventArgs e)
     {
-        if (ElementsList.SelectedItem is not LayoutElementModel m)
+        if (_selectedElement is not LayoutElementModel m)
             return;
+        var index = _elements.IndexOf(m);
         _elements.Remove(m);
+        if (_elements.Count == 0)
+            SetSelectedElement(null);
+        else
+            SetSelectedElement(_elements[Math.Clamp(index, 0, _elements.Count - 1)]);
     }
 
     void ExportJson_OnClick(object sender, RoutedEventArgs e)
@@ -526,8 +965,11 @@ public partial class LayoutCreatorWindow : Window
         var json = ControllerLayoutDocument.Serialize(
             _elements,
             LayoutNameBox.Text.Trim(),
-            LayoutBackgroundColorBox.Text,
-            backgroundImage);
+            LayoutBackgroundColorPicker.HexValue,
+            backgroundImage,
+            GetTiltTargetIndex(),
+            GetSelectedStepTargetOption().StepTarget,
+            GetSelectedStepTargetOption().StepButtonBitmask);
         File.WriteAllText(dlg.FileName, json);
         MessageBox.Show(this, $"Saved to:\n{dlg.FileName}", "Export", MessageBoxButton.OK, MessageBoxImage.Information);
     }
@@ -551,8 +993,11 @@ public partial class LayoutCreatorWindow : Window
             var exported = ControllerLayoutDocument.Serialize(
                 _elements,
                 LayoutNameBox.Text.Trim(),
-                LayoutBackgroundColorBox.Text,
-                backgroundImage);
+                LayoutBackgroundColorPicker.HexValue,
+                backgroundImage,
+                GetTiltTargetIndex(),
+                GetSelectedStepTargetOption().StepTarget,
+                GetSelectedStepTargetOption().StepButtonBitmask);
             var wireJson = Program.BuildPhoneLayoutJsonFromExportedLayout(exported);
             var sent = await Program.TryBroadcastLayoutToPhonesAsync(wireJson);
             if (!sent)
@@ -631,7 +1076,7 @@ public partial class LayoutCreatorWindow : Window
 
     void PickSelectedButtonImage_OnClick(object sender, RoutedEventArgs e)
     {
-        if (ElementsList.SelectedItem is not LayoutElementModel m || m.Type != LayoutElementKind.button)
+        if (_selectedElement is not LayoutElementModel m || m.Type != LayoutElementKind.button)
             return;
 
         var dlg = new OpenFileDialog
@@ -667,7 +1112,7 @@ public partial class LayoutCreatorWindow : Window
 
     void ClearSelectedButtonImage_OnClick(object sender, RoutedEventArgs e)
     {
-        if (ElementsList.SelectedItem is not LayoutElementModel m || m.Type != LayoutElementKind.button)
+        if (_selectedElement is not LayoutElementModel m || m.Type != LayoutElementKind.button)
             return;
         m.ClearButtonImageForEditor();
         RefreshPreview();

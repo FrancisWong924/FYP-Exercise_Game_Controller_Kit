@@ -390,7 +390,7 @@ export class ControllerInput {
         
         const jsonString = JSON.stringify(message);
         
-        if (jsonString.length > 1000) {
+        if (new TextEncoder().encode(`LAYOUT:${jsonString}`).length > 480) {
             console.log(`[ControllerInput] Large layout detected (${jsonString.length} chars). Using chunked sending.`);
             await this.sendLargeData(targetPlayerId, jsonString);
         } else {

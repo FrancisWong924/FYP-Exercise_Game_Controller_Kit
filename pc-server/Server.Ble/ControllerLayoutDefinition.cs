@@ -18,11 +18,27 @@ public enum LayoutElementKind
     // trigger
 }
 
+/// <summary>Matches Flutter <c>ButtonShape</c>.</summary>
+public enum LayoutButtonShape
+{
+    circle,
+    square,
+    rectangle,
+}
+
 /// <summary>Dropdown entry for <c>buttonId</c> bitmask (<c>1 &lt;&lt; n</c>).</summary>
 public sealed class ButtonIdMaskOption
 {
     public string DisplayName { get; init; } = "";
     public int Value { get; init; }
+}
+
+/// <summary>Dropdown entry for layout <c>stepTarget</c> / <c>stepButtonBitmask</c>.</summary>
+public sealed class StepTargetOption
+{
+    public string DisplayName { get; init; } = "";
+    public int StepTarget { get; init; }
+    public int StepButtonBitmask { get; init; }
 }
 
 /// <summary>Editable element; mirrors Flutter <c>ControllerElement</c> JSON fields.</summary>
@@ -44,6 +60,12 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
     string? _buttonImageUploadedFileName;
     string? _useSystemIcon;
     double _opacity = 1.0;
+    LayoutButtonShape _buttonShape = LayoutButtonShape.circle;
+    double? _buttonWidth;
+    double? _buttonHeight;
+
+    public const double RectangleWidthFactor = 2.0;
+    public const double RectangleHeightFactor = 0.75;
 
     public string Summary => $"{Label} ({Type})";
 
@@ -110,6 +132,7 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
             if (!SetField(ref _type, value)) return;
             OnPropertyChanged(nameof(Summary));
             OnPropertyChanged(nameof(ButtonImageHint));
+            OnPropertyChanged(nameof(IsRectangleButton));
         }
     }
 
@@ -128,7 +151,23 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
     public double Size
     {
         get => _size;
-        set => SetField(ref _size, value);
+        set
+        {
+            if (EqualityComparer<double>.Default.Equals(_size, value)) return;
+            var previousSize = _size;
+            _size = value;
+            if (previousSize > 0 && value > 0)
+            {
+                var ratio = value / previousSize;
+                if (_buttonWidth is > 0)
+                    _buttonWidth *= ratio;
+                if (_buttonHeight is > 0)
+                    _buttonHeight *= ratio;
+            }
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(ButtonWidth));
+            OnPropertyChanged(nameof(ButtonHeight));
+        }
     }
 
     public int? ButtonId
@@ -262,6 +301,58 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
         set => SetField(ref _opacity, value);
     }
 
+    public LayoutButtonShape ButtonShape
+    {
+        get => _buttonShape;
+        set
+        {
+            if (!SetField(ref _buttonShape, value)) return;
+            OnPropertyChanged(nameof(IsRectangleButton));
+            OnPropertyChanged(nameof(ButtonWidth));
+            OnPropertyChanged(nameof(ButtonHeight));
+        }
+    }
+
+    public bool IsRectangleButton => Type == LayoutElementKind.button && ButtonShape == LayoutButtonShape.rectangle;
+
+    public double ButtonWidth
+    {
+        get
+        {
+            if (_buttonWidth is > 0)
+                return _buttonWidth.Value;
+            return Size * RectangleWidthFactor;
+        }
+        set => SetField(ref _buttonWidth, value > 0 ? value : null);
+    }
+
+    public double ButtonHeight
+    {
+        get
+        {
+            if (_buttonHeight is > 0)
+                return _buttonHeight.Value;
+            return Size * RectangleHeightFactor;
+        }
+        set => SetField(ref _buttonHeight, value > 0 ? value : null);
+    }
+
+    /// <summary>Preview / phone layout size in logical pixels (before canvas scale).</summary>
+    public (double width, double height) GetButtonLayoutSize()
+    {
+        return ButtonShape switch
+        {
+            LayoutButtonShape.rectangle => (ButtonWidth, ButtonHeight),
+            _ => (Size, Size),
+        };
+    }
+
+    public double GetButtonVisualScale()
+    {
+        var (w, h) = GetButtonLayoutSize();
+        return Math.Min(w, h);
+    }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public static LayoutElementModel CreateButton(string id)
@@ -318,6 +409,9 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
             {
                 TryGetButtonImageForExport(out var img, out _);
                 dto.Image = string.IsNullOrEmpty(img) ? null : img;
+                dto.ButtonShape = ButtonShape.ToString();
+                dto.ButtonWidth = _buttonWidth;
+                dto.ButtonHeight = _buttonHeight;
             }
             else
             {
@@ -387,6 +481,18 @@ public sealed class LayoutElementDto
     [JsonPropertyName("opacity")]
     public double Opacity { get; set; } = 1.0;
 
+    [JsonPropertyName("buttonShape")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ButtonShape { get; set; }
+
+    [JsonPropertyName("buttonWidth")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ButtonWidth { get; set; }
+
+    [JsonPropertyName("buttonHeight")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? ButtonHeight { get; set; }
+
     public static LayoutElementModel ToModel(LayoutElementDto d)
     {
         var kind = Enum.TryParse<LayoutElementKind>(d.Type, true, out var k) ? k : LayoutElementKind.button;
@@ -406,7 +512,16 @@ public sealed class LayoutElementDto
             Opacity = d.Opacity
         };
         if (kind == LayoutElementKind.button)
+        {
             LayoutElementModel.ApplyImportedButtonImage(model, d.Image);
+            if (!string.IsNullOrWhiteSpace(d.ButtonShape) &&
+                Enum.TryParse<LayoutButtonShape>(d.ButtonShape, true, out var shape))
+                model.ButtonShape = shape;
+            if (d.ButtonWidth is > 0)
+                model.ButtonWidth = d.ButtonWidth.Value;
+            if (d.ButtonHeight is > 0)
+                model.ButtonHeight = d.ButtonHeight.Value;
+        }
         else
             model.Image = d.Image;
         return model;
@@ -428,7 +543,10 @@ public sealed class ControllerLayoutDocument
         ObservableCollection<LayoutElementModel> elements,
         string layoutName,
         string? backgroundColor,
-        string? backgroundImage)
+        string? backgroundImage,
+        int tiltTarget = 1,
+        int stepTarget = 0,
+        int stepButtonBitmask = 0)
     {
         var doc = new ControllerLayoutDocument
         {
@@ -438,6 +556,9 @@ public sealed class ControllerLayoutDocument
             {
                 BackgroundColor = NormalizeOptionalColor(backgroundColor),
                 BackgroundImage = NormalizeOptionalString(backgroundImage),
+                TiltTarget = tiltTarget,
+                StepTarget = stepTarget,
+                StepButtonBitmask = stepButtonBitmask,
                 Elements = elements.Select(e => e.ToDto()).ToList()
             }
         };
@@ -495,6 +616,15 @@ public sealed class ControllerLayoutData
     [JsonPropertyName("backgroundColor")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? BackgroundColor { get; set; }
+
+    [JsonPropertyName("tiltTarget")]
+    public int TiltTarget { get; set; } = 1;
+
+    [JsonPropertyName("stepTarget")]
+    public int StepTarget { get; set; }
+
+    [JsonPropertyName("stepButtonBitmask")]
+    public int StepButtonBitmask { get; set; }
 
     [JsonPropertyName("elements")]
     public List<LayoutElementDto> Elements { get; set; } = new();

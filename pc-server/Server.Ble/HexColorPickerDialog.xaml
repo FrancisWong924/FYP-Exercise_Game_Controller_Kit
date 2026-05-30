@@ -1,0 +1,195 @@
+<Window x:Class="BleServer.HexColorPickerDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Pick a color"
+        Width="340"
+        Height="Auto"
+        SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        Background="#FF1E1E1E"
+        PreviewMouseLeftButtonUp="Window_OnPreviewMouseLeftButtonUp">
+    <StackPanel Margin="16">
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="24"/>
+            </Grid.ColumnDefinitions>
+
+            <Grid Grid.Column="0" Width="260" Height="200">
+                <Border CornerRadius="4"
+                        BorderBrush="#FF555555"
+                        BorderThickness="1"
+                        ClipToBounds="True"
+                        IsHitTestVisible="False">
+                    <Grid>
+                        <Rectangle x:Name="HueBaseFill"/>
+                        <Rectangle IsHitTestVisible="False">
+                            <Rectangle.Fill>
+                                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                    <GradientStop Color="White" Offset="0"/>
+                                    <GradientStop Color="#00FFFFFF" Offset="1"/>
+                                </LinearGradientBrush>
+                            </Rectangle.Fill>
+                        </Rectangle>
+                        <Rectangle IsHitTestVisible="False">
+                            <Rectangle.Fill>
+                                <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                    <GradientStop Color="#00000000" Offset="0"/>
+                                    <GradientStop Color="Black" Offset="1"/>
+                                </LinearGradientBrush>
+                            </Rectangle.Fill>
+                        </Rectangle>
+                    </Grid>
+                </Border>
+                <Ellipse x:Name="SatValMarker"
+                         Width="14"
+                         Height="14"
+                         HorizontalAlignment="Left"
+                         VerticalAlignment="Top"
+                         Margin="-7,-7,0,0"
+                         Stroke="White"
+                         StrokeThickness="2"
+                         Fill="Transparent"
+                         IsHitTestVisible="False"/>
+                <Rectangle x:Name="SatValHitSurface"
+                           Fill="Transparent"
+                           Cursor="Cross"
+                           MouseLeftButtonDown="SatValHitSurface_OnMouseDown"
+                           MouseMove="SatValHitSurface_OnMouseMove"
+                           MouseLeftButtonUp="SatValHitSurface_OnMouseLeftButtonUp"/>
+            </Grid>
+
+            <Grid Grid.Column="2" Width="24" Height="200">
+                <Border CornerRadius="4"
+                        BorderBrush="#FF555555"
+                        BorderThickness="1"
+                        ClipToBounds="True"
+                        IsHitTestVisible="False">
+                    <Rectangle>
+                        <Rectangle.Fill>
+                            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                <GradientStop Color="#FFFF0000" Offset="0.000"/>
+                                <GradientStop Color="#FFFFFF00" Offset="0.167"/>
+                                <GradientStop Color="#FF00FF00" Offset="0.333"/>
+                                <GradientStop Color="#FF00FFFF" Offset="0.500"/>
+                                <GradientStop Color="#FF0000FF" Offset="0.667"/>
+                                <GradientStop Color="#FFFF00FF" Offset="0.833"/>
+                                <GradientStop Color="#FFFF0000" Offset="1.000"/>
+                            </LinearGradientBrush>
+                        </Rectangle.Fill>
+                    </Rectangle>
+                </Border>
+                <Border x:Name="HueMarker"
+                        Width="28"
+                        Height="4"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Top"
+                        Margin="0,-2,0,0"
+                        Background="White"
+                        BorderBrush="#FF333333"
+                        BorderThickness="1"
+                        CornerRadius="1"
+                        IsHitTestVisible="False"/>
+                <Rectangle x:Name="HueHitSurface"
+                           Fill="Transparent"
+                           Cursor="Cross"
+                           MouseLeftButtonDown="HueHitSurface_OnMouseDown"
+                           MouseMove="HueHitSurface_OnMouseMove"
+                           MouseLeftButtonUp="HueHitSurface_OnMouseLeftButtonUp"/>
+            </Grid>
+        </Grid>
+
+        <TextBlock Text="Opacity"
+                   Foreground="#FFAAAAAA"
+                   Margin="0,12,0,4"/>
+        <Grid Width="284" Height="24">
+            <Border CornerRadius="4"
+                    BorderBrush="#FF555555"
+                    BorderThickness="1"
+                    ClipToBounds="True"
+                    IsHitTestVisible="False">
+                <Grid>
+                    <Rectangle IsHitTestVisible="False">
+                        <Rectangle.Fill>
+                            <DrawingBrush TileMode="Tile" Viewport="0,0,8,8" ViewportUnits="Absolute">
+                                <DrawingBrush.Drawing>
+                                    <DrawingGroup>
+                                        <GeometryDrawing Brush="#FF808080">
+                                            <GeometryDrawing.Geometry>
+                                                <RectangleGeometry Rect="0,0,8,8"/>
+                                            </GeometryDrawing.Geometry>
+                                        </GeometryDrawing>
+                                        <GeometryDrawing Brush="#FFC0C0C0">
+                                            <GeometryDrawing.Geometry>
+                                                <GeometryGroup>
+                                                    <RectangleGeometry Rect="0,0,4,4"/>
+                                                    <RectangleGeometry Rect="4,4,4,4"/>
+                                                </GeometryGroup>
+                                            </GeometryDrawing.Geometry>
+                                        </GeometryDrawing>
+                                    </DrawingGroup>
+                                </DrawingBrush.Drawing>
+                            </DrawingBrush>
+                        </Rectangle.Fill>
+                    </Rectangle>
+                    <Rectangle x:Name="AlphaGradientFill" IsHitTestVisible="False"/>
+                </Grid>
+            </Border>
+            <Border x:Name="AlphaMarker"
+                    Width="4"
+                    Height="28"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Center"
+                    Margin="-2,0,0,0"
+                    Background="White"
+                    BorderBrush="#FF333333"
+                    BorderThickness="1"
+                    CornerRadius="1"
+                    IsHitTestVisible="False"/>
+            <Rectangle x:Name="AlphaHitSurface"
+                       Fill="Transparent"
+                       Cursor="Cross"
+                       MouseLeftButtonDown="AlphaHitSurface_OnMouseDown"
+                       MouseMove="AlphaHitSurface_OnMouseMove"
+                       MouseLeftButtonUp="AlphaHitSurface_OnMouseLeftButtonUp"/>
+        </Grid>
+
+        <Grid Margin="0,16,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Border x:Name="PreviewSwatch"
+                    Width="48"
+                    Height="48"
+                    Margin="0,0,12,0"
+                    CornerRadius="6"
+                    BorderBrush="#FF555555"
+                    BorderThickness="1"/>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                <TextBlock Text="Selected color"
+                           Foreground="#FFAAAAAA"
+                           Margin="0,0,0,4"/>
+                <TextBlock x:Name="HexLabel"
+                           Foreground="#FFE0E0E0"
+                           FontFamily="Consolas"
+                           FontSize="14"/>
+            </StackPanel>
+        </Grid>
+
+        <StackPanel Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Margin="0,16,0,0">
+            <Button MinWidth="72"
+                    Margin="0,0,8,0"
+                    Content="Cancel"
+                    IsCancel="True"/>
+            <Button MinWidth="72"
+                    Content="OK"
+                    IsDefault="True"
+                    Click="Ok_OnClick"/>
+        </StackPanel>
+    </StackPanel>
+</Window>

@@ -50,9 +50,13 @@ namespace BleServer
         public float JoyRX { get; set; } = 0f;
         public float JoyRY { get; set; } = 0f;
         public uint Buttons { get; set; } = 0;
+        /// <summary>Left trigger 0–255 (BLE packet byte 2).</summary>
+        public byte LeftTrigger { get; set; }
+        /// <summary>Right trigger 0–255 (BLE packet byte 3).</summary>
+        public byte RightTrigger { get; set; }
 
         public override string ToString()
-            => $"Player:{PlayerId} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons,4}]";
+            => $"Player:{PlayerId} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons:X4} LT:{LeftTrigger} RT:{RightTrigger}";
     }
 
     class Program
@@ -176,8 +180,6 @@ namespace BleServer
                 await Task.Delay(1800);
                 Console.WriteLine("[SERVER] Post-kill settle delay complete — continuing startup.");
             }
-
-            ProgramDiagnostics.LogDiag($"[SERVER][Timing] EnsureExclusiveBleServerProcessAsync total: {swAll.ElapsedMilliseconds} ms (killedAny={killedAny})");
         }
 
         /// <summary>Stops BLE, WebSocket, and ViGEm without terminating the process. Safe to call multiple times.</summary>
@@ -369,7 +371,9 @@ namespace BleServer
                         var state = new InputState 
                         { 
                             PlayerId = session.PlayerId,
-                            Buttons = BitConverter.ToUInt32(bytes, 0),
+                            Buttons = BitConverter.ToUInt16(bytes, 0),
+                            LeftTrigger = bytes[2],
+                            RightTrigger = bytes[3],
                             JoyLX = BitConverter.ToInt16(bytes, 4) / 32767f,
                             JoyLY = BitConverter.ToInt16(bytes, 6) / 32767f,
                             JoyRX = BitConverter.ToInt16(bytes, 8) / 32767f,
@@ -385,10 +389,7 @@ namespace BleServer
                         // Broadcast the specific player's data
                         _ = BroadcastInputAsync(state);
 
-                        // Only log when ViGEm owns input; when a WS game is connected, IsVigemEnabled is false
-                        // but the phone still sends BLE → JSON, so logging here looked like a ghost controller.
-                        if (IsVigemEnabled)
-                            Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X} LX: {state.JoyLX:F2} LY: {state.JoyLY:F2} RX: {state.JoyRX:F2} RY: {state.JoyRY:F2}");
+                        Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X4} LT:{state.LeftTrigger} RT:{state.RightTrigger} LX:{state.JoyLX:F2} LY:{state.JoyLY:F2} RX:{state.JoyRX:F2} RY:{state.JoyRY:F2}");
                     }
                 }
                 catch (Exception ex)
@@ -429,20 +430,25 @@ namespace BleServer
                             .FirstOrDefault(c => c.Session.DeviceId.Id == deviceId);
 
                         if (activeSubscriber != null) {
-                            Console.WriteLine($"[BLE] Late Registration for {deviceId}. Adding to tracking...");
                             int assignedId = GetStickyPlayerId(deviceId);
-
-                            if (!ConnectedPlayers.ContainsKey(assignedId)) 
+                            var lateSession = new PlayerSession {
+                                PlayerId = assignedId,
+                                DeviceId = deviceId,
+                                Client = activeSubscriber,
+                                LastSeen = DateTime.Now,
+                                Controller = vigemClient?.CreateXbox360Controller()
+                            };
+                            if (ConnectedPlayers.TryAdd(assignedId, lateSession))
                             {
-                                session = new PlayerSession {
-                                    PlayerId = assignedId,
-                                    DeviceId = deviceId,
-                                    Client = activeSubscriber,
-                                    LastSeen = DateTime.Now
-                                };
-                                ConnectedPlayers.TryAdd(assignedId, session);
-                                SendStatusToWSClients("CONNECTED", assignedId);
-                                await session.SendMessageViaBle("VIBRATE", notifyChar);
+                                Console.WriteLine($"[BLE] Late Registration for {deviceId}. Adding to tracking...");
+                                session = lateSession;
+                                await CompleteNewPlayerAttachmentAsync(session, assignedId, deviceId);
+                            }
+                            else
+                            {
+                                session = ConnectedPlayers.TryGetValue(assignedId, out var existing)
+                                    ? existing
+                                    : ConnectedPlayers.Values.FirstOrDefault(p => p.DeviceId == deviceId);
                             }
                         }
                         else
@@ -498,7 +504,11 @@ namespace BleServer
                                 var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                                 var pid = session?.PlayerId.ToString() ?? "unknown";
                                 var path = Path.Combine(dir, $"exercise_{stamp}_player{pid}.gpx");
-                                await File.WriteAllTextAsync(path, sb.ToString());
+                                var xml = sb.ToString();
+                                await File.WriteAllTextAsync(path, xml);
+                                var geotagged = GpxRecordingPhotoProcessor.TryGeotagScreenshotsAndAugmentGpx(path, xml);
+                                if (geotagged > 0)
+                                    Console.WriteLine($"[GPX] Geotagged {geotagged} screenshot(s) (EXIF + GPX waypoints) for recording window.");
                                 Console.WriteLine($"[GPX] Saved from phone: {path} ({sb.Length} chars)");
                             }
                             catch (Exception ex)
@@ -510,29 +520,46 @@ namespace BleServer
                         request.Respond();
                         return;
                     }
-                    [DllImport("user32.dll")]
-                    static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
-
-                    const byte VK_LWIN = 0x5B;
-                    const byte VK_SNAPSHOT = 0x2C;
-                    const uint KEYEVENTF_KEYUP = 0x02;
                     if (text == "SCREENSHOT")
                     {
-                        _ = Task.Run(() => 
+                        var devId = deviceId;
+                        var t0 = DateTime.UtcNow;
+                        _ = Task.Run(async () =>
                         {
-                            // 1. Press Windows Key
-                            keybd_event(VK_LWIN, 0, 0, 0); 
-                            // 2. Press PrintScreen
-                            keybd_event(VK_SNAPSHOT, 0, 0, 0); 
-                            
-                            // 3. Release PrintScreen
-                            keybd_event(VK_SNAPSHOT, 0, KEYEVENTF_KEYUP, 0); 
-                            // 4. Release Windows Key
-                            keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+                            try
+                            {
+                                await Task.Delay(30).ConfigureAwait(false);
+                                NativeInput.TriggerWinPrintScreen();
+                                await Task.Delay(2500).ConfigureAwait(false);
+                                var shotDir = Path.Combine(
+                                    Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                                    "Screenshots");
+                                if (!Directory.Exists(shotDir))
+                                {
+                                    Console.WriteLine("[SCREENSHOT] Pictures/Screenshots folder not found.");
+                                    return;
+                                }
 
-                            Console.WriteLine("[SERVER] Fullscreen capture saved to Pictures/Screenshots");
+                                var candidates = Directory.GetFiles(shotDir, "*.png")
+                                    .Select(f => (path: f, t: File.GetLastWriteTimeUtc(f)))
+                                    .Where(x => x.t >= t0.AddSeconds(-8))
+                                    .OrderByDescending(x => x.t)
+                                    .ToList();
+
+                                foreach (var c in candidates)
+                                {
+                                    Console.WriteLine($"[SCREENSHOT] Capture: {c.path} @ {c.t:O} (matched to GPX by time when you save the activity)");
+                                    return;
+                                }
+
+                                Console.WriteLine("[SCREENSHOT] No new PNG found (check Pictures/Screenshots and delay).");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[SCREENSHOT] {ex.Message}");
+                            }
                         });
-                        
+
                         request.Respond();
                     }
 
@@ -733,6 +760,23 @@ namespace BleServer
             }
         }
 
+        private static async Task CompleteNewPlayerAttachmentAsync(PlayerSession session, int assignedId, string deviceId)
+        {
+            try
+            {
+                session.Controller?.Connect();
+                Console.WriteLine($"[ViGEm] Player {assignedId} virtual controller connected.");
+                Console.WriteLine($"[BLE] Player {assignedId} Connected ({deviceId})");
+                await Task.Delay(1000);
+                SendStatusToWSClients("CONNECTED", assignedId);
+                await session.SendMessageViaBle("VIBRATE", notifyChar);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[BLE] Initial attachment failed: {ex.Message}");
+            }
+        }
+
         private static async void OnSubscribedClientsChanged(GattLocalCharacteristic sender, object args) {
             if (notifyChar != null) 
             {
@@ -761,18 +805,8 @@ namespace BleServer
                             Controller = vigemClient?.CreateXbox360Controller()
                         };
 
-                        if (ConnectedPlayers.TryAdd(assignedId, newSession)) {
-                            try {
-                                newSession.Controller?.Connect(); // Plug it into Windows
-                                Console.WriteLine($"[ViGEm] Player {assignedId} virtual controller connected.");
-                                Console.WriteLine($"[BLE] Player {assignedId} Connected ({deviceId})");
-                                await Task.Delay(1000);
-                                SendStatusToWSClients("CONNECTED", assignedId);
-                                await newSession.SendMessageViaBle("VIBRATE", notifyChar);
-                            } catch (Exception ex) {
-                                Console.WriteLine($"[BLE] Initial failed: {ex.Message}");
-                            }
-                        }
+                        if (ConnectedPlayers.TryAdd(assignedId, newSession))
+                            await CompleteNewPlayerAttachmentAsync(newSession, assignedId, deviceId);
                     }
                 }
                 StartHeartbeatWatcher();
@@ -896,6 +930,9 @@ namespace BleServer
             controller.SetAxisValue(Xbox360Axis.RightThumbX, (short)(state.JoyRX * 32767));
             controller.SetAxisValue(Xbox360Axis.RightThumbY, (short)(-state.JoyRY * 32767));
 
+            controller.SetSliderValue(Xbox360Slider.LeftTrigger, state.LeftTrigger);
+            controller.SetSliderValue(Xbox360Slider.RightTrigger, state.RightTrigger);
+
             // 3. Send to Windows Kernel
             controller.SubmitReport();
         }
@@ -962,6 +999,12 @@ namespace BleServer
         /// <summary>Version number paired with <c>gameId</c> for phone storage key.</summary>
         public const int LayoutCreatorPhoneVersion = 1;
 
+        /// <summary>BLE notify payloads above this size are split (START_MSG / CHUNK / END_MSG). Typical ATT MTU ≈ 512 bytes.</summary>
+        public const int BleMaxSingleNotifyUtf8Bytes = 480;
+
+        public const int BleLayoutChunkCharSize = 400;
+        public const int BleLayoutChunkDelayMs = 50;
+
         /// <summary>
         /// Wraps JSON from <see cref="ControllerLayoutDocument.Serialize"/> with <c>gameId</c> and <c>version</c> as required by the Flutter app.
         /// </summary>
@@ -983,21 +1026,20 @@ namespace BleServer
             if (ConnectedPlayers.IsEmpty)
                 return false;
 
-            const int chunkSize = 500;
-            const int smallThreshold = 1000;
-            const int delayMs = 50;
-
-            if (fullLayoutJson.Length <= smallThreshold)
-                await BroadcastToAllPlayers($"LAYOUT:{fullLayoutJson}");
+            var inlineLayout = $"LAYOUT:{fullLayoutJson}";
+            if (Encoding.UTF8.GetByteCount(inlineLayout + "\n") <= BleMaxSingleNotifyUtf8Bytes)
+            {
+                await BroadcastToAllPlayers(inlineLayout);
+            }
             else
             {
                 await BroadcastToAllPlayers("START_MSG");
-                for (int i = 0; i < fullLayoutJson.Length; i += chunkSize)
+                for (int i = 0; i < fullLayoutJson.Length; i += BleLayoutChunkCharSize)
                 {
-                    var len = Math.Min(chunkSize, fullLayoutJson.Length - i);
+                    var len = Math.Min(BleLayoutChunkCharSize, fullLayoutJson.Length - i);
                     var chunk = fullLayoutJson.Substring(i, len);
                     await BroadcastToAllPlayers($"CHUNK:{chunk}");
-                    await Task.Delay(delayMs);
+                    await Task.Delay(BleLayoutChunkDelayMs);
                 }
                 await BroadcastToAllPlayers("END_MSG");
             }
@@ -1017,7 +1059,7 @@ namespace BleServer
         }
         protected override void OnOpen()
         {
-            Console.WriteLine("[WS] Cocos Creator client connected. Disabling ViGEmBus.");
+            Console.WriteLine("[WS] websocket client connected. Disabling ViGEmBus.");
             Program.IsVigemEnabled = false;
             lock (Program._wsLock)
             {
@@ -1028,7 +1070,7 @@ namespace BleServer
 
         protected override void OnClose(WebSocketSharp.CloseEventArgs e)
         {
-            Console.WriteLine("[WS] Cocos Creator client disconnected. Re-enabling ViGEmBus.");
+            Console.WriteLine("[WS] websocket client disconnected. Re-enabling ViGEmBus.");
             lock (Program._wsLock)
             {
                 Program.wsSessions.Remove(Context.WebSocket);
@@ -1115,6 +1157,24 @@ namespace BleServer
         }
     }
 
+    internal static class NativeInput
+    {
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+
+        private const byte VK_LWIN = 0x5B;
+        private const byte VK_SNAPSHOT = 0x2C;
+        private const uint KEYEVENTF_KEYUP = 0x02;
+
+        public static void TriggerWinPrintScreen()
+        {
+            keybd_event(VK_LWIN, 0, 0, 0);
+            keybd_event(VK_SNAPSHOT, 0, 0, 0);
+            keybd_event(VK_SNAPSHOT, 0, KEYEVENTF_KEYUP, 0);
+            keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+        }
+    }
+
     public class PlayerSession
     {
         public int PlayerId { get; set; }
@@ -1129,16 +1189,44 @@ namespace BleServer
 
             try
             {
+                if (message.StartsWith("LAYOUT:", StringComparison.Ordinal))
+                {
+                    var json = message.Substring(7);
+                    var inline = message + "\n";
+                    if (Encoding.UTF8.GetByteCount(inline) > Program.BleMaxSingleNotifyUtf8Bytes)
+                    {
+                        await SendLayoutJsonChunkedAsync(json, notifyChar);
+                        return;
+                    }
+                }
+
                 var writer = new DataWriter();
                 writer.WriteString(message + "\n");
-                // Use the specific client stored in this session
                 await notifyChar.NotifyValueAsync(writer.DetachBuffer(), Client);
-                // Console.WriteLine($"[PC] → Sent to Player {PlayerId}: {message}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[PC] Failed to send to Player {PlayerId}: {ex.Message}");
             }
+        }
+
+        async Task SendLayoutJsonChunkedAsync(string layoutJson, GattLocalCharacteristic notifyChar)
+        {
+            await SendNotifyLineAsync("START_MSG", notifyChar);
+            for (int i = 0; i < layoutJson.Length; i += Program.BleLayoutChunkCharSize)
+            {
+                var len = Math.Min(Program.BleLayoutChunkCharSize, layoutJson.Length - i);
+                await SendNotifyLineAsync($"CHUNK:{layoutJson.Substring(i, len)}", notifyChar);
+                await Task.Delay(Program.BleLayoutChunkDelayMs);
+            }
+            await SendNotifyLineAsync("END_MSG", notifyChar);
+        }
+
+        async Task SendNotifyLineAsync(string message, GattLocalCharacteristic notifyChar)
+        {
+            var writer = new DataWriter();
+            writer.WriteString(message + "\n");
+            await notifyChar.NotifyValueAsync(writer.DetachBuffer(), Client);
         }
     }
 }

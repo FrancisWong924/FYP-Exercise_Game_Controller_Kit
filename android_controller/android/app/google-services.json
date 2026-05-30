@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "587541945267",
+    "project_id": "exersync-kit",
+    "storage_bucket": "exersync-kit.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:587541945267:android:f82367ed9fd9bf58b789c6",
+        "android_client_info": {
+          "package_name": "com.example.android_controller"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC11PIXtRLlyZHKNGZFPupcl3yqsSkSiKg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -6,6 +6,8 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'bluetooth_connection.dart';
 import 'simulated_gpx_generator.dart';
+import 'exercise_start_map_picker.dart';
+import 'package:latlong2/latlong.dart';
 import 'models/controller_element.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
@@ -66,6 +68,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   DateTime? lastLayoutChunkTime;
   Timer? layoutWatchdog;
 
+  static const String _kExerciseMapPickLat = 'exercise_map_pick_lat';
+  static const String _kExerciseMapPickLon = 'exercise_map_pick_lon';
+
   static String defaultKey = "Default_Layout";
   ControllerLayout? defaultLayout;
   ControllerLayout? currentLayout;
@@ -80,6 +85,8 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   ControllerLayout? editLayoutCopy;
   ControllerElement? selectedElement;
   double lastSentStepValue = 0.0;
+  double resizeGridSize = 8;
+  final TextEditingController _resizeGridSizeController = TextEditingController(text: '8');
 
   bool _gpxExerciseRecording = false;
   StreamSubscription<StepCount>? _gpxPedometerSub;
@@ -95,17 +102,17 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     "LEFT": 1 << 2,
     "RIGHT": 1 << 3,
     "START": 1 << 4,
-    "SELECT": 1 << 5,
-    "L1": 1 << 6,
-    "R1": 1 << 7,
-    "L2": 1 << 8,
-    "R2": 1 << 9,
-    "L3": 1 << 10,
-    "R3": 1 << 11,
-    "CROSS / A": 1 << 12,
-    "CIRCLE / B": 1 << 13,
-    "SQUARE / X": 1 << 14,
-    "TRIANGLE / Y": 1 << 15,
+    "BACK": 1 << 5,
+    "LS": 1 << 6,
+    "RS": 1 << 7,
+    "LB": 1 << 8,
+    "RB": 1 << 9,
+    "LT": 1 << 10,
+    "RT": 1 << 11,
+    "A": 1 << 12,
+    "B": 1 << 13,
+    "X": 1 << 14,
+    "Y": 1 << 15,
   };
 
   @override
@@ -126,6 +133,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     accelSubscription?.cancel();
     _gpxPedometerSub?.cancel();
     stepTimer?.cancel();
+    _resizeGridSizeController.dispose();
     bleManager.stopInputSending();
     bleManager.dispose();
     super.dispose();
@@ -510,32 +518,33 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
       }
     }
 
-    var locPerm = await Geolocator.checkPermission();
-    if (locPerm == LocationPermission.denied) {
-      locPerm = await Geolocator.requestPermission();
-    }
-    if (locPerm == LocationPermission.denied || locPerm == LocationPermission.deniedForever) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Location permission is required for the GPX start point.')),
-      );
-      return;
-    }
-
-    late Position pos;
-    try {
-      pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
-      ).timeout(const Duration(seconds: 25));
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not get GPS fix: $e')),
-      );
-      return;
+    final lastLat = prefs.getDouble(_kExerciseMapPickLat);
+    final lastLon = prefs.getDouble(_kExerciseMapPickLon);
+    LatLng initialCenter = lastLat != null && lastLon != null
+        ? LatLng(lastLat, lastLon)
+        : LatLng(SimulatedGpxGenerator.defaultLat, SimulatedGpxGenerator.defaultLon);
+    if (lastLat == null || lastLon == null) {
+      try {
+        var locPerm = await Geolocator.checkPermission();
+        if (locPerm == LocationPermission.denied) {
+          locPerm = await Geolocator.requestPermission();
+        }
+        if (locPerm != LocationPermission.denied &&
+            locPerm != LocationPermission.deniedForever) {
+          final pos = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
+          ).timeout(const Duration(seconds: 8));
+          initialCenter = LatLng(pos.latitude, pos.longitude);
+        }
+      } catch (_) {}
     }
 
     if (!mounted) return;
+    final picked = await showExerciseStartMapPicker(context, initialCenter: initialCenter);
+    if (picked == null || !mounted) return;
+
+    await prefs.setDouble(_kExerciseMapPickLat, picked.latitude);
+    await prefs.setDouble(_kExerciseMapPickLon, picked.longitude);
 
     late StepCount firstStep;
     try {
@@ -553,8 +562,8 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     await _gpxPedometerSub?.cancel();
     _gpxStepBaseline = firstStep.steps;
     _gpxLastPedometerSteps = firstStep.steps;
-    _gpxSessionStartLat = pos.latitude;
-    _gpxSessionStartLon = pos.longitude;
+    _gpxSessionStartLat = picked.latitude;
+    _gpxSessionStartLon = picked.longitude;
     _gpxRecordingStartedAtUtc = DateTime.now().toUtc();
     _gpxExerciseRecording = true;
     _gpxPedometerSub = Pedometer.stepCountStream.listen((StepCount e) {
@@ -646,7 +655,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
 
   Future<void> handleFullJsonPayload(String fullJson) async {
     try {
-      final Map<String, dynamic> decoded = jsonDecode(fullJson);
+      String payload = fullJson.trim();
+      if (payload.startsWith("LAYOUT:")) {
+        payload = payload.replaceFirst("LAYOUT:", "");
+      }
+      final Map<String, dynamic> decoded = jsonDecode(payload);
       String gameId = decoded['gameId'];
       int version = decoded['version'];
       
@@ -740,13 +753,48 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           size: 55,
         ),
         ControllerElement(
+          id: "l1",
+          type: ControllerElementType.button,
+          position: Offset(0.21, 0.09),
+          label: "LB",
+          size: 44,
+          buttonId: 1 << 8,
+          buttonShape: ButtonShape.rectangle,
+        ),
+        ControllerElement(
+          id: "r1",
+          type: ControllerElementType.button,
+          position: Offset(0.79, 0.09),
+          label: "RB",
+          size: 44,
+          buttonId: 1 << 9,
+          buttonShape: ButtonShape.rectangle,
+        ),
+        ControllerElement(
+          id: "l2",
+          type: ControllerElementType.button,
+          position: Offset(0.085, 0.09),
+          label: "LT",
+          size: 44,
+          buttonId: 1 << 10,
+          buttonShape: ButtonShape.rectangle,
+        ),
+        ControllerElement(
+          id: "r2",
+          type: ControllerElementType.button,
+          position: Offset(0.915, 0.09),
+          label: "RT",
+          size: 44,
+          buttonId: 1 << 11,
+          buttonShape: ButtonShape.rectangle,
+        ),
+        ControllerElement(
           id: ControllerId.buttonSquare.name,
           type: ControllerElementType.button,
           position: Offset(0.804, 0.499),
           size: 65,
           buttonId: 1 << 14,
-          label: "square",
-          useSystemIcon: "square",
+          label: "X",
         ),
         ControllerElement(
           id: ControllerId.buttonCross.name,
@@ -754,8 +802,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           position: Offset(0.87, 0.642),
           size: 65,
           buttonId: 1 << 12,
-          label: "cross",
-          useSystemIcon: "cross",
+          label: "A",
         ),
         ControllerElement(
           id: ControllerId.buttonCircle.name,
@@ -763,8 +810,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           position: Offset(0.935, 0.499),
           size: 65,
           buttonId: 1 << 13,
-          label: "circle",
-          useSystemIcon: "circle",
+          label: "B",
         ),
         ControllerElement(
           id: ControllerId.buttonTriangle.name,
@@ -772,8 +818,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           position: Offset(0.87, 0.358),
           size: 65,
           buttonId: 1 << 15,
-          label: "triangle",
-          useSystemIcon: "triangle",
+          label: "Y",
         ),
         ControllerElement(
           id: ControllerId.buttonUp.name,
@@ -1067,7 +1112,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           // Use minWidth and maxWidth as the same value to "lock" the size
           minWidth: toolbarWidth,
           maxWidth: toolbarWidth, 
-          maxHeight: 130,
+          maxHeight: 145,
         ),
         child: Card(
           color: Color(0xFF1A1A1A),
@@ -1130,46 +1175,49 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                         ],
                       ),
                       const SizedBox(height: 8),
-                      // Size slider
                       Container(
                         width: double.infinity,
                         constraints: const BoxConstraints(minHeight: 48),
                         padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.05), // Darker subtle background
+                          color: Colors.white.withOpacity(0.05),
                           borderRadius: BorderRadius.circular(4),
                         ),
-                        child: selectedElement == null
-                            ? const Center(
-                                child: Text(
-                                  "No Element Selected",
-                                  style: TextStyle(color: Colors.white38, fontSize: 10, fontStyle: FontStyle.italic),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              "Resize snap step (0 = off)",
+                              style: TextStyle(color: Colors.blueAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 4),
+                            TextField(
+                              controller: _resizeGridSizeController,
+                              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                              style: const TextStyle(color: Colors.white, fontSize: 12),
+                              decoration: InputDecoration(
+                                isDense: true,
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                                filled: true,
+                                fillColor: Colors.black26,
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(4),
+                                  borderSide: const BorderSide(color: Color(0xFF505050)),
                                 ),
-                              )
-                            : Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    "Size: ${selectedElement!.size.toInt()}",
-                                    style: const TextStyle(color: Colors.blueAccent, fontSize: 12, fontWeight: FontWeight.bold),
-                                  ),
-                                  SliderTheme(
-                                    data: SliderTheme.of(context).copyWith(
-                                      trackHeight: 2,
-                                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
-                                    ),
-                                    child: Slider(
-                                      value: selectedElement!.size,
-                                      min: 40,
-                                      max: 100,
-                                      activeColor: Colors.blueAccent,
-                                      inactiveColor: Colors.white10,
-                                      onChanged: (val) => setState(() => selectedElement!.size = val),
-                                    ),
-                                  ),
-                                ],
+                                enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(4),
+                                  borderSide: const BorderSide(color: Color(0xFF505050)),
+                                ),
                               ),
+                              onChanged: (value) {
+                                final parsed = double.tryParse(value.trim());
+                                if (parsed != null && parsed >= 0) {
+                                  setState(() => resizeGridSize = parsed);
+                                }
+                              },
+                            ),
+                          ],
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Row(
@@ -1765,7 +1813,14 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                         element: element,
                         isEditing: isEditing,
                         isSelected: isSelected,
+                        resizeGridSize: resizeGridSize,
                         onSelect: () => setState(() => selectedElement = element),
+                        onSizeChanged: (newSize) => setState(() {
+                          final selected = selectedElement;
+                          if (selected != null && selected.id == element.id) {
+                            selected.size = newSize;
+                          }
+                        }),
                         onPressed: (id, pressed) {
                           // send button press/release to PC
                           if (!isEditing) {
@@ -1781,7 +1836,14 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                         deadzone: 0.20,
                         isEditing: isEditing,
                         isSelected: isSelected,
+                        resizeGridSize: resizeGridSize,
                         onSelect: () => setState(() => selectedElement = element),
+                        onSizeChanged: (newSize) => setState(() {
+                          final selected = selectedElement;
+                          if (selected != null && selected.id == element.id) {
+                            selected.size = newSize;
+                          }
+                        }),
                         onChange: (id, x, y) {
                           if (!isEditing) {
                             final type = element.joystickType ?? "left";

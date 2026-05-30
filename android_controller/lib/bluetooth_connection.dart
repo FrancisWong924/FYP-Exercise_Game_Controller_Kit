@@ -52,7 +52,17 @@ class BleManager {
 
   int _lastSentSequence = 0;
   Uint8List? _lastSentPacket;
+  int _lastSentButtons = -1;
+  DateTime? _lastButtonHoldResendTime;
   bool _isPausedForLargeData = false;
+
+  static const double _joystickNeutralEpsilon = 0.001;
+  /// Hold refresh while a button stays down (joysticks neutral) — avoids menu double-fires at 60 Hz.
+  static const Duration _buttonHoldResendInterval = Duration(milliseconds: 200);
+
+  /// Matches <c>buttonBitmasks</c> in main.dart — sent as analog bytes 2–3, not in the 16-bit mask.
+  static const int _bitLt = 1 << 10;
+  static const int _bitRt = 1 << 11;
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
@@ -381,9 +391,18 @@ class BleManager {
 
     final packet = Uint8List(16);
     final bd = packet.buffer.asByteData();
+    final bool isLtPressed = (currentButtons & _bitLt) != 0;
+    final bool isRtPressed = (currentButtons & _bitRt) != 0;
+    final int leftTriggerValue = isLtPressed ? 255 : 0;
+    final int rightTriggerValue = isRtPressed ? 255 : 0;
+    final int buttonsMask = currentButtons & ~(_bitLt | _bitRt);
 
-    // Bytes 0–3: Buttons (32 little-endian
-    bd.setUint16(0, currentButtons, Endian.little);
+    // Bytes 0–1: Buttons (16-bit mask; LT/RT use bytes 2–3)
+    bd.setUint16(0, buttonsMask, Endian.little);
+    
+    // Bytes 2–3: Triggers (2 × Uint8)
+    bd.setUint8(2, leftTriggerValue);  // Byte 2: Left Trigger
+    bd.setUint8(3, rightTriggerValue); // Byte 3: Right Trigger
 
     // Bytes 4–11: Joysticks (4 × Int16)
     bd.setInt16(4, (currentJoy.joyLX * 32767).round(), Endian.little);
@@ -391,26 +410,11 @@ class BleManager {
     bd.setInt16(8, (currentJoy.joyRX * 32767).round(), Endian.little);
     bd.setInt16(10, (currentJoy.joyRY * 32767).round(), Endian.little);
 
-    // Bytes 12–13: Steering (Int16)
-    // bd.setInt16(12, (currentSteering * 32767).round(), Endian.little);
-
-    // Bytes 14–15: NEW Step Variable
-    // bd.setInt16(14, (currentStep * 32767).round(), Endian.little);
-
-    bool isNeutral = currentButtons == 0 &&
-      currentJoy.joyLX.abs() < 0.001 &&
-      currentJoy.joyLY.abs() < 0.001 &&
-      currentJoy.joyRX.abs() < 0.001 &&
-      currentJoy.joyRY.abs() < 0.001;
-    bool stateChanged = _lastSentPacket == null || !_arePacketsEqual(_lastSentPacket!, packet);
-    if (isNeutral && !stateChanged) {
-      if (_lastSentSequence > 2) {
-        return;
-      }
-      _lastSentSequence++;
-    } else {
-      _lastSentSequence = 0;
+    if (!_shouldTransmitPacket(packet)) {
+      return;
     }
+
+    _lastSentButtons = currentButtons;
     _lastSentPacket = Uint8List.fromList(packet);
     try {
       if (pcDevice!.isConnected) {
@@ -440,8 +444,76 @@ class BleManager {
     return true;
   }
 
+  bool _areJoysticksNeutral() {
+    return currentJoy.joyLX.abs() < _joystickNeutralEpsilon &&
+        currentJoy.joyLY.abs() < _joystickNeutralEpsilon &&
+        currentJoy.joyRX.abs() < _joystickNeutralEpsilon &&
+        currentJoy.joyRY.abs() < _joystickNeutralEpsilon;
+  }
+
+  bool _joystickSliceChanged(Uint8List packet) {
+    final prev = _lastSentPacket;
+    if (prev == null || prev.length < 12 || packet.length < 12) return true;
+    for (var i = 4; i <= 10; i += 2) {
+      if (packet[i] != prev[i] || packet[i + 1] != prev[i + 1]) return true;
+    }
+    return false;
+  }
+
+  bool _buttonHoldResendDue() {
+    final now = DateTime.now();
+    if (_lastButtonHoldResendTime == null ||
+        now.difference(_lastButtonHoldResendTime!) >= _buttonHoldResendInterval) {
+      _lastButtonHoldResendTime = now;
+      return true;
+    }
+    return false;
+  }
+
+  /// Press/release sends immediately; steady hold resends at ~10 Hz; joysticks stay at 60 Hz when moving.
+  bool _shouldTransmitPacket(Uint8List packet) {
+    final buttonsChanged = currentButtons != _lastSentButtons;
+    if (buttonsChanged) {
+      _lastButtonHoldResendTime = DateTime.now();
+      _lastSentSequence = 0;
+      return true;
+    }
+
+    final joysticksNeutral = _areJoysticksNeutral();
+
+    if (!joysticksNeutral) {
+        _lastSentSequence = 0;
+        return true;
+    }
+
+    if (currentButtons != 0) {
+      if (_buttonHoldResendDue()) {
+        _lastSentSequence = 0;
+        return true;
+      }
+      return false;
+    }
+
+    final stateChanged = _lastSentPacket == null || !_arePacketsEqual(_lastSentPacket!, packet);
+    if (!stateChanged) {
+      if (_lastSentSequence > 2) return false;
+      _lastSentSequence++;
+      return true;
+    }
+    _lastSentSequence = 0;
+    return true;
+  }
+
+  void _resetInputSendState() {
+    _lastSentSequence = 0;
+    _lastSentPacket = null;
+    _lastSentButtons = -1;
+    _lastButtonHoldResendTime = null;
+  }
+
   void startInputSending() {
     print("[BLE] 60Hz input loop started");
+    _resetInputSendState();
     _inputTimer?.cancel();
     _inputTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
       if (inputCharacteristic != null) {
@@ -452,7 +524,7 @@ class BleManager {
 
   void setInputPause(bool pause) {
     _isPausedForLargeData = pause;
-    _lastSentSequence = 0;
+    _resetInputSendState();
     if (pause) {
       print("[BLE] Input loop throttled for incoming data...");
     } else {
@@ -464,6 +536,7 @@ class BleManager {
   void stopInputSending() {
     _inputTimer?.cancel();
     _inputTimer = null;
+    _resetInputSendState();
   }
 
   Future<void> disconnect() async {
