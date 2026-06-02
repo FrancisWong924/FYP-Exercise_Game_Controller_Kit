@@ -5,7 +5,8 @@
         Title="Controller layout creator"
         Width="1100" Height="720"
         MinWidth="900" MinHeight="560"
-        Background="#FF1E1E1E">
+        Background="#FF1E1E1E"
+        PreviewKeyDown="LayoutCreatorWindow_OnPreviewKeyDown">
     <Grid Margin="16">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>

@@ -9,6 +9,7 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -928,16 +929,25 @@ public partial class LayoutCreatorWindow : Window
         SetSelectedElement(added);
     }
 
-    void RemoveSelected_OnClick(object sender, RoutedEventArgs e)
+    void RemoveSelected_OnClick(object sender, RoutedEventArgs e) => RemoveSelectedElement();
+
+    void RemoveSelectedElement()
     {
         if (_selectedElement is not LayoutElementModel m)
             return;
-        var index = _elements.IndexOf(m);
         _elements.Remove(m);
-        if (_elements.Count == 0)
-            SetSelectedElement(null);
-        else
-            SetSelectedElement(_elements[Math.Clamp(index, 0, _elements.Count - 1)]);
+        SetSelectedElement(null);
+    }
+
+    void LayoutCreatorWindow_OnPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Back || _selectedElement is null)
+            return;
+        if (Keyboard.FocusedElement is TextBoxBase)
+            return;
+
+        e.Handled = true;
+        RemoveSelectedElement();
     }
 
     void ExportJson_OnClick(object sender, RoutedEventArgs e)
