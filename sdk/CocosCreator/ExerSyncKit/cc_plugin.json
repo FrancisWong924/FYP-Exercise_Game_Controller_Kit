@@ -1,0 +1,14 @@
+{
+    "name": "ExerSyncKit",
+    "version": "1.0.0",
+    "author": "FrancisWong",
+    "description": "ExerSyncKit Bridge for Windows",
+    "engine-version": ">=3.6.0",
+    "disabled": false,
+    "platforms": ["windows"],
+    "modules": [
+        {
+            "target": "ExerSyncKit_glue"
+        }
+    ]
+}

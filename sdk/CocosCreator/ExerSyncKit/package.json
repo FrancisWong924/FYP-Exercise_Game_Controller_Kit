@@ -1,0 +1,20 @@
+{
+    "name": "exersynckit",
+    "version": "1.0.0",
+    "package_version": 2,
+    "author": "FrancisWong",
+    "description": "ExerSyncKit Bridge for Windows",
+    "editor": ">=3.8.0",
+    "contributions": {
+        "asset-db": {
+            "mount": {
+                "path": "./assets",
+                "name": "exersynckit"
+            }
+        }
+    },
+    "scripts": {
+        "build": "tsc -b",
+        "watch": "tsc -w"
+    }
+}

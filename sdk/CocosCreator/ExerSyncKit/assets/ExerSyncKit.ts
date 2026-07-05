@@ -2,6 +2,10 @@ import { Color, native, sys } from 'cc';
 import { JSB } from 'cc/env';
 
 declare const GetCurrentProcessId: () => number;
+declare const launchExternalExe: (cmd: string) => boolean;
+declare const closeExternalExe: () => boolean;
+declare const isExternalExeAlive: () => boolean;
+declare const getGamePid: () => number;
 
 export interface InputState {
     PlayerId: number;
@@ -13,27 +17,55 @@ export interface InputState {
 }
 
 export const DefaultButtonMasks = {
-    Cross: 1 << 12,
-    Circle: 1 << 13,
-    Square: 1 << 14,
-    Triangle: 1 << 15,
-    Up: 1 << 0,
-    Down: 1 << 1,
-    Left: 1 << 2,
-    Right: 1 << 3,
+    UP: 1 << 0,
+    DOWN: 1 << 1,
+    LEFT: 1 << 2,
+    RIGHT: 1 << 3,
+    START: 1 << 4,
+    BACK: 1 << 5,
+    LS: 1 << 6,
+    RS: 1 << 7,
+    LB: 1 << 8,
+    RB: 1 << 9,
+    LT: 1 << 10,
+    RT: 1 << 11,
+    A: 1 << 12,
+    B: 1 << 13,
+    X: 1 << 14,
+    Y: 1 << 15,
 };
 
 export type ControllerServerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'cooldown';
 
-export class ControllerInput {
-    private serverName: string = "Server.Ble.exe";
+export interface GeotagImageExportResult {
+    success: boolean;
+    exportPath: string;
+    error: string;
+}
+
+export interface ExerSyncKitEnableOptions {
+    gameId: string;
+    version?: number;
+    layoutData?: any;
+    onStateChanged?: (state: ControllerServerState, remainingCooldownMs?: number) => void;
+    onConnected?: () => void;
+    onDisconnected?: () => void;
+    onServerUnavailable?: (reason: string) => void;
+    onControllerConnected?: (playerId: number) => void;
+    onControllerDisconnected?: (playerId: number) => void;
+    onPause?: () => void;
+    onResume?: () => void;
+    onInput?: (playerId: number, state: InputState) => void;
+}
+
+export class ExerSyncKit {
+    private serverName: string = "ExerSyncKitServer.exe";
     private socket: WebSocket | null = null;
     private buffer: string = '';
     /** BLE stack needs a short cool-down after shutdown before relaunch is stable. Shared across instances. */
     private static readonly minRestartDelayMs = 5000;
     private static cooldownUntilMs = 0;
 
-    public onInput: ((playerId: number, state: InputState) => void) | null = null;
     public onPause: (() => void) | null = null;
     public onResume: (() => void) | null = null;
     public onConnected: (() => void) | null = null;
@@ -45,6 +77,8 @@ export class ControllerInput {
     public onCooldown: ((remainingMs: number) => void) | null = null;
     /** Fired when server lifecycle state changes. */
     public onStateChanged: ((state: ControllerServerState, remainingCooldownMs?: number) => void) | null = null;
+    public onServerUnavailable: ((reason: string) => void) | null = null;
+    public onInput: ((playerId: number, state: InputState) => void) | null = null;
     public connectedConrollers: number[] = [];
 
     /** WebSocket has opened at least once this session. */
@@ -65,6 +99,19 @@ export class ControllerInput {
     private currentTransferId: number = 0;
     private lifecycleState: ControllerServerState = 'stopped';
     private cooldownTimer: ReturnType<typeof setTimeout> | null = null;
+    private pendingStepResolve: ((value: number) => void) | null = null;
+    private pendingStepRequestId: string | null = null;
+    private pendingGeotagResolve: ((value: GeotagImageExportResult) => void) | null = null;
+    private pendingGeotagRequestId: string | null = null;
+    private boundOnStateChanged: ExerSyncKitEnableOptions['onStateChanged'] | null = null;
+    private boundOnConnected: ExerSyncKitEnableOptions['onConnected'] | null = null;
+    private boundOnDisconnected: ExerSyncKitEnableOptions['onDisconnected'] | null = null;
+    private boundOnServerUnavailable: ExerSyncKitEnableOptions['onServerUnavailable'] | null = null;
+    private boundOnControllerConnected: ExerSyncKitEnableOptions['onControllerConnected'] | null = null;
+    private boundOnControllerDisconnected: ExerSyncKitEnableOptions['onControllerDisconnected'] | null = null;
+    private boundOnPause: ExerSyncKitEnableOptions['onPause'] | null = null;
+    private boundOnResume: ExerSyncKitEnableOptions['onResume'] | null = null;
+    private boundOnInput: ExerSyncKitEnableOptions['onInput'] | null = null;
 
     private setState(state: ControllerServerState, remainingCooldownMs?: number) {
         if (this.lifecycleState === state) return;
@@ -73,7 +120,7 @@ export class ControllerInput {
     }
 
     public getRemainingCooldownMs(): number {
-        return Math.max(0, ControllerInput.cooldownUntilMs - Date.now());
+        return Math.max(0, ExerSyncKit.cooldownUntilMs - Date.now());
     }
 
     public getState(): ControllerServerState {
@@ -84,8 +131,131 @@ export class ControllerInput {
         return this.getRemainingCooldownMs() > 0;
     }
 
+    private bindOptionsCallbacks(options: ExerSyncKitEnableOptions) {
+        this.unbindOptionsCallbacks();
+        if (options.onStateChanged) {
+            this.boundOnStateChanged = options.onStateChanged;
+            this.onStateChanged = this.boundOnStateChanged;
+        }
+        if (options.onConnected) {
+            this.boundOnConnected = options.onConnected;
+            this.onConnected = this.boundOnConnected;
+        }
+        if (options.onDisconnected) {
+            this.boundOnDisconnected = options.onDisconnected;
+            this.onDisconnected = this.boundOnDisconnected;
+        }
+        if (options.onServerUnavailable) {
+            this.boundOnServerUnavailable = options.onServerUnavailable;
+            this.onServerUnavailable = this.boundOnServerUnavailable;
+        }
+        if (options.onControllerConnected) {
+            this.boundOnControllerConnected = options.onControllerConnected;
+            this.onControllerConnected = this.boundOnControllerConnected;
+        }
+        if (options.onControllerDisconnected) {
+            this.boundOnControllerDisconnected = options.onControllerDisconnected;
+            this.onControllerDisconnected = this.boundOnControllerDisconnected;
+        }
+        if (options.onPause) {
+            this.boundOnPause = options.onPause;
+            this.onPause = this.boundOnPause;
+        }
+        if (options.onResume) {
+            this.boundOnResume = options.onResume;
+            this.onResume = this.boundOnResume;
+        }
+        if (options.onInput) {
+            this.boundOnInput = options.onInput;
+            this.onInput = this.boundOnInput;
+        }
+    }
+
+    private unbindOptionsCallbacks() {
+        if (this.boundOnStateChanged) {
+            this.onStateChanged = null;
+            this.boundOnStateChanged = null;
+        }
+        if (this.boundOnConnected) {
+            this.onConnected = null;
+            this.boundOnConnected = null;
+        }
+        if (this.boundOnDisconnected) {
+            this.onDisconnected = null;
+            this.boundOnDisconnected = null;
+        }
+        if (this.boundOnServerUnavailable) {
+            this.onServerUnavailable = null;
+            this.boundOnServerUnavailable = null;
+        }
+        if (this.boundOnControllerConnected) {
+            this.onControllerConnected = null;
+            this.boundOnControllerConnected = null;
+        }
+        if (this.boundOnControllerDisconnected) {
+            this.onControllerDisconnected = null;
+            this.boundOnControllerDisconnected = null;
+        }
+        if (this.boundOnPause) {
+            this.onPause = null;
+            this.boundOnPause = null;
+        }
+        if (this.boundOnResume) {
+            this.onResume = null;
+            this.boundOnResume = null;
+        }
+        if (this.boundOnInput) {
+            this.onInput = null;
+            this.boundOnInput = null;
+        }
+    }
+
+    public async enableAsync(options: ExerSyncKitEnableOptions): Promise<boolean> {
+        if (!options?.gameId) {
+            throw new Error('gameId is required to enable the ExerSyncKit.');
+        }
+
+        this.bindOptionsCallbacks(options);
+
+        if (this.lifecycleState === 'running' || this.lifecycleState === 'starting') {
+            return true;
+        }
+
+        const started = this.launchServer();
+        if (!started) {
+            const cooldownMs = this.getRemainingCooldownMs();
+            if (cooldownMs > 0) {
+                this.onCooldown?.(cooldownMs);
+            }
+            this.unbindOptionsCallbacks();
+            return false;
+        }
+
+        this.connect(options.gameId, options.version ?? 1, options.layoutData ?? null);
+        return true;
+    }
+
+    private isServerStillRunning(): boolean {
+        if (typeof isExternalExeAlive !== 'undefined') {
+            try {
+                return isExternalExeAlive();
+            } catch {
+                return this.processLaunchOk;
+            }
+        }
+        return this.processLaunchOk;
+    }
+
+    private notifyServerUnavailable(reason: string) {
+        if (this.isManualDisconnect) return;
+        this.processLaunchOk = false;
+        this.serverStarted = false;
+        console.warn(`[ExerSyncKit] Server unavailable. ${reason}`);
+        this.onServerUnavailable?.(reason);
+    }
+
     private startRestartCooldown() {
-        ControllerInput.cooldownUntilMs = Date.now() + ControllerInput.minRestartDelayMs;
+        ExerSyncKit.cooldownUntilMs = Date.now() + ExerSyncKit.minRestartDelayMs;
         const remaining = this.getRemainingCooldownMs();
         this.onCooldown?.(remaining);
         this.setState('cooldown', remaining);
@@ -103,17 +273,17 @@ export class ControllerInput {
 
     public launchServer(): boolean {
         if (this.lifecycleState === 'starting' || this.lifecycleState === 'running') {
-            console.log(`[SDK] launchServer ignored: server is already ${this.lifecycleState}.`);
+            console.log(`[ExerSyncKit] launchServer ignored: server is already ${this.lifecycleState}.`);
             return true;
         }
         if (this.lifecycleState === 'stopping') {
-            console.warn('[SDK] launchServer ignored: server is currently stopping.');
+            console.warn('[ExerSyncKit] launchServer ignored: server is currently stopping.');
             return false;
         }
         const cooldownMs = this.getRemainingCooldownMs();
         if (cooldownMs > 0) {
             const sec = (cooldownMs / 1000).toFixed(1);
-            console.warn(`[SDK] Launch blocked by cool-down (${sec}s left). This avoids rapid BLE restart failures.`);
+            console.warn(`[ExerSyncKit] Launch blocked by cool-down (${sec}s left).`);
             this.onCooldown?.(cooldownMs);
             this.setState('cooldown', cooldownMs);
             this.processLaunchOk = false;
@@ -122,44 +292,40 @@ export class ControllerInput {
         this.setState('starting');
         if (sys.isNative && sys.os === sys.OS.WINDOWS) {
             try {
-                const rootPath = native.fileUtils.getDefaultResourceRootPath();
-                const fullPath = (rootPath + this.serverName).replace(/\//g, "\\");
+                // const rootPath = native.fileUtils.getDefaultResourceRootPath();
+                // const fullPath = (rootPath + this.serverName).replace(/\//g, "\\");
                 
-                const gamePid = (window as any).getGamePid ? (window as any).getGamePid() : 0;
-                const commandLine = `"${fullPath}" ${gamePid}`;
+                const gamePid = typeof getGamePid !== 'undefined' ? getGamePid() : 0;
+                const commandLine = `"${this.serverName}" ${gamePid} --no-activate`;
 
-                console.log("[SDK] Attempting to launch server:", commandLine);
+                console.log("[ExerSyncKit] Attempting to launch server:", commandLine);
 
                 // Trigger the C++ bridge
-                if ((window as any).launchExternalExe) {
-                    const didStart = (window as any).launchExternalExe(commandLine);
+                if (typeof launchExternalExe !== 'undefined') {
+                    const didStart = launchExternalExe(commandLine);
 
                     if (didStart) {
-                        console.log("[SDK] Server process launched and still running (native check passed).");
+                        console.log("[ExerSyncKit] Server process launched and still running.");
                         this.processLaunchOk = true;
                         this.setState('running');
                     } else {
-                        console.error(
-                            "[SDK] Server did not stay running. Check: (1) Server.Ble.exe exists next to game data, " +
-                            "(2) run it manually from that folder to see errors, (3) rebuild native ble_controller after C++ changes."
-                        );
-                        console.error("[SDK] Intended path:", fullPath);
+                        console.error("[ExerSyncKit] Server did not stay running. Check if ExerSyncKitServer.exe exists in your build output folder.");
                         this.processLaunchOk = false;
                         this.setState('stopped');
                     }
                     return didStart;
                 } else {
-                    console.error("[SDK] launchExternalExe not found! Is the C++ bridge linked?");
+                    console.error("[ExerSyncKit] launchExternalExe not found! Is the C++ bridge linked?");
                     this.setState('stopped');
                     return false;
                 }
             } catch (e) {
-                console.error("[SDK] Failed to launch server:", e);
+                console.error("[ExerSyncKit] Failed to launch server:", e);
                 this.setState('stopped');
                 return false;
             }
         } else {
-            console.warn("[SDK] launchServer ignored: Not running on Native Windows.");
+            console.warn("[ExerSyncKit] launchServer ignored: Not running on Native Windows.");
             this.processLaunchOk = false;
             this.setState('stopped');
             return false;
@@ -181,7 +347,7 @@ export class ControllerInput {
         const cooldownMs = this.getRemainingCooldownMs();
         if (cooldownMs > 0) {
             const sec = (cooldownMs / 1000).toFixed(1);
-            console.warn(`[ControllerInput] connect() blocked by cooldown (${sec}s left).`);
+            console.warn(`[ExerSyncKit] connect() blocked by cooldown (${sec}s left).`);
             this.onCooldown?.(cooldownMs);
             this.setState('cooldown', cooldownMs);
             return;
@@ -212,7 +378,7 @@ export class ControllerInput {
 
     private establishConnection() {
         this.disconnect();
-        console.log(`[ControllerInput] Attempting connection to ${this.currentUrl}...`);
+        console.log(`[ExerSyncKit] Attempting connection to ${this.currentUrl}...`);
 
         try {
             // Avoid passing an empty subprotocol list; some native WebSocket stacks behave badly with `[]`.
@@ -220,14 +386,14 @@ export class ControllerInput {
             this.socket.binaryType = "arraybuffer";
 
             this.socket.onopen = () => {
-                console.log('[ControllerInput] Connected to controller server (WebSocket)');
+                console.log('[ExerSyncKit] Connected to controller server (WebSocket)');
                 this.serverStarted = true;
                 this.setState('running');
                 this.onConnected?.();
             };
 
             this.socket.onclose = (event) => {
-                console.log('[ControllerInput] Disconnected from server');
+                console.log('[ExerSyncKit] Disconnected from server');
                 console.log('   Code:', event.code);
                 console.log('   Reason:', event.reason || '(no reason)');
                 console.log('   Was clean:', event.wasClean);
@@ -238,15 +404,18 @@ export class ControllerInput {
                     this.setState('stopped');
                 }
 
-                // TRIGGER RECONNECT
                 if (!this.isManualDisconnect) {
                     this.onDisconnected?.();
-                    this.scheduleReconnect();
+                    if (this.isServerStillRunning()) {
+                        this.scheduleReconnect();
+                    } else {
+                        this.notifyServerUnavailable('Server process is not running.');
+                    }
                 }
             };
 
             this.socket.onerror = (err) => {
-                console.error('[ControllerInput] WebSocket error:', err);
+                console.error('[ExerSyncKit] WebSocket error:', err);
                 this.onError?.(err);
             };
 
@@ -263,7 +432,7 @@ export class ControllerInput {
                 this.processText(text);
             };
         } catch (e) {
-            console.error('[ControllerInput] Exception during connection:', e);
+            console.error('[ExerSyncKit] Exception during connection:', e);
         }
     }
 
@@ -293,11 +462,15 @@ export class ControllerInput {
         if (this.reconnectTimeout || this.isManualDisconnect) return;
         if (!this.serverStarted && !this.processLaunchOk) return;
 
-        console.log(`[ControllerInput] Connection lost. Retrying in 3 seconds...`);
+        console.log(`[ExerSyncKit] Connection lost. Retrying in 3 seconds...`);
         this.reconnectTimeout = setTimeout(() => {
             this.reconnectTimeout = null;
+            if (!this.isServerStillRunning()) {
+                this.notifyServerUnavailable('Server process is not running.');
+                return;
+            }
             this.establishConnection();
-        }, 3000); 
+        }, 3000);
     }
 
     private processText(text: string) {
@@ -312,16 +485,16 @@ export class ControllerInput {
                 const data = JSON.parse(line);
                 const msgType = data.Type || data.type;
                 const pId = data.PlayerId !== undefined ? data.PlayerId : (data.playerId !== undefined ? data.playerId : -1); // Get the player ID from the status message
-                console.log('[ControllerInput] Received data type:', msgType);
+                console.log('[ExerSyncKit] Received data type:', msgType);
                 // Check if this is a system status message
                 if (msgType === 'status') {
                     if (data.value === 'DISCONNECTED') {
-                        console.warn(`[SDK] Player ${pId} Lost`);
+                        console.warn(`[ExerSyncKit] Player ${pId} Lost`);
                         this.connectedConrollers = this.connectedConrollers.filter(id => id !== pId);
                         this.abortOngoingTransfer();
                         this.onControllerDisconnected?.(pId);
                     } else if (data.value === 'CONNECTED') {
-                        console.log(`[SDK] Player ${pId} Connected`);
+                        console.log(`[ExerSyncKit] Player ${pId} Connected`);
                         if (!this.connectedConrollers.includes(pId)) {
                             this.connectedConrollers.push(pId);
                         }
@@ -337,25 +510,116 @@ export class ControllerInput {
                     } else if (data.value === 'RESUME') {
                         this.onResume?.();
                     } else if (data.value === 'NEED_LAYOUT') {
-                        console.log(`[SDK] Player ${pId} needs layout. Sending...`);
+                        console.log(`[ExerSyncKit] Player ${pId} needs layout. Sending...`);
                         if (this.myPredefinedLayout) {
                             this.sendLayout(pId, this.myPredefinedLayout);
                         }
                     }
+                } else if (msgType === 'stepCount') {
+                    const value = data.value ?? data.Value ?? 0;
+                    const rid = data.requestId ?? data.RequestId;
+                    if (this.pendingStepResolve &&
+                        (!rid || rid === this.pendingStepRequestId)) {
+                        this.pendingStepResolve(value);
+                        this.pendingStepResolve = null;
+                        this.pendingStepRequestId = null;
+                    }
+                } else if (msgType === 'geotagImage') {
+                    const rid = data.requestId ?? data.RequestId;
+                    if (this.pendingGeotagResolve &&
+                        (!rid || rid === this.pendingGeotagRequestId)) {
+                        this.pendingGeotagResolve({
+                            success: data.success ?? data.Success ?? false,
+                            exportPath: data.exportPath ?? data.ExportPath ?? '',
+                            error: data.error ?? data.Error ?? '',
+                        });
+                        this.pendingGeotagResolve = null;
+                        this.pendingGeotagRequestId = null;
+                    }
                 } else if (msgType === 'input') {
-                    // Otherwise, treat it as normal InputState
-                    this.onInput?.(pId, data as InputState);
+                    const st: InputState = {
+                        PlayerId: pId,
+                        JoyLX: data.joyLX ?? data.JoyLX ?? 0,
+                        JoyLY: data.joyLY ?? data.JoyLY ?? 0,
+                        JoyRX: data.joyRX ?? data.JoyRX ?? 0,
+                        JoyRY: data.joyRY ?? data.JoyRY ?? 0,
+                        Buttons: data.buttons ?? data.Buttons ?? 0,
+                    };
+                    this.onInput?.(pId, st);
                 }
             } catch (e) {
-                console.error('[ControllerInput] JSON parse error:', e);
+                console.error('[ExerSyncKit] JSON parse error:', e);
             }
         }
     }
 
     private abortOngoingTransfer() {
-        console.log("[ControllerInput] Aborting ongoing transfer...");
+        console.log("[ExerSyncKit] Aborting ongoing transfer...");
         this.currentTransferId++; // This causes the loop's 'sessionId !== currentTransferId' check to fail
         this.isSendingLargeData = false;
+    }
+
+    public getStepCounterAsync(playerId: number = -1, timeoutMs: number = 3000): Promise<number | null> {
+        if (this.pendingStepResolve) {
+            console.warn('[ExerSyncKit] getStepCounterAsync: request already in flight.');
+            return Promise.resolve(null);
+        }
+        const reqId = Math.random().toString(36).slice(2, 10);
+        return new Promise((resolve) => {
+            this.pendingStepResolve = resolve;
+            this.pendingStepRequestId = reqId;
+            this.sendCommand(playerId, `GET_STEP_COUNT:${reqId}`);
+            setTimeout(() => {
+                if (this.pendingStepRequestId === reqId) {
+                    this.pendingStepResolve = null;
+                    this.pendingStepRequestId = null;
+                    resolve(null);
+                }
+            }, timeoutMs);
+        });
+    }
+
+    public resetStepCounter(playerId: number = -1) {
+        this.sendCommand(playerId, 'RESET_STEP_COUNT'); 
+    }
+
+    public exportGeotaggedImageAsync(
+        latitude: number,
+        longitude: number,
+        exportPath: string,
+        sourceImagePath?: string | null,
+        timeoutMs: number = 15000
+    ): Promise<GeotagImageExportResult | null> {
+        if (this.pendingGeotagResolve) {
+            console.warn('[ExerSyncKit] exportGeotaggedImageAsync: request already in flight.');
+            return Promise.resolve(null);
+        }
+        if (!exportPath?.trim()) {
+            return Promise.resolve({ success: false, exportPath: '', error: 'exportPath is required.' });
+        }
+
+        const reqId = Math.random().toString(36).slice(2, 10);
+        const payload = JSON.stringify({
+            requestId: reqId,
+            lat: latitude,
+            lon: longitude,
+            exportPath,
+            sourcePath: sourceImagePath?.trim() ? sourceImagePath.trim() : null,
+        });
+
+        return new Promise((resolve) => {
+            this.pendingGeotagResolve = resolve;
+            this.pendingGeotagRequestId = reqId;
+            this.sendCommand(-2, `GEOTAG_IMAGE:${payload}`);
+            setTimeout(() => {
+                if (this.pendingGeotagRequestId === reqId) {
+                    this.pendingGeotagResolve = null;
+                    this.pendingGeotagRequestId = null;
+                    console.warn('[ExerSyncKit] exportGeotaggedImageAsync timed out.');
+                    resolve(null);
+                }
+            }, timeoutMs);
+        });
     }
 
     public sendCommand(pId: number, command: string) {
@@ -370,18 +634,18 @@ export class ControllerInput {
             }
             this.socket.send(payload);
             if (pId === -1) {
-                console.log(`[ControllerInput] Broadcast command sent: ${command}`);
+                console.log(`[ExerSyncKit] Broadcast command sent: ${command}`);
             } else {
-                console.log(`[ControllerInput] Targeted command sent to Player ${pId}: ${command}`);
+                console.log(`[ExerSyncKit] Targeted command sent to Player ${pId}: ${command}`);
             }
         } else {
-            console.warn('[ControllerInput] Cannot send command - WebSocket not open');
+            console.warn('[ExerSyncKit] Cannot send command - WebSocket not open');
         }
     }
 
     public async sendLayout(targetPlayerId: number, layoutData: any) {
         if (this.isSendingLargeData) {
-            console.warn('[ControllerInput] Blocked sendLayout: A large transfer is already in progress.');
+            console.warn('[ExerSyncKit] Blocked sendLayout: A large transfer is already in progress.');
             return;
         }
 
@@ -390,8 +654,8 @@ export class ControllerInput {
         
         const jsonString = JSON.stringify(message);
         
-        if (new TextEncoder().encode(`LAYOUT:${jsonString}`).length > 480) {
-            console.log(`[ControllerInput] Large layout detected (${jsonString.length} chars). Using chunked sending.`);
+        if (new TextEncoder().encode(`LAYOUT:${jsonString}`).length > 400) {
+            console.log(`[ExerSyncKit] Large layout detected (${jsonString.length} chars). Using chunked sending.`);
             await this.sendLargeData(targetPlayerId, jsonString);
         } else {
             this.sendCommand(targetPlayerId, `LAYOUT:${jsonString}`);
@@ -415,7 +679,7 @@ export class ControllerInput {
             for (let i = 0; i < totalChunks; i++) {
                 // CHECK: If the ID has changed, another process stopped this one
                 if (sessionId !== this.currentTransferId) {
-                    console.warn("[ControllerInput] Transfer aborted: Session changed.");
+                    console.warn("[ExerSyncKit] Transfer aborted: Session changed.");
                     return; 
                 }
 
@@ -435,12 +699,12 @@ export class ControllerInput {
                 this.sendCommand(targetPlayerId, "END_MSG");
             }
         } catch (e) {
-            console.error("[ControllerInput] Error during chunked send:", e);
+            console.error("[ExerSyncKit] Error during chunked send:", e);
         } finally {
             // Only release the lock if we are still the "active" session
             if (sessionId === this.currentTransferId) {
                 this.isSendingLargeData = false;
-                console.log("[ControllerInput] Lock Released - Chunk Transfer Complete");
+                console.log("[ExerSyncKit] Lock Released - Chunk Transfer Complete");
             }
         }
     }
@@ -508,26 +772,22 @@ export class ControllerInput {
             this.isManualDisconnect = true;
             this.processLaunchOk = false;
             this.startRestartCooldown();
-            console.log('[SDK] Initiating safe shutdown via Native Bridge...');
-            // Ask the server to shut itself down first so C# can run full cleanup.
+            console.log('[ExerSyncKit] Initiating safe shutdown via Native Bridge...');
             if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                 this.sendCommand(-2, "SHUTDOWN");
             }
-            // 1. Trigger the C++ "Polite" Shutdown (CTRL+BREAK)
-            // This is the most reliable way to ensure the C# CleanUp() runs.
-            if ((window as any).closeExternalExe) {
-                const closed = (window as any).closeExternalExe();
-                console.log(`[SDK] closeExternalExe result: ${closed}`);
-                if ((window as any).isExternalExeAlive) {
-                    const alive = (window as any).isExternalExeAlive();
-                    console.log(`[SDK] Server alive after close request: ${alive}`);
+            if (typeof closeExternalExe !== 'undefined') {
+                const closed = closeExternalExe();
+                console.log(`[ExerSyncKit] closeExternalExe result: ${closed}`);
+                if (typeof isExternalExeAlive !== 'undefined') {
+                    const alive = isExternalExeAlive();
+                    console.log(`[ExerSyncKit] Server alive after close request: ${alive}`);
                 }
             }
 
-            // 2. Disconnect the local socket immediately
             this.disconnect();
             this.serverStarted = false;
-            console.log(`[SDK] Restart cool-down started (${(ControllerInput.minRestartDelayMs / 1000).toFixed(1)}s).`);
+            console.log(`[ExerSyncKit] Restart cool-down started (${(ExerSyncKit.minRestartDelayMs / 1000).toFixed(1)}s).`);
         } else {
             const cooldownMs = this.getRemainingCooldownMs();
             if (cooldownMs > 0) {
@@ -537,6 +797,14 @@ export class ControllerInput {
                 this.setState('stopped');
             }
         }
+        this.unbindOptionsCallbacks();
+    }
+
+    public disableAsync(): Promise<void> {
+        return new Promise((resolve) => {
+            this.shutdownServer();
+            setTimeout(resolve, 100);
+        });
     }
 
     public getControllerCount(): number {
@@ -549,5 +817,25 @@ export class ControllerInput {
 
     public broadcastCommand(command: string) {
         this.sendCommand(-1, command);
+    }
+
+    public triggerVibration(playerId: number = -1) {
+        this.sendCommand(playerId, "TRIGGER_VIBRATION");
+    }
+
+    public enableStep(playerId: number = -1) {
+        this.sendCommand(playerId, "ENABLE_STEP");
+    }
+
+    public disableStep(playerId: number = -1) {
+        this.sendCommand(playerId, "DISABLE_STEP");
+    }
+
+    public enableSteering(playerId: number = -1) {
+        this.sendCommand(playerId, "ENABLE_STEERING");
+    }
+
+    public disableSteering(playerId: number = -1) {
+        this.sendCommand(playerId, "DISABLE_STEERING");
     }
 }

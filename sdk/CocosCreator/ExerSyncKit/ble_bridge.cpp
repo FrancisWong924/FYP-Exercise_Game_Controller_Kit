@@ -23,7 +23,7 @@ static bool isTrackedServerAlive() {
     return exitCode == STILL_ACTIVE;
 }
 
-/** Directory of the quoted .exe in `"...exe" args` so the child cwd matches published layouts (native DLLs next to Server.Ble.exe). */
+/** Directory of the quoted .exe in `"...exe" args` so the child cwd matches published layouts (native DLLs next to ExerSyncKitServer.exe). */
 static std::string extractQuotedExeDirectory(const std::string& commandLine) {
     const size_t open = commandLine.find('"');
     if (open == std::string::npos) {
@@ -80,7 +80,7 @@ static bool waitTrackedServerExit(DWORD timeoutMs) {
 }
 
 bool launchExternalExeImpl(const std::string& commandLine) {
-    // Avoid a second Server.Ble while the first is still running: the C# server kills duplicate
+    // Avoid a second ExerSyncKitServer while the first is still running: the C# server kills duplicate
     // processes and tears down WebSockets, which matches an immediate disconnect in the game.
     if (isTrackedServerAlive()) {
         return true;
@@ -109,7 +109,7 @@ bool launchExternalExeImpl(const std::string& commandLine) {
         return false;
     }
     if (exitCode != STILL_ACTIVE) {
-        OutputDebugStringA("[ble_bridge] Server.Ble exited shortly after launch (check deps, .NET runtime, and cwd).\n");
+        OutputDebugStringA("[ble_bridge] ExerSyncKitServer exited shortly after launch (check deps, .NET runtime, and cwd).\n");
         clearServerProcessHandles();
         return false;
     }
@@ -186,7 +186,7 @@ static bool register_ble_bridge(se::Object* global) {
     return true;
 }
 
-static void ble_controller_plugin_load() {
+static void ExerSyncKit_plugin_load() {
     using namespace cc::plugin;
     static Listener listener(BusType::SCRIPT_ENGINE);
     listener.receive([](ScriptEngineEvent event) {
@@ -198,4 +198,4 @@ static void ble_controller_plugin_load() {
 
 } // namespace
 
-CC_PLUGIN_ENTRY(ble_controller_glue, ble_controller_plugin_load)
+CC_PLUGIN_ENTRY(ExerSyncKit_glue, ExerSyncKit_plugin_load)
