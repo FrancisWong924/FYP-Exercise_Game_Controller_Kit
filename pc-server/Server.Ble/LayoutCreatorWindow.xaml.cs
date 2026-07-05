@@ -14,6 +14,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
+using System.Text.Json;
 using Microsoft.Win32;
 
 namespace BleServer;
@@ -22,7 +23,9 @@ public partial class LayoutCreatorWindow : Window
 {
     /// <summary>Logical width of the preview canvas; scales element sizes like Flutter density.</summary>
     const double PhoneRefWidth = 780.0;
-    const double ResizeHitLogical = 36.0;
+    const double ResizeHitMaxLogical = 36.0;
+    const double ResizeHitFraction = 0.35;
+    const double ResizeGripVisual = 10.0;
     const double JoystickMinRadius = 40.0;
     const double ButtonSquareMinSize = 40.0;
     const double ButtonRectMinWidth = 24.0;
@@ -42,11 +45,17 @@ public partial class LayoutCreatorWindow : Window
     bool _previewResizeArmed;
     LayoutElementModel? _previewDragElement;
     LayoutElementModel? _previewResizeElement;
+    ResizeCorner _previewResizeCorner;
+    Point _resizeAnchorCanvas;
     Point _previewPressCanvasPoint;
     LayoutElementModel? _selectedElement;
 
     /// <summary>Joystick <c>joystickType</c> values accepted by the Flutter controller (dropdown only).</summary>
-    public IReadOnlyList<string> JoystickSideOptions { get; } = new[] { "left", "right" };
+    public IReadOnlyList<JoystickSideOption> JoystickSideOptions { get; } = new[]
+    {
+        new JoystickSideOption { DisplayName = "LEFT JOYSTICK", Value = "left" },
+        new JoystickSideOption { DisplayName = "RIGHT JOYSTICK", Value = "right" },
+    };
 
     public Array ButtonShapeOptions { get; } = Enum.GetValues(typeof(LayoutButtonShape));
 
@@ -55,26 +64,28 @@ public partial class LayoutCreatorWindow : Window
 
     public IReadOnlyList<StepTargetOption> StepTargetOptions { get; } = CreateStepTargetOptions();
 
-    /// <summary>buttonId choices <c>1 &lt;&lt; 0</c> … <c>1 &lt;&lt; 15</c> for the layout editor.</summary>
+    /// <summary>buttonId choices <c>1 &lt;&lt; 0</c> … <c>1 &lt;&lt; 15</c> (input packet only; toolbar uses fixed ids).</summary>
     public IReadOnlyList<ButtonIdMaskOption> ButtonIdMaskOptions { get; } = CreateButtonIdMaskOptions();
 
     static string ButtonIdMaskDisplayName(int i) => i switch
     {
-        0 => $"1 << {i} (arrow up)",
-        1 => $"1 << {i} (arrow down)",
-        2 => $"1 << {i} (arrow left)",
-        3 => $"1 << {i} (arrow right)",
-        6 => $"1 << {i} (LS)",
-        7 => $"1 << {i} (RS)",
-        8 => $"1 << {i} (LB)",
-        9 => $"1 << {i} (RB)",
-        10 => $"1 << {i} (LT)",
-        11 => $"1 << {i} (RT)",
-        12 => $"1 << {i} (A)",
-        13 => $"1 << {i} (B)",
-        14 => $"1 << {i} (X)",
-        15 => $"1 << {i} (Y)",
-        _ => $"1 << {i}"
+        0 => $"arrow up",
+        1 => $"arrow down",
+        2 => $"arrow left",
+        3 => $"arrow right",
+        4 => $"start",
+        5 => $"back",
+        6 => $"LS",
+        7 => $"RS",
+        8 => $"LB - Left Shoulder",
+        9 => $"RB - Right Shoulder",
+        10 => $"LT - Left Trigger",
+        11 => $"RT - Right Trigger",
+        12 => $"A",
+        13 => $"B",
+        14 => $"X",
+        15 => $"Y",
+        _ => $"custom {i}"
     };
 
     private static readonly Dictionary<string, Geometry> SystemIconGeometries = new()
@@ -86,14 +97,27 @@ public partial class LayoutCreatorWindow : Window
         { "arrow_up",    Geometry.Parse("M 14,2 L 26,14 H 18 V 26 H 10 V 14 H 2 Z") },
         { "arrow_down",  Geometry.Parse("M 14,26 L 2,14 H 10 V 2 H 18 V 14 H 26 Z") },
         { "arrow_left",  Geometry.Parse("M 2,14 L 14,2 V 10 H 26 V 18 H 14 V 26 Z") },
-        { "arrow_right", Geometry.Parse("M 26,14 L 14,2 V 10 H 2 V 18 H 14 V 26 Z") }
+        { "arrow_right", Geometry.Parse("M 26,14 L 14,2 V 10 H 2 V 18 H 14 V 26 Z") },
+        { "screenshot",  Geometry.Parse(
+            "M 7,2 H 2 V 7 " + 
+            "M 19,2 H 24 V 7 " + 
+            "M 7,26 H 2 V 21 " + 
+            "M 19,26 H 24 V 21")
+        },
+        { "pause",       Geometry.Parse("M 6,4 H 10 V 24 H 6 Z M 18,4 H 22 V 24 H 18 Z") },
+        { "play",        Geometry.Parse("M 8,4 L 24,14 L 8,24 Z") },
+        { "settings",    Geometry.Parse(
+            "M 13,2 L 15,2 L 16,5 A 7,7 0 0,1 18,6 L 21,4 L 23,6 L 21,9 A 7,7 0 0,1 22,11 L 25,12 L 25,14 L 22,15 A 7,7 0 0,1 21,17 L 23,20 L 21,22 L 18,20 A 7,7 0 0,1 16,21 L 15,24 L 13,24 L 12,21 A 7,7 0 0,1 10,20 L 7,22 L 5,20 L 7,17 A 7,7 0 0,1 6,15 L 2,14 L 2,12 L 6,11 A 7,7 0 0,1 7,9 L 5,6 L 7,4 L 10,6 A 7,7 0 0,1 12,5 Z " + 
+            "M 14,9 A 4,4 0 1,0 14,17 A 4,4 0 1,0 14,9 Z") 
+        },
     };
 
     static ButtonIdMaskOption[] CreateButtonIdMaskOptions()
     {
-        var opts = new ButtonIdMaskOption[16];
+        var opts = new ButtonIdMaskOption[17];
+        opts[0] = new ButtonIdMaskOption { DisplayName = "— select button mapping —", Value = null };
         for (var i = 0; i < 16; i++)
-            opts[i] = new ButtonIdMaskOption { DisplayName = ButtonIdMaskDisplayName(i), Value = 1 << i };
+            opts[i + 1] = new ButtonIdMaskOption { DisplayName = ButtonIdMaskDisplayName(i), Value = 1 << i };
         return opts;
     }
 
@@ -131,11 +155,12 @@ public partial class LayoutCreatorWindow : Window
             btn.X = 0.82;
             btn.Y = 0.52;
             btn.Label = "cross";
-            btn.ButtonId = null;
             btn.UseSystemIcon = null;
             _elements.Add(joy);
             _elements.Add(btn);
         }
+
+        ToolbarLayoutHelper.EnsureToolbarButtons(_elements);
 
         foreach (var m in _elements)
             HookModel(m);
@@ -146,6 +171,14 @@ public partial class LayoutCreatorWindow : Window
             SetSelectedElement(_elements[0]);
         else
             SetSelectedElement(null);
+
+        Loaded += LayoutCreatorWindow_OnLoaded;
+    }
+
+    void LayoutCreatorWindow_OnLoaded(object sender, RoutedEventArgs e)
+    {
+        if (LayoutCreatorUserSettings.TryConsumeFirstRunTutorial())
+            StartTutorial();
     }
 
     void Elements_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -187,7 +220,9 @@ public partial class LayoutCreatorWindow : Window
         if (_isPreviewResizing && sender is LayoutElementModel &&
             (e.PropertyName == nameof(LayoutElementModel.Size) ||
              e.PropertyName == nameof(LayoutElementModel.ButtonWidth) ||
-             e.PropertyName == nameof(LayoutElementModel.ButtonHeight)))
+             e.PropertyName == nameof(LayoutElementModel.ButtonHeight) ||
+             e.PropertyName == nameof(LayoutElementModel.X) ||
+             e.PropertyName == nameof(LayoutElementModel.Y)))
         {
             return;
         }
@@ -197,7 +232,8 @@ public partial class LayoutCreatorWindow : Window
 
     public List<string> SystemIconOptions { get; } = new() 
     { 
-        "None", "square", "triangle", "circle", "cross", "arrow_up", "arrow_down", "arrow_left", "arrow_right" 
+        "None", "square", "triangle", "circle", "cross", "arrow_up", "arrow_down", "arrow_left", "arrow_right",
+        "screenshot", "pause", "play", "settings"
     };
 
     void RefreshPreview()
@@ -429,27 +465,6 @@ public partial class LayoutCreatorWindow : Window
             }
         }
 
-        if (isSelected && (el.Type == LayoutElementKind.button || el.Type == LayoutElementKind.joystick))
-        {
-            const double grip = 10;
-            var gripFill = new SolidColorBrush(Color.FromArgb(0xE6, 0x4F, 0xA3, 0xFF));
-            var gripBorder = new SolidColorBrush(Color.FromArgb(0xFF, 0xF3, 0xF3, 0xF3));
-            var resizeGrip = new Border
-            {
-                Width = grip,
-                Height = grip,
-                Background = gripFill,
-                BorderBrush = gripBorder,
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(2),
-                Cursor = Cursors.SizeNWSE,
-                IsHitTestVisible = false
-            };
-            Canvas.SetLeft(resizeGrip, hitW - grip);
-            Canvas.SetTop(resizeGrip, hitH - grip);
-            inner.Children.Add(resizeGrip);
-        }
-
         var host = new Border
         {
             Tag = el,
@@ -458,7 +473,6 @@ public partial class LayoutCreatorWindow : Window
             Background = Brushes.Transparent,
             BorderBrush = isSelected ? new SolidColorBrush(Color.FromArgb(0xE6, 0x4F, 0xA3, 0xFF)) : Brushes.Transparent,
             BorderThickness = new Thickness(2),
-            Cursor = Cursors.Hand,
             Child = inner
         };
         Canvas.SetLeft(host, cx - hitW / 2);
@@ -501,7 +515,7 @@ public partial class LayoutCreatorWindow : Window
             _suppressTypeCombo = true;
             TypeCombo.SelectedItem = el.Type;
             _suppressTypeCombo = false;
-            UpdateEditorFieldVisibility(el.Type);
+            UpdateEditorFieldVisibility(el);
         }
 
         if (!_isPreviewDragging && !_isPreviewResizing)
@@ -519,53 +533,173 @@ public partial class LayoutCreatorWindow : Window
         return (cx - hitW / 2, cy - hitH / 2, hitW, hitH);
     }
 
-    static bool IsInResizeZone(LayoutElementModel el, Point canvasPoint, double canvasW, double canvasH, double scale)
+    static double GetCornerHitSize(double hitW, double hitH, double scale)
+    {
+        var maxHit = ResizeHitMaxLogical * scale;
+        var adaptive = Math.Min(hitW, hitH) * ResizeHitFraction;
+        var gripHit = ResizeGripVisual * scale;
+        return Math.Min(maxHit, Math.Max(adaptive, gripHit));
+    }
+
+    static ResizeCorner? TryGetResizeCorner(
+        LayoutElementModel el, Point canvasPoint, double canvasW, double canvasH, double scale)
     {
         if (el.Type is not (LayoutElementKind.button or LayoutElementKind.joystick))
-            return false;
+            return null;
 
         var (left, top, hitW, hitH) = GetPreviewHostBounds(el, canvasW, canvasH, scale);
         var localX = canvasPoint.X - left;
         var localY = canvasPoint.Y - top;
-        var resizeSize = ResizeHitLogical * scale;
-        return localX >= hitW - resizeSize && localY >= hitH - resizeSize;
+        var hit = GetCornerHitSize(hitW, hitH, scale);
+
+        ResizeCorner? best = null;
+        var bestDist = double.MaxValue;
+
+        void Consider(ResizeCorner corner, bool inZone, double distToCorner)
+        {
+            if (!inZone || distToCorner >= bestDist)
+                return;
+            best = corner;
+            bestDist = distToCorner;
+        }
+
+        if (localX <= hit && localY <= hit)
+            Consider(ResizeCorner.TopLeft, true, Math.Sqrt(localX * localX + localY * localY));
+        if (localX >= hitW - hit && localY <= hit)
+            Consider(ResizeCorner.TopRight, true,
+                Math.Sqrt((hitW - localX) * (hitW - localX) + localY * localY));
+        if (localX <= hit && localY >= hitH - hit)
+            Consider(ResizeCorner.BottomLeft, true,
+                Math.Sqrt(localX * localX + (hitH - localY) * (hitH - localY)));
+        if (localX >= hitW - hit && localY >= hitH - hit)
+            Consider(ResizeCorner.BottomRight, true,
+                Math.Sqrt((hitW - localX) * (hitW - localX) + (hitH - localY) * (hitH - localY)));
+
+        return best;
     }
+
+    static (double minW, double minH) GetMinPreviewHitSize(LayoutElementModel el, double scale)
+    {
+        if (el.Type == LayoutElementKind.joystick)
+            return (JoystickMinRadius * 2 * scale, JoystickMinRadius * 2 * scale);
+        if (el.Type == LayoutElementKind.button && el.ButtonShape == LayoutButtonShape.rectangle)
+            return (ButtonRectMinWidth * scale, ButtonRectMinHeight * scale);
+        return (ButtonSquareMinSize * scale, ButtonSquareMinSize * scale);
+    }
+
+    static void EnforceMinRect(
+        ref double left, ref double top, ref double right, ref double bottom,
+        double minW, double minH, ResizeCorner corner)
+    {
+        if (right - left < minW)
+        {
+            if (corner is ResizeCorner.TopLeft or ResizeCorner.BottomLeft)
+                left = right - minW;
+            else
+                right = left + minW;
+        }
+
+        if (bottom - top < minH)
+        {
+            if (corner is ResizeCorner.TopLeft or ResizeCorner.TopRight)
+                top = bottom - minH;
+            else
+                bottom = top + minH;
+        }
+    }
+
+    static Point GetResizeAnchorCanvas(
+        ResizeCorner corner, double left, double top, double hitW, double hitH) =>
+        corner switch
+        {
+            ResizeCorner.TopLeft => new Point(left + hitW, top + hitH),
+            ResizeCorner.TopRight => new Point(left, top + hitH),
+            ResizeCorner.BottomLeft => new Point(left + hitW, top),
+            _ => new Point(left, top)
+        };
 
     static void ApplyResizeFromCanvasPoint(
         LayoutElementModel el,
         Point canvasPoint,
+        ResizeCorner corner,
+        Point anchorCanvas,
         double canvasW,
         double canvasH,
         double scale,
         double gridSize)
     {
-        var cx = el.X * canvasW;
-        var cy = el.Y * canvasH;
-        var logicalDx = Math.Max((canvasPoint.X - cx) / scale, 0);
-        var logicalDy = Math.Max((canvasPoint.Y - cy) / scale, 0);
+        double newLeft, newTop, newRight, newBottom;
+        switch (corner)
+        {
+            case ResizeCorner.TopLeft:
+                newLeft = canvasPoint.X;
+                newTop = canvasPoint.Y;
+                newRight = anchorCanvas.X;
+                newBottom = anchorCanvas.Y;
+                break;
+            case ResizeCorner.TopRight:
+                newLeft = anchorCanvas.X;
+                newTop = canvasPoint.Y;
+                newRight = canvasPoint.X;
+                newBottom = anchorCanvas.Y;
+                break;
+            case ResizeCorner.BottomLeft:
+                newLeft = canvasPoint.X;
+                newTop = anchorCanvas.Y;
+                newRight = anchorCanvas.X;
+                newBottom = canvasPoint.Y;
+                break;
+            default:
+                newLeft = anchorCanvas.X;
+                newTop = anchorCanvas.Y;
+                newRight = canvasPoint.X;
+                newBottom = canvasPoint.Y;
+                break;
+        }
+
+        var (minW, minH) = GetMinPreviewHitSize(el, scale);
+        EnforceMinRect(ref newLeft, ref newTop, ref newRight, ref newBottom, minW, minH, corner);
+
+        var newHitW = newRight - newLeft;
+        var newHitH = newBottom - newTop;
 
         if (el.Type == LayoutElementKind.joystick)
         {
-            var next = Math.Max(Math.Max(logicalDx, logicalDy), JoystickMinRadius);
+            var next = Math.Max(Math.Max(newHitW, newHitH) / (2 * scale), JoystickMinRadius);
             el.Size = Math.Max(SnapToGrid(next, gridSize), JoystickMinRadius);
-            return;
         }
-
-        if (el.Type != LayoutElementKind.button)
-            return;
-
-        if (el.ButtonShape == LayoutButtonShape.rectangle)
+        else if (el.Type == LayoutElementKind.button)
         {
-            var nextW = Math.Max(logicalDx * 2, ButtonRectMinWidth);
-            var nextH = Math.Max(logicalDy * 2, ButtonRectMinHeight);
-            el.ButtonWidth = Math.Max(SnapToGrid(nextW, gridSize), ButtonRectMinWidth);
-            el.ButtonHeight = Math.Max(SnapToGrid(nextH, gridSize), ButtonRectMinHeight);
-            return;
+            if (el.ButtonShape == LayoutButtonShape.rectangle)
+            {
+                var nextW = Math.Max(newHitW / scale, ButtonRectMinWidth);
+                var nextH = Math.Max(newHitH / scale, ButtonRectMinHeight);
+                el.ButtonWidth = Math.Max(SnapToGrid(nextW, gridSize), ButtonRectMinWidth);
+                el.ButtonHeight = Math.Max(SnapToGrid(nextH, gridSize), ButtonRectMinHeight);
+            }
+            else
+            {
+                var nextSize = Math.Max(Math.Max(newHitW, newHitH) / scale, ButtonSquareMinSize);
+                el.Size = Math.Max(SnapToGrid(nextSize, gridSize), ButtonSquareMinSize);
+            }
         }
 
-        var nextSize = Math.Max(Math.Max(logicalDx, logicalDy) * 2, ButtonSquareMinSize);
-        el.Size = Math.Max(SnapToGrid(nextSize, gridSize), ButtonSquareMinSize);
+        var (finalW, finalH) = GetPreviewHitSize(el, scale);
+        var pinnedLeft = corner is ResizeCorner.TopLeft or ResizeCorner.BottomLeft
+            ? anchorCanvas.X - finalW
+            : anchorCanvas.X;
+        var pinnedTop = corner is ResizeCorner.TopLeft or ResizeCorner.TopRight
+            ? anchorCanvas.Y - finalH
+            : anchorCanvas.Y;
+        el.X = Math.Clamp((pinnedLeft + finalW / 2) / canvasW, 0, 1);
+        el.Y = Math.Clamp((pinnedTop + finalH / 2) / canvasH, 0, 1);
     }
+
+    static Cursor GetResizeCursor(ResizeCorner corner) => corner switch
+    {
+        ResizeCorner.TopLeft or ResizeCorner.BottomRight => Cursors.SizeNWSE,
+        _ => Cursors.SizeNESW
+    };
 
     double GetResizeGridSize()
     {
@@ -607,10 +741,20 @@ public partial class LayoutCreatorWindow : Window
         var canvasH = PreviewCanvas.Height;
         var scale = GetPreviewScale();
 
-        if (IsInResizeZone(hit, pos, canvasW, canvasH, scale))
+        var resizeCorner = TryGetResizeCorner(hit, pos, canvasW, canvasH, scale);
+        if (resizeCorner != null)
         {
+            var (left, top, hitW, hitH) = GetPreviewHostBounds(hit, canvasW, canvasH, scale);
             _previewResizeArmed = true;
             _previewResizeElement = hit;
+            _previewResizeCorner = resizeCorner.Value;
+            _resizeAnchorCanvas = GetResizeAnchorCanvas(resizeCorner.Value, left, top, hitW, hitH);
+            _isPreviewResizing = true;
+            PreviewCanvas.Cursor = GetResizeCursor(_previewResizeCorner);
+            ApplyResizeFromCanvasPoint(
+                hit, pos, _previewResizeCorner, _resizeAnchorCanvas,
+                canvasW, canvasH, scale, GetResizeGridSize());
+            RefreshPreview();
         }
         else
         {
@@ -622,26 +766,51 @@ public partial class LayoutCreatorWindow : Window
         e.Handled = true;
     }
 
+    void UpdatePreviewHoverCursor(Point pos)
+    {
+        var hit = HitTestPreviewElement(pos);
+        if (hit == null)
+        {
+            PreviewCanvas.Cursor = Cursors.Arrow;
+            return;
+        }
+
+        if (ReferenceEquals(hit, _selectedElement) &&
+            hit.Type is LayoutElementKind.button or LayoutElementKind.joystick)
+        {
+            var scale = GetPreviewScale();
+            var corner = TryGetResizeCorner(
+                hit, pos, PreviewCanvas.Width, PreviewCanvas.Height, scale);
+            if (corner != null)
+            {
+                PreviewCanvas.Cursor = GetResizeCursor(corner.Value);
+                return;
+            }
+        }
+
+        PreviewCanvas.Cursor = Cursors.Hand;
+    }
+
     void PreviewCanvas_OnMouseMove(object sender, MouseEventArgs e)
     {
-        if (e.LeftButton != MouseButtonState.Pressed)
-            return;
-
         var pos = e.GetPosition(PreviewCanvas);
+
+        if (e.LeftButton != MouseButtonState.Pressed)
+        {
+            UpdatePreviewHoverCursor(pos);
+            return;
+        }
         var scale = GetPreviewScale();
 
         if (_previewResizeArmed && _previewResizeElement != null)
         {
-            if (!_isPreviewResizing && !HasExceededDragThreshold(pos))
-                return;
-
-            _isPreviewResizing = true;
-            PreviewCanvas.Cursor = Cursors.SizeNWSE;
             var canvasW = PreviewCanvas.Width;
             var canvasH = PreviewCanvas.Height;
             ApplyResizeFromCanvasPoint(
                 _previewResizeElement,
                 pos,
+                _previewResizeCorner,
+                _resizeAnchorCanvas,
                 canvasW,
                 canvasH,
                 scale,
@@ -678,7 +847,6 @@ public partial class LayoutCreatorWindow : Window
         _previewResizeElement = null;
         if (PreviewCanvas.IsMouseCaptured)
             PreviewCanvas.ReleaseMouseCapture();
-        PreviewCanvas.Cursor = Cursors.Arrow;
     }
 
     void PreviewCanvas_OnMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -686,6 +854,7 @@ public partial class LayoutCreatorWindow : Window
         EndPreviewDrag();
         EndPreviewResize();
         ClearPreviewPointerState();
+        UpdatePreviewHoverCursor(e.GetPosition(PreviewCanvas));
         e.Handled = true;
     }
 
@@ -696,6 +865,7 @@ public partial class LayoutCreatorWindow : Window
             EndPreviewDrag();
             EndPreviewResize();
             ClearPreviewPointerState();
+            PreviewCanvas.Cursor = Cursors.Arrow;
         }
     }
 
@@ -889,7 +1059,7 @@ public partial class LayoutCreatorWindow : Window
             return;
         m.Type = kind;
         ApplyTypeSpecificDefaults(m);
-        UpdateEditorFieldVisibility(kind);
+        UpdateEditorFieldVisibility(m);
     }
 
     static void ApplyTypeSpecificDefaults(LayoutElementModel m)
@@ -907,10 +1077,78 @@ public partial class LayoutCreatorWindow : Window
         }
     }
 
-    void UpdateEditorFieldVisibility(LayoutElementKind kind)
+    void UpdateEditorFieldVisibility(LayoutElementModel? el)
     {
+        var kind = el?.Type ?? LayoutElementKind.button;
+        var isToolbar = el != null && ToolbarLayoutHelper.IsToolbarElement(el.Id);
+        ElementTypePanel.Visibility = isToolbar ? Visibility.Collapsed : Visibility.Visible;
+        ElementIdPanel.Visibility = isToolbar ? Visibility.Collapsed : Visibility.Visible;
+        LabelFieldCaption.Text = isToolbar
+            ? "Label (editor hint only)"
+            : "Label (required)";
         JoystickFieldsPanel.Visibility = kind == LayoutElementKind.joystick ? Visibility.Visible : Visibility.Collapsed;
         ButtonFieldsPanel.Visibility = kind == LayoutElementKind.joystick ? Visibility.Collapsed : Visibility.Visible;
+        ButtonMappingPanel.Visibility = kind == LayoutElementKind.button && !isToolbar ? Visibility.Visible : Visibility.Collapsed;
+        SystemIconPanel.Visibility = kind == LayoutElementKind.button && !isToolbar ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    void StartTutorial_OnClick(object sender, RoutedEventArgs e) => StartTutorial();
+
+    void StartTutorial()
+    {
+        if (_selectedElement is null && _elements.Count > 0)
+            SetSelectedElement(_elements[0]);
+
+        LayoutTutorialOverlay.Start(new[]
+        {
+            new TutorialStep
+            {
+                Target = PreviewSection,
+                Message = "This is the layout preview. It mirrors how your controller will appear on the phone. Click an element to select it, drag to move it, and drag a corner to resize (sizes snap to the grid step). Press Backspace to remove the selected element.",
+                HighlightPadding = new Thickness(6)
+            },
+            new TutorialStep
+            {
+                Target = LayoutPropertiesSection,
+                Message = "Layout properties apply to the whole controller layout. Set the layout name, background color or image, and resize grid for better alignment. Steering target chooses which joystick receives phone tilt. Step output chooses which game input receives step-counter data from the phone.",
+                HighlightPadding = new Thickness(18, 6, 18, 6)
+            },
+            new TutorialStep
+            {
+                Target = ElementSettingsSection,
+                Message = "Element settings appear when you select an element in the preview. You can edit its type, id, label, position, colors, and button or joystick specific options here.",
+                HighlightPadding = new Thickness(18, 6, 18, 6),
+                ScrollToRevealEntireTarget = true,
+                MessagePlacement = TutorialMessagePlacement.Left
+            },
+            new TutorialStep
+            {
+                Prepare = PrepareButtonMappingTutorialStep,
+                Target = ButtonMappingPanel,
+                Message = "Each buton has a buttonValueMapping that map to a game input (for example A, B, or a shoulder button). Every gameplay button needs a mapping, it is easy to miss, so check it for each button you add.",
+                HighlightPadding = new Thickness(18, 6, 18, 6),
+                ScrollToRevealEntireTarget = true,
+                MessagePlacement = TutorialMessagePlacement.Left
+            },
+            new TutorialStep
+            {
+                Target = SidebarActionButtonsSection,
+                Message = "Use these actions to build and share your layout. Add buttons and joysticks, import or export a layout file, and send the finished layout to a connected phone.",
+                HighlightPadding = new Thickness(18, 6, 18, 6),
+                MessagePlacement = TutorialMessagePlacement.Left
+            }
+        });
+    }
+
+    void PrepareButtonMappingTutorialStep()
+    {
+        var button = _elements.FirstOrDefault(e =>
+            e.Type == LayoutElementKind.button && !ToolbarLayoutHelper.IsToolbarElement(e.Id));
+        if (button is not null)
+            SetSelectedElement(button);
+
+        SidebarScrollViewer.UpdateLayout();
+        ButtonMappingPanel.UpdateLayout();
     }
 
     void AddButton_OnClick(object sender, RoutedEventArgs e)
@@ -929,12 +1167,92 @@ public partial class LayoutCreatorWindow : Window
         SetSelectedElement(added);
     }
 
-    void RemoveSelected_OnClick(object sender, RoutedEventArgs e) => RemoveSelectedElement();
+    void ImportLayout_OnClick(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog
+        {
+            Filter = ControllerLayoutDocument.FileDialogFilter,
+            Title = "Import layout"
+        };
+        if (dlg.ShowDialog(this) != true)
+            return;
+        try
+        {
+            var json = File.ReadAllText(dlg.FileName);
+            var layout = ControllerLayoutDocument.Deserialize(json);
+
+            // Check if layout and nested Data exist to avoid NullReferenceExceptions
+            if (layout == null)
+            {
+                MessageBox.Show("The layout file is empty or invalid.", "Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+            LayoutNameBox.Text = layout.LayoutName ?? "New layout";
+        
+            if (layout.Data != null)
+            {
+                LayoutBackgroundColorPicker.HexValue = layout.Data.BackgroundColor ?? "";
+                LayoutBackgroundImageBox.Text = layout.Data.BackgroundImage ?? "";
+                
+                // For your ComboBoxes / Dropdowns (e.g., tiltTarget, stepTarget):
+                // You may need to map the integers (like 1, 0) to your UI selection items
+                TiltTargetCombo.SelectedIndex = layout.Data.TiltTarget;
+
+                var options = StepTargetOptions; // or however you expose your options array
+                var matchedOption = options.FirstOrDefault(opt => 
+                    opt.StepTarget == layout.Data.StepTarget && 
+                    opt.StepButtonBitmask == layout.Data.StepButtonBitmask
+                );
+
+                if (matchedOption != null)
+                {
+                    // If your ComboBox is bound to objects, set the SelectedItem directly
+                    StepTargetCombo.SelectedItem = matchedOption;
+                }
+                else
+                {
+                    // Fallback: Default to the first item (LEFT JOYSTICK) if no exact match is found
+                    StepTargetCombo.SelectedIndex = 0; 
+                }
+            }
+            if (layout.Data?.Elements != null)
+            {
+                _elements.Clear();
+                
+                // 2. Map the JSON DTOs back into UI Models and add them
+                foreach (var dto in layout.Data.Elements)
+                {
+                    var model = LayoutElementModel.FromDto(dto); 
+                    
+                    _elements.Add(model);
+                }
+
+                ToolbarLayoutHelper.EnsureToolbarButtons(_elements);
+            }
+        }
+        catch (JsonException ex)
+        {
+            MessageBox.Show($"Failed to parse JSON file: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"An error occurred while loading file: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
 
     void RemoveSelectedElement()
     {
         if (_selectedElement is not LayoutElementModel m)
             return;
+        if (ToolbarLayoutHelper.IsToolbarElement(m.Id))
+        {
+            MessageBox.Show(this,
+                "Toolbar buttons (screenshot, pause/resume, settings) cannot be removed.",
+                "Layout creator",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
         _elements.Remove(m);
         SetSelectedElement(null);
     }
@@ -966,8 +1284,9 @@ public partial class LayoutCreatorWindow : Window
 
         var dlg = new SaveFileDialog
         {
-            Filter = "JSON (*.json)|*.json|All files (*.*)|*.*",
-            FileName = $"{SanitizeFileName(LayoutNameBox.Text)}.json"
+            Filter = ControllerLayoutDocument.FileDialogFilter,
+            DefaultExt = ControllerLayoutDocument.FileExtension.TrimStart('.'),
+            FileName = $"{SanitizeFileName(LayoutNameBox.Text)}{ControllerLayoutDocument.FileExtension}"
         };
         if (dlg.ShowDialog(this) != true)
             return;
@@ -1223,12 +1542,12 @@ public partial class LayoutCreatorWindow : Window
             }
             if (string.IsNullOrWhiteSpace(el.BackgroundColor))
             {
-                error = $"Element '{el.Id}' must have a 'backgroundColor'.";
+                error = $"Element '{el.Label}' must have a 'backgroundColor'.";
                 return false;
             }
             if (string.IsNullOrWhiteSpace(el.Color))
             {
-                error = $"Element '{el.Id}' must have a 'color'.";
+                error = $"Element '{el.Label}' must have a 'color'.";
                 return false;
             }
             if (el.Type == LayoutElementKind.joystick)
@@ -1236,7 +1555,7 @@ public partial class LayoutCreatorWindow : Window
                 var jt = el.JoystickType?.Trim().ToLowerInvariant();
                 if (jt is not ("left" or "right"))
                 {
-                    error = $"Joystick \"{el.Id}\" must have joystickType \"left\" or \"right\".";
+                    error = $"Joystick \"{el.Label}\" must have joystickType \"left\" or \"right\".";
                     return false;
                 }
             }
@@ -1244,7 +1563,7 @@ public partial class LayoutCreatorWindow : Window
             {
                 if (el.ButtonId == 0 || el.ButtonId == null)
                 {
-                    error = $"Button \"{el.Id}\" must have a 'buttonId' selected.";
+                    error = $"Button \"{el.Label}\" must have a 'buttonValueMapping' selected.";
                     return false;
                 }
                 if (!el.TryGetButtonImageForExport(out _, out var imgErr))
@@ -1258,4 +1577,12 @@ public partial class LayoutCreatorWindow : Window
         error = "";
         return true;
     }
+}
+
+enum ResizeCorner
+{
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight
 }

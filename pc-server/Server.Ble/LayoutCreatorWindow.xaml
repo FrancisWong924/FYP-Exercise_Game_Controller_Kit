@@ -7,28 +7,41 @@
         MinWidth="900" MinHeight="560"
         Background="#FF1E1E1E"
         PreviewKeyDown="LayoutCreatorWindow_OnPreviewKeyDown">
-    <Grid Margin="16">
+    <Grid>
+        <Grid Margin="16">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>
             <ColumnDefinition Width="340"/>
         </Grid.ColumnDefinitions>
 
         <!-- Preview -->
-        <Grid Grid.Column="0">
+        <Grid x:Name="PreviewSection" Grid.Column="0">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
 
-            <TextBlock Grid.Row="0"
-                       Text="Layout Preview"
-                       FontSize="18"
-                       Foreground="#FFF3F3F3"
-                       Margin="0,0,0,12"/>
+            <Grid Grid.Row="0" Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0"
+                           Text="Layout Preview"
+                           FontSize="18"
+                           Foreground="#FFF3F3F3"
+                           VerticalAlignment="Center"/>
+                <Button Grid.Column="1"
+                        Content="Tutorial"
+                        MinWidth="88"
+                        Padding="12,4"
+                        VerticalAlignment="Center"
+                        Click="StartTutorial_OnClick"/>
+            </Grid>
 
             <TextBlock Grid.Row="1"
-                       Text="Click to select, drag to move; drag bottom-right corner to resize (snaps to grid step)"
+                       Text="Click to select, drag to move; drag corner to resize (snaps to grid step); press backspace to remove element"
                        Foreground="#FFB0B0B0"
                        TextWrapping="Wrap"
                        Margin="0,0,0,8"/>
@@ -42,7 +55,7 @@
                                     Background="#FF1A1A1C"
                                     Cursor="Arrow"
                                     MouseLeftButtonDown="PreviewCanvas_OnMouseLeftButtonDown"
-                                    MouseMove="PreviewCanvas_OnMouseMove"
+                                    PreviewMouseMove="PreviewCanvas_OnMouseMove"
                                     MouseLeftButtonUp="PreviewCanvas_OnMouseLeftButtonUp"
                                     MouseLeave="PreviewCanvas_OnMouseLeave"/>
                         </Border>
@@ -54,23 +67,21 @@
         <!-- Sidebar -->
         <Grid Grid.Column="1" Margin="16,0,0,0">
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
-            <TextBlock Grid.Row="0"
-                       Text="Layout Properties"
-                       FontSize="18"
-                       Foreground="#FFF3F3F3"
-                       Margin="0,0,0,12"/>
-
-            <ScrollViewer Grid.Row="1"
+            <ScrollViewer x:Name="SidebarScrollViewer"
+                          Grid.Row="0"
                           VerticalScrollBarVisibility="Auto"
                           HorizontalScrollBarVisibility="Disabled"
                           Margin="0,0,0,12">
                 <StackPanel>
-                    <StackPanel Margin="0,0,0,12">
+                    <StackPanel x:Name="LayoutPropertiesSection" Margin="0,0,0,12">
+                        <TextBlock Text="Layout Properties"
+                                   FontSize="18"
+                                   Foreground="#FFF3F3F3"
+                                   Margin="0,0,0,12"/>
                         <TextBlock Text="Layout name" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
                         <TextBox x:Name="LayoutNameBox" Text="New layout" Margin="0,0,0,8"/>
                         <TextBlock Text="backgroundColor" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
@@ -122,7 +133,7 @@
                                   Margin="0,0,0,0"
                                   PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
                     </StackPanel>
-
+                    <StackPanel x:Name="ElementSettingsSection">
                     <Border Height="1"
                             Background="#FF555555"
                             Margin="0,4,0,12"/>
@@ -132,21 +143,27 @@
                                FontWeight="SemiBold"
                                Margin="0,0,0,8"/>
                     <StackPanel x:Name="EditorPanel" Visibility="Collapsed">
-                        <TextBlock Text="Type (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
-                        <ComboBox x:Name="TypeCombo"
-                                Margin="0,0,0,8"
-                                SelectionChanged="TypeCombo_OnSelectionChanged"
-                                PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
-                        <TextBlock Text="Id (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
-                        <TextBox Text="{Binding Id, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
-                        <TextBlock Text="Label (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                        <StackPanel x:Name="ElementTypePanel">
+                            <TextBlock Text="Type (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                            <ComboBox x:Name="TypeCombo"
+                                    Margin="0,0,0,8"
+                                    SelectionChanged="TypeCombo_OnSelectionChanged"
+                                    PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                        </StackPanel>
+                        <StackPanel x:Name="ElementIdPanel">
+                            <TextBlock Text="Id (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                            <TextBox Text="{Binding Id, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
+                        </StackPanel>
+                        <TextBlock x:Name="LabelFieldCaption" Text="Label (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
                         <TextBox Text="{Binding Label, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8"/>
 
                         <StackPanel x:Name="JoystickFieldsPanel" Visibility="Collapsed" Margin="0,0,0,8">
                             <TextBlock Text="joystickType (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
                             <ComboBox Margin="0,0,0,0"
                                     ItemsSource="{Binding JoystickSideOptions, RelativeSource={RelativeSource AncestorType=Window}}"
-                                    SelectedItem="{Binding JoystickType, UpdateSourceTrigger=PropertyChanged}"
+                                    DisplayMemberPath="DisplayName"
+                                    SelectedValuePath="Value"
+                                    SelectedValue="{Binding JoystickType, UpdateSourceTrigger=PropertyChanged}"
                                     PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
                         </StackPanel>
 
@@ -168,13 +185,15 @@
                                       ItemsSource="{Binding ButtonShapeOptions, RelativeSource={RelativeSource AncestorType=Window}}"
                                       SelectedItem="{Binding ButtonShape, UpdateSourceTrigger=PropertyChanged}"
                                       PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
-                            <TextBlock Text="buttonValueMapping (bitmask) (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
-                            <ComboBox Margin="0,0,0,8"
-                                    ItemsSource="{Binding ButtonIdMaskOptions, RelativeSource={RelativeSource AncestorType=Window}}"
-                                    DisplayMemberPath="DisplayName"
-                                    SelectedValuePath="Value"
-                                    SelectedValue="{Binding ButtonId, UpdateSourceTrigger=PropertyChanged}"
-                                    PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                            <StackPanel x:Name="ButtonMappingPanel" Visibility="Visible">
+                                <TextBlock Text="buttonValueMapping (required)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                                <ComboBox Margin="0,0,0,8"
+                                        ItemsSource="{Binding ButtonIdMaskOptions, RelativeSource={RelativeSource AncestorType=Window}}"
+                                        DisplayMemberPath="DisplayName"
+                                        SelectedValuePath="Value"
+                                        SelectedValue="{Binding ButtonId, UpdateSourceTrigger=PropertyChanged}"
+                                        PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                            </StackPanel>
                             <TextBlock Text="image (URL or uploaded file)" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
                             <Grid Margin="0,0,0,4">
                                 <Grid.ColumnDefinitions>
@@ -202,11 +221,13 @@
                                     Foreground="#FF8E8E8E"
                                     Margin="0,0,0,8"
                                     TextWrapping="Wrap"/>
-                            <TextBlock Text="System Icon" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
-                            <ComboBox ItemsSource="{Binding SystemIconOptions, RelativeSource={RelativeSource AncestorType=Window}}" 
-                                    SelectedItem="{Binding UseSystemIcon, UpdateSourceTrigger=PropertyChanged}" 
-                                    Margin="0,0,0,8"
-                                    PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                            <StackPanel x:Name="SystemIconPanel">
+                                <TextBlock Text="System Icon" Foreground="#FFAAAAAA" Margin="0,0,0,4"/>
+                                <ComboBox ItemsSource="{Binding SystemIconOptions, RelativeSource={RelativeSource AncestorType=Window}}" 
+                                        SelectedItem="{Binding UseSystemIcon, UpdateSourceTrigger=PropertyChanged}" 
+                                        Margin="0,0,0,8"
+                                        PreviewMouseWheel="ComboBox_PreviewMouseWheel"/>
+                            </StackPanel>
                         </StackPanel>
                     </StackPanel>
                     <TextBlock x:Name="NoSelectionHint"
@@ -215,16 +236,20 @@
                                FontStyle="Italic"
                                TextWrapping="Wrap"
                                Margin="0,10,0,0"/>
+                    </StackPanel>
                 </StackPanel>
             </ScrollViewer>
 
-            <StackPanel Grid.Row="2" Orientation="Vertical">
+            <StackPanel x:Name="SidebarActionButtonsSection" Grid.Row="1" Orientation="Vertical">
                 <Button Content="Add button" Margin="0,0,0,8" Click="AddButton_OnClick"/>
                 <Button Content="Add joystick" Margin="0,0,0,8" Click="AddJoystick_OnClick"/>
-                <Button Content="Remove selected element" Margin="0,0,0,8" Click="RemoveSelected_OnClick"/>
-                <Button Content="Export JSON…" Margin="0,0,0,8" Click="ExportJson_OnClick"/>
+                <Button Content="Import layout" Margin="0,0,0,8" Click="ImportLayout_OnClick"/>
+                <Button Content="Export layout" Margin="0,0,0,8" Click="ExportJson_OnClick"/>
                 <Button Content="Send layout to phone" Margin="0,0,0,8" Click="SendLayoutToPhone_OnClick"/>
             </StackPanel>
         </Grid>
+        </Grid>
+
+        <local:TutorialOverlay x:Name="LayoutTutorialOverlay" Panel.ZIndex="100"/>
     </Grid>
 </Window>

@@ -255,7 +255,8 @@ internal static class GpxRecordingPhotoProcessor
         return (a.lat + u * (b.lat - a.lat), a.lon + u * (b.lon - a.lon));
     }
 
-    private static bool TryWriteGpsExif(string imagePath, double lat, double lon, DateTime capturedUtc)
+    /// <summary>Writes GPS latitude/longitude and capture time into an image file (JPEG/PNG/WebP).</summary>
+    public static bool TryWriteGpsExif(string imagePath, double lat, double lon, DateTime capturedUtc)
     {
         try
         {

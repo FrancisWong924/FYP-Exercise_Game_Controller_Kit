@@ -32,9 +32,16 @@ public partial class App : Application
 
         _serverCts = new CancellationTokenSource();
         var args = e.Args.Length > 0 ? e.Args : Environment.GetCommandLineArgs().Skip(1).ToArray();
+        var noActivate = args.Any(a => string.Equals(a, "--no-activate", StringComparison.OrdinalIgnoreCase));
         // Run off the UI thread so continuations do not marshal to the Dispatcher. Otherwise OnExit's
         // Wait() on this task blocks the UI thread and deadlocks with the cancellation/finally path.
         _serverTask = Task.Run(() => Program.RunServerAsync(args, _serverCts.Token));
+
+        if (noActivate)
+        {
+            main.ShowActivated = false;
+            main.WindowState = WindowState.Minimized;
+        }
 
         main.Show();
     }

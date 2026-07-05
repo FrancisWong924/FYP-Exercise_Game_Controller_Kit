@@ -44,7 +44,7 @@ namespace BleServer
     public class InputState
     {
         public string Type { get; set; } = "input";
-        public int PlayerId { get; set; } = 1;
+        public int PlayerId { get; set; } = 0;
         public float JoyLX { get; set; } = 0f;
         public float JoyLY { get; set; } = 0f;
         public float JoyRX { get; set; } = 0f;
@@ -56,7 +56,7 @@ namespace BleServer
         public byte RightTrigger { get; set; }
 
         public override string ToString()
-            => $"Player:{PlayerId} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons:X4} LT:{LeftTrigger} RT:{RightTrigger}";
+            => $"Player:{PlayerId + 1} LX:{JoyLX,6:F2} LY:{JoyLY,6:F2} RX:{JoyRX,6:F2} RY:{JoyRY,6:F2} BTN:{Buttons:X4} LT:{LeftTrigger} RT:{RightTrigger}";
     }
 
     class Program
@@ -78,12 +78,24 @@ namespace BleServer
         /// <summary>Phone → PC GPX export: UTF-8 chunks reassembled per BLE device id.</summary>
         private static readonly ConcurrentDictionary<string, StringBuilder> _phoneGpxBuffers = new();
         private static ConcurrentDictionary<string, int> _playerIdHistory = new ConcurrentDictionary<string, int>();
-        private static int _nextPlayerId = 0;
+        private static int _nextPlayerId = -1;
+
+        /// <summary>1-based player number for console output (internal IDs are 0-based).</summary>
+        internal static int PlayerIdForLog(int playerId) => playerId + 1;
 
         // --- Game Engine Integration (WebSocket) ---
         static WebSocketServer? wsServer;
         internal static readonly List<WebSocketSharp.WebSocket> wsSessions = new();
         internal static readonly object _wsLock = new object();  // Separate lock for WS
+        /// <summary>True while at least one game WebSocket client is connected.</summary>
+        private static volatile bool _gameWsClientConnected;
+
+        /// <summary>
+        /// WebSocketSharp <see cref="WebSocket.IsAlive"/> requires a completed ping/pong round-trip.
+        /// Godot (and some other clients) are connected and can send commands before that, so track Open state instead.
+        /// </summary>
+        internal static bool IsGameWsSessionOpen(WebSocketSharp.WebSocket? ws) =>
+            ws != null && ws.ReadyState == WebSocketState.Open;
 
         // Timer for cleaning up stale connections
         private static System.Timers.Timer? disconnectTimer = null;
@@ -226,6 +238,7 @@ namespace BleServer
                 {
                     foreach (var ws in wsSessions.ToList()) { try { ws.Close(); } catch { } }
                     wsSessions.Clear();
+                    _gameWsClientConnected = false;
                 }
                 ProgramDiagnostics.LogDiag($"[BLE][Timing]   WebSocket session Close loop: {sw.ElapsedMilliseconds - t} ms");
 
@@ -245,6 +258,18 @@ namespace BleServer
             } catch (Exception ex) {
                 ProgramDiagnostics.LogDiag($"[BLE] Error after {sw.ElapsedMilliseconds} ms: {ex.Message}");
             }
+        }
+
+        static bool TryGetGamePidFromArgs(string[] args, out int gamePid)
+        {
+            foreach (var arg in args)
+            {
+                if (int.TryParse(arg, out gamePid))
+                    return true;
+            }
+
+            gamePid = 0;
+            return false;
         }
 
         /// <summary>
@@ -275,7 +300,7 @@ namespace BleServer
             };
 
             // WATCHDOG: Handles the "X" button/Crashes
-            if (args.Length > 0 && int.TryParse(args[0], out int gamePid))
+            if (TryGetGamePidFromArgs(args, out int gamePid))
             {
                 _ = Task.Run(async () =>
                 {
@@ -325,7 +350,7 @@ namespace BleServer
             }
             if (newProvider is null)
             {
-                Console.WriteLine("Failed to create GATT service after retries. Check Bluetooth, admin rights, and stray Server.Ble processes.");
+                Console.WriteLine("Failed to create GATT service after retries. Check Bluetooth, admin rights, and stray ExerSyncKitServer processes.");
                 return;
             }
             provider = newProvider;
@@ -389,7 +414,7 @@ namespace BleServer
                         // Broadcast the specific player's data
                         _ = BroadcastInputAsync(state);
 
-                        Console.WriteLine($"[P{state.PlayerId}] BTN: {state.Buttons:X4} LT:{state.LeftTrigger} RT:{state.RightTrigger} LX:{state.JoyLX:F2} LY:{state.JoyLY:F2} RX:{state.JoyRX:F2} RY:{state.JoyRY:F2}");
+                        Console.WriteLine($"[P{PlayerIdForLog(state.PlayerId)}] BTN: {state.Buttons:X4} LT:{state.LeftTrigger} RT:{state.RightTrigger} LX:{state.JoyLX:F2} LY:{state.JoyLY:F2} RX:{state.JoyRX:F2} RY:{state.JoyRY:F2}");
                     }
                 }
                 catch (Exception ex)
@@ -460,6 +485,30 @@ namespace BleServer
                     }
 
                     // GPX export from phone (chunked UTF-8, base64 per line)
+                    if (text.StartsWith("STEP_COUNT:", StringComparison.Ordinal))
+                    {
+                        if (session != null)
+                        {
+                            session.LastSeen = DateTime.Now;
+                            var rest = text["STEP_COUNT:".Length..];
+                            string? requestId = null;
+                            int value;
+                            var colon = rest.LastIndexOf(':');
+                            if (colon > 0 && int.TryParse(rest[(colon + 1)..], out value))
+                            {
+                                requestId = rest[..colon];
+                            }
+                            else if (!int.TryParse(rest, out value))
+                            {
+                                request.Respond();
+                                return;
+                            }
+
+                            BroadcastStepCountToGame(session.PlayerId, value, requestId);
+                        }
+                        request.Respond();
+                        return;
+                    }
                     if (text == "GPX_EXPORT_START")
                     {
                         _phoneGpxBuffers[deviceId] = new StringBuilder();
@@ -495,26 +544,49 @@ namespace BleServer
                     {
                         if (_phoneGpxBuffers.TryRemove(deviceId, out var sb))
                         {
-                            try
+                            var gpxXml = sb.ToString();
+                            var gpxCharCount = sb.Length;
+                            var playerLabel = session?.PlayerId.ToString() ?? "unknown";
+                            _ = Task.Run(async () =>
                             {
-                                var dir = Path.Combine(
-                                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
-                                    "ControllerExerciseGpx");
-                                Directory.CreateDirectory(dir);
-                                var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                                var pid = session?.PlayerId.ToString() ?? "unknown";
-                                var path = Path.Combine(dir, $"exercise_{stamp}_player{pid}.gpx");
-                                var xml = sb.ToString();
-                                await File.WriteAllTextAsync(path, xml);
-                                var geotagged = GpxRecordingPhotoProcessor.TryGeotagScreenshotsAndAugmentGpx(path, xml);
-                                if (geotagged > 0)
-                                    Console.WriteLine($"[GPX] Geotagged {geotagged} screenshot(s) (EXIF + GPX waypoints) for recording window.");
-                                Console.WriteLine($"[GPX] Saved from phone: {path} ({sb.Length} chars)");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[GPX] Save failed: {ex.Message}");
-                            }
+                                try
+                                {
+                                    var tempDir = Path.Combine(
+                                        Path.GetTempPath(),
+                                        "ControllerExerciseGpx",
+                                        Guid.NewGuid().ToString("N"));
+                                    Directory.CreateDirectory(tempDir);
+                                    var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                                    var path = Path.Combine(tempDir, $"exercise_{stamp}_player{playerLabel}.gpx");
+                                    await File.WriteAllTextAsync(path, gpxXml).ConfigureAwait(false);
+                                    var geotagged = GpxRecordingPhotoProcessor.TryGeotagScreenshotsAndAugmentGpx(path, gpxXml);
+                                    if (geotagged > 0)
+                                        Console.WriteLine($"[GPX] Geotagged {geotagged} screenshot(s) (EXIF + GPX waypoints) for recording window.");
+
+                                    var destFolder = GpxExportDestinationPicker.TryPickFolder();
+                                    if (destFolder == null)
+                                    {
+                                        Console.WriteLine($"[GPX] Export cancelled; prepared files remain in: {tempDir}");
+                                    }
+                                    else
+                                    {
+                                        var exportedPath = GpxExportDestinationPicker.CopyBundle(path, destFolder);
+                                        Console.WriteLine($"[GPX] Exported from phone to: {exportedPath} ({gpxCharCount} chars)");
+                                        try
+                                        {
+                                            Directory.Delete(tempDir, recursive: true);
+                                        }
+                                        catch
+                                        {
+                                            // ignore temp cleanup failures
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"[GPX] Save failed: {ex.Message}");
+                                }
+                            });
                         }
                         if (session != null) session.LastSeen = DateTime.Now;
                         request.Respond();
@@ -522,37 +594,19 @@ namespace BleServer
                     }
                     if (text == "SCREENSHOT")
                     {
-                        var devId = deviceId;
-                        var t0 = DateTime.UtcNow;
                         _ = Task.Run(async () =>
                         {
                             try
                             {
-                                await Task.Delay(30).ConfigureAwait(false);
-                                NativeInput.TriggerWinPrintScreen();
-                                await Task.Delay(2500).ConfigureAwait(false);
-                                var shotDir = Path.Combine(
-                                    Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
-                                    "Screenshots");
-                                if (!Directory.Exists(shotDir))
+                                var captured = await GeotaggedImageExporter.CaptureLatestScreenshotAsync().ConfigureAwait(false);
+                                if (captured == null)
                                 {
-                                    Console.WriteLine("[SCREENSHOT] Pictures/Screenshots folder not found.");
+                                    Console.WriteLine("[SCREENSHOT] No new image found (check Pictures/Screenshots and delay).");
                                     return;
                                 }
 
-                                var candidates = Directory.GetFiles(shotDir, "*.png")
-                                    .Select(f => (path: f, t: File.GetLastWriteTimeUtc(f)))
-                                    .Where(x => x.t >= t0.AddSeconds(-8))
-                                    .OrderByDescending(x => x.t)
-                                    .ToList();
-
-                                foreach (var c in candidates)
-                                {
-                                    Console.WriteLine($"[SCREENSHOT] Capture: {c.path} @ {c.t:O} (matched to GPX by time when you save the activity)");
-                                    return;
-                                }
-
-                                Console.WriteLine("[SCREENSHOT] No new PNG found (check Pictures/Screenshots and delay).");
+                                var t = File.GetLastWriteTimeUtc(captured);
+                                Console.WriteLine($"[SCREENSHOT] Capture: {captured} @ {t:O} (matched to GPX by time when you save the activity)");
                             }
                             catch (Exception ex)
                             {
@@ -576,7 +630,7 @@ namespace BleServer
                             }
                             else
                             {
-                                Console.WriteLine($"[P{session.PlayerId}] PING → ACK only (UI / server teardown — no PONG)");
+                                Console.WriteLine($"[P{PlayerIdForLog(session.PlayerId)}] PING → ACK only (UI / server teardown — no PONG)");
                             }
                             request.Respond();
                         }
@@ -591,7 +645,7 @@ namespace BleServer
                         if (session != null) 
                         {
                             session.LastSeen = DateTime.Now;
-                            Console.WriteLine($"[P{session.PlayerId}] COMMAND RECEIVED: {text}");
+                            Console.WriteLine($"[P{PlayerIdForLog(session.PlayerId)}] COMMAND RECEIVED: {text}");
 
                             if (IsVigemEnabled && session.Controller != null && (text == "PAUSE" || text == "RESUME"))
                             {
@@ -623,7 +677,7 @@ namespace BleServer
                             {
                                 foreach (var ws in wsSessions.ToList())
                                 {
-                                    if (ws.IsAlive) ws.Send(cmdData);
+                                    if (IsGameWsSessionOpen(ws)) ws.Send(cmdData);
                                 }
                             }
 
@@ -765,16 +819,64 @@ namespace BleServer
             try
             {
                 session.Controller?.Connect();
-                Console.WriteLine($"[ViGEm] Player {assignedId} virtual controller connected.");
-                Console.WriteLine($"[BLE] Player {assignedId} Connected ({deviceId})");
+                Console.WriteLine($"[ViGEm] Player {PlayerIdForLog(assignedId)} virtual controller connected.");
+                Console.WriteLine($"[BLE] Player {PlayerIdForLog(assignedId)} Connected ({deviceId})");
                 await Task.Delay(1000);
                 SendStatusToWSClients("CONNECTED", assignedId);
                 await session.SendMessageViaBle("VIBRATE", notifyChar);
+                TrySyncStepCountArm();
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[BLE] Initial attachment failed: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Arms phone-side game step counting once both a game WebSocket client and at least one phone are connected.
+        /// Fixes the race where STEP_COUNT_ARM was only sent on WS OnOpen before the phone had subscribed.
+        /// </summary>
+        internal static void TrySyncStepCountArm()
+        {
+            if (!_gameWsClientConnected)
+            {
+                Console.WriteLine("[BLE] STEP_COUNT_ARM deferred — game WebSocket not connected yet.");
+                return;
+            }
+            if (ConnectedPlayers.IsEmpty)
+            {
+                Console.WriteLine("[BLE] STEP_COUNT_ARM deferred — no phone controller connected yet.");
+                return;
+            }
+            Console.WriteLine($"[BLE] Game WS + {ConnectedPlayers.Count} phone(s) ready — sending STEP_COUNT_ARM.");
+            _ = BroadcastToAllPlayers("STEP_COUNT_ARM");
+        }
+
+        internal static void UpdateGameWsClientConnectedFlag()
+        {
+            lock (_wsLock)
+            {
+                wsSessions.RemoveAll(s => !IsGameWsSessionOpen(s));
+                _gameWsClientConnected = wsSessions.Count > 0;
+            }
+        }
+
+        internal static void OnGameWsSessionOpened()
+        {
+            UpdateGameWsClientConnectedFlag();
+            foreach (var playerId in ConnectedPlayers.Keys)
+            {
+                SendStatusToWSClients("CONNECTED", playerId);
+            }
+            TrySyncStepCountArm();
+        }
+
+        internal static void OnGameWsSessionEnded()
+        {
+            UpdateGameWsClientConnectedFlag();
+            if (_gameWsClientConnected) return;
+            IsVigemEnabled = true;
+            _ = BroadcastToAllPlayers("STEP_COUNT_DISARM");
         }
 
         private static async void OnSubscribedClientsChanged(GattLocalCharacteristic sender, object args) {
@@ -845,12 +947,12 @@ namespace BleServer
             {
                 Console.WriteLine("[ID] Room is empty. Resetting Player ID sequence.");
                 _playerIdHistory.Clear();
-                _nextPlayerId = 0; 
+                _nextPlayerId = -1; 
             }
             // 2. If we've seen this phone before, reuse the old ID
             if (_playerIdHistory.TryGetValue(deviceId, out int existingId))
             {
-                Console.WriteLine($"[ID] Welcome back! Reassigning ID {existingId} to {deviceId}");
+                Console.WriteLine($"[ID] Welcome back! Reassigning ID {PlayerIdForLog(existingId)} to {deviceId}");
                 return existingId;
             }
             // 3. If it's a brand new phone, generate a new ID
@@ -864,16 +966,16 @@ namespace BleServer
             if (ConnectedPlayers.TryRemove(playerId, out var session)) {
                 // DISCONNECT THE CONTROLLER
                 session.Controller?.Disconnect();
-                Console.WriteLine($"[ViGEm] Player {playerId} virtual controller removed.");
+                Console.WriteLine($"[ViGEm] Player {PlayerIdForLog(playerId)} virtual controller removed.");
 
-                Console.WriteLine($"[BLE] Player {playerId} removed (Device: {session.DeviceId}).");
+                Console.WriteLine($"[BLE] Player {PlayerIdForLog(playerId)} removed (Device: {session.DeviceId}).");
                 SendStatusToWSClients("DISCONNECTED", playerId);
                 // Check if this was the last person
                 if (ConnectedPlayers.IsEmpty)
                 {
                     Console.WriteLine("[BLE] All players gone. Clearing history for next session.");
                     _playerIdHistory.Clear();
-                    _nextPlayerId = 0;
+                    _nextPlayerId = -1;
                 }
             }
         }
@@ -907,7 +1009,7 @@ namespace BleServer
             
             lock (_wsLock) {
                 foreach (var session in wsSessions.ToList()) {
-                    if (session.IsAlive) session.Send(statusData);
+                    if (IsGameWsSessionOpen(session)) session.Send(statusData);
                 }
             }
         }
@@ -938,6 +1040,57 @@ namespace BleServer
         }
 
         // Helper to broadcast input to all games
+        internal static void BroadcastGeotagImageToGame(
+            string? requestId,
+            bool success,
+            string? exportPath,
+            string? error)
+        {
+            var cmdObj = new Dictionary<string, object?>
+            {
+                ["type"] = "geotagImage",
+                ["success"] = success,
+            };
+            if (!string.IsNullOrEmpty(requestId))
+                cmdObj["requestId"] = requestId;
+            if (!string.IsNullOrEmpty(exportPath))
+                cmdObj["exportPath"] = exportPath;
+            if (!string.IsNullOrEmpty(error))
+                cmdObj["error"] = error;
+
+            string cmdJson = JsonSerializer.Serialize(cmdObj);
+            byte[] cmdData = Encoding.UTF8.GetBytes(cmdJson + "\n");
+            lock (_wsLock)
+            {
+                foreach (var ws in wsSessions.ToList())
+                {
+                    if (IsGameWsSessionOpen(ws)) ws.Send(cmdData);
+                }
+            }
+        }
+
+        internal static void BroadcastStepCountToGame(int playerId, int value, string? requestId = null)
+        {
+            var cmdObj = new Dictionary<string, object?>
+            {
+                ["type"] = "stepCount",
+                ["playerId"] = playerId,
+                ["value"] = value,
+            };
+            if (!string.IsNullOrEmpty(requestId))
+                cmdObj["requestId"] = requestId;
+
+            string cmdJson = JsonSerializer.Serialize(cmdObj);
+            byte[] cmdData = Encoding.UTF8.GetBytes(cmdJson + "\n");
+            lock (_wsLock)
+            {
+                foreach (var ws in wsSessions.ToList())
+                {
+                    if (IsGameWsSessionOpen(ws)) ws.Send(cmdData);
+                }
+            }
+        }
+
         private static Task BroadcastInputAsync(InputState input)
         {
             return Task.Run(() =>
@@ -952,7 +1105,7 @@ namespace BleServer
                         try
                         {
                             var ws = wsSessions[i];
-                            if (ws != null && ws.IsAlive)
+                            if (ws != null && IsGameWsSessionOpen(ws))
                             {
                                 ws.Send(data);
                             }
@@ -979,7 +1132,7 @@ namespace BleServer
             }
             else
             {
-                Console.WriteLine($"[BLE] Target Player {pId} not found in active sessions.");
+                Console.WriteLine($"[BLE] Target Player {PlayerIdForLog(pId)} not found in active sessions.");
             }
         }
 
@@ -1063,9 +1216,10 @@ namespace BleServer
             Program.IsVigemEnabled = false;
             lock (Program._wsLock)
             {
-                Program.wsSessions.RemoveAll(s => !s.IsAlive);
+                Program.wsSessions.RemoveAll(s => !Program.IsGameWsSessionOpen(s));
                 Program.wsSessions.Add(Context.WebSocket);
             }
+            Program.OnGameWsSessionOpened();
         }
 
         protected override void OnClose(WebSocketSharp.CloseEventArgs e)
@@ -1074,11 +1228,8 @@ namespace BleServer
             lock (Program._wsLock)
             {
                 Program.wsSessions.Remove(Context.WebSocket);
-                if (Program.wsSessions.Count == 0)
-                {
-                    Program.IsVigemEnabled = true;
-                }
             }
+            Program.OnGameWsSessionEnded();
         }
 
         protected override void OnError(WebSocketSharp.ErrorEventArgs e)
@@ -1088,6 +1239,7 @@ namespace BleServer
             {
                 Program.wsSessions.Remove(Context.WebSocket);
             }
+            Program.OnGameWsSessionEnded();
         }
 
         protected override void OnMessage(MessageEventArgs e)
@@ -1103,6 +1255,38 @@ namespace BleServer
                     {
                         Console.WriteLine("[WS] Shutdown command received from game.");
                         Program.CleanUp();
+                    }
+                    else if (sysCmd.StartsWith("GEOTAG_IMAGE:", StringComparison.Ordinal))
+                    {
+                        var json = sysCmd["GEOTAG_IMAGE:".Length..];
+                        _ = Task.Run(async () =>
+                        {
+                            string? requestId = null;
+                            try
+                            {
+                                var req = JsonSerializer.Deserialize<GeotagImageRequest>(json, new JsonSerializerOptions
+                                {
+                                    PropertyNameCaseInsensitive = true
+                                });
+                                if (req == null || string.IsNullOrWhiteSpace(req.ExportPath))
+                                {
+                                    Program.BroadcastGeotagImageToGame(requestId, false, null, "Invalid GEOTAG_IMAGE request.");
+                                    return;
+                                }
+
+                                requestId = req.RequestId;
+                                var (success, error, outputPath) = await GeotaggedImageExporter.ExportAsync(
+                                    req.SourcePath,
+                                    req.Lat,
+                                    req.Lon,
+                                    req.ExportPath).ConfigureAwait(false);
+                                Program.BroadcastGeotagImageToGame(requestId, success, outputPath, error);
+                            }
+                            catch (Exception ex)
+                            {
+                                Program.BroadcastGeotagImageToGame(requestId, false, null, ex.Message);
+                            }
+                        });
                     }
                     return;
                 }
@@ -1132,9 +1316,12 @@ namespace BleServer
                             {
                                 if (!Program.ConnectedPlayers.ContainsKey(pId))
                                 {
-                                    return; 
+                                    var connected = string.Join(", ", Program.ConnectedPlayers.Keys.OrderBy(k => k).Select(k => Program.PlayerIdForLog(k)));
+                                    Console.WriteLine($"[WS] Target Player {Program.PlayerIdForLog(pId)} not found (connected: [{connected}]). Dropping: {actualCmd}");
+                                    return;
                                 }
                                 // DIRECT: Send to specific phone
+                                Console.WriteLine($"[WS] Sending to Player {Program.PlayerIdForLog(pId)}: {actualCmd}");
                                 await Program.SendToPlayer(pId, actualCmd);
                             }
 
@@ -1175,6 +1362,15 @@ namespace BleServer
         }
     }
 
+    internal sealed class GeotagImageRequest
+    {
+        public string? RequestId { get; set; }
+        public double Lat { get; set; }
+        public double Lon { get; set; }
+        public string ExportPath { get; set; } = "";
+        public string? SourcePath { get; set; }
+    }
+
     public class PlayerSession
     {
         public int PlayerId { get; set; }
@@ -1206,7 +1402,7 @@ namespace BleServer
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[PC] Failed to send to Player {PlayerId}: {ex.Message}");
+                Console.WriteLine($"[PC] Failed to send to Player {Program.PlayerIdForLog(PlayerId)}: {ex.Message}");
             }
         }
 

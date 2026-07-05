@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -30,7 +31,7 @@ public enum LayoutButtonShape
 public sealed class ButtonIdMaskOption
 {
     public string DisplayName { get; init; } = "";
-    public int Value { get; init; }
+    public int? Value { get; init; }
 }
 
 /// <summary>Dropdown entry for layout <c>stepTarget</c> / <c>stepButtonBitmask</c>.</summary>
@@ -39,6 +40,13 @@ public sealed class StepTargetOption
     public string DisplayName { get; init; } = "";
     public int StepTarget { get; init; }
     public int StepButtonBitmask { get; init; }
+}
+
+/// <summary>Dropdown entry for joystick <c>joystickType</c> (<c>left</c> / <c>right</c>).</summary>
+public sealed class JoystickSideOption
+{
+    public string DisplayName { get; init; } = "";
+    public string Value { get; init; } = "";
 }
 
 /// <summary>Editable element; mirrors Flutter <c>ControllerElement</c> JSON fields.</summary>
@@ -361,8 +369,7 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
         {
             Id = id,
             Type = LayoutElementKind.button,
-            Label = "A",
-            ButtonId = 1 << 0
+            Label = "A"
         };
     }
 
@@ -424,6 +431,15 @@ public sealed class LayoutElementModel : INotifyPropertyChanged
         }
 
         return dto;
+    }
+
+    public static LayoutElementModel FromDto(LayoutElementDto dto)
+    {
+        // If the incoming DTO is null, return an empty model or handle as appropriate
+        if (dto == null)
+            throw new ArgumentNullException(nameof(dto));
+
+        return LayoutElementDto.ToModel(dto);
     }
 
     void OnPropertyChanged([CallerMemberName] string? name = null)
@@ -530,6 +546,12 @@ public sealed class LayoutElementDto
 
 public sealed class ControllerLayoutDocument
 {
+    /// <summary>Custom on-disk extension; file contents remain JSON.</summary>
+    public const string FileExtension = ".exersync";
+
+    public const string FileDialogFilter =
+        "Controller layout (*.exersync)|*.exersync|All files (*.*)|*.*";
+
     [JsonPropertyName("layoutName")]
     public string LayoutName { get; set; } = "New layout";
 
@@ -563,6 +585,13 @@ public sealed class ControllerLayoutDocument
             }
         };
         return JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    public static ControllerLayoutDocument? Deserialize(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return null;
+        return JsonSerializer.Deserialize<ControllerLayoutDocument>(json);
     }
 
     static string? NormalizeOptionalString(string? s)
@@ -604,6 +633,55 @@ public sealed class ControllerLayoutDocument
             return false;
         }
         return value.Length > 0;
+    }
+}
+
+/// <summary>Reserved toolbar button ids (screenshot, pause/resume, settings) for layout customization.</summary>
+public static class ToolbarLayoutHelper
+{
+    public const string ScreenshotId = "toolbar_screenshot";
+    public const string PauseId = "toolbar_pause";
+    public const string SettingsId = "toolbar_settings";
+
+    public const double ToolbarY = 0.05;
+    static readonly double[] ToolbarX = [0.4487, 0.5231, 0.5974];
+
+    public static bool IsToolbarElement(string? id) =>
+        id is ScreenshotId or PauseId or SettingsId;
+
+    public static IEnumerable<LayoutElementModel> CreateDefaultToolbarButtons()
+    {
+        yield return CreateToolbarButton(ScreenshotId, 17, "Screenshot", "screenshot", ToolbarX[0]);
+        yield return CreateToolbarButton(PauseId, 16, "Pause", "pause", ToolbarX[1]);
+        yield return CreateToolbarButton(SettingsId, 18, "Settings", "settings", ToolbarX[2]);
+    }
+
+    static LayoutElementModel CreateToolbarButton(string id, int bitIndex, string label, string icon, double x) =>
+        new()
+        {
+            Id = id,
+            Type = LayoutElementKind.button,
+            X = x,
+            Y = ToolbarY,
+            Size = 26,
+            ButtonWidth = 36,
+            ButtonHeight = 26,
+            ButtonShape = LayoutButtonShape.rectangle,
+            BackgroundColor = "3DFFFFFF",
+            Color = "FFFFFFFF",
+            ButtonId = 1 << bitIndex,
+            Label = label,
+            UseSystemIcon = icon,
+        };
+
+    public static void EnsureToolbarButtons(ObservableCollection<LayoutElementModel> elements)
+    {
+        var existing = new HashSet<string>(elements.Select(e => e.Id));
+        foreach (var tb in CreateDefaultToolbarButtons())
+        {
+            if (!existing.Contains(tb.Id))
+                elements.Add(tb);
+        }
     }
 }
 
