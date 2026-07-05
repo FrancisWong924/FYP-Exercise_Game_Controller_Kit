@@ -31,8 +31,14 @@ enum ButtonShape {
   rectangle,
 }
 
-/// Matches PC layout creator: absolute corner resize with optional grid snap, min sizes only.
+enum LayoutResizeCorner { topLeft, topRight, bottomLeft, bottomRight }
+
+/// Matches PC layout creator: four-corner resize, anchored opposite corner, optional grid snap.
 class LayoutEditorResize {
+  static const double hostPadding = 4.0;
+  static const double resizeHitMax = 36.0;
+  static const double resizeHitFraction = 0.35;
+  static const double resizeGripVisual = 10.0;
   static const double joystickMinRadius = 40.0;
   static const double buttonSquareMinSize = 40.0;
   static const double buttonRectMinWidth = 24.0;
@@ -43,41 +49,230 @@ class LayoutEditorResize {
     return (value / gridSize).roundToDouble() * gridSize;
   }
 
-  static void applyButtonResizeFromPointer({
-    required ControllerElement element,
-    required Offset elementCenterOnScreen,
-    required Offset pointerOnScreen,
-    required double gridSize,
-  }) {
-    final logicalDx = math.max(pointerOnScreen.dx - elementCenterOnScreen.dx, 0.0);
-    final logicalDy = math.max(pointerOnScreen.dy - elementCenterOnScreen.dy, 0.0);
-
-    if (element.buttonShape == ButtonShape.rectangle) {
-      final nextW = math.max(logicalDx * 2, buttonRectMinWidth).toDouble();
-      final nextH = math.max(logicalDy * 2, buttonRectMinHeight).toDouble();
-      element.buttonWidth = math.max(snapToGrid(nextW, gridSize), buttonRectMinWidth);
-      element.buttonHeight = math.max(snapToGrid(nextH, gridSize), buttonRectMinHeight);
-      return;
-    }
-
-    final nextSize = math.max(math.max(logicalDx, logicalDy) * 2, buttonSquareMinSize).toDouble();
-    element.size = math.max(snapToGrid(nextSize, gridSize), buttonSquareMinSize);
+  static double cornerHitSize(double hitW, double hitH) {
+    final adaptive = math.min(hitW, hitH) * resizeHitFraction;
+    return math.min(resizeHitMax, math.max(adaptive, resizeGripVisual));
   }
 
-  static void applyJoystickResizeFromPointer({
+  static LayoutResizeCorner? tryGetResizeCorner(
+    double localX,
+    double localY,
+    double hitW,
+    double hitH,
+  ) {
+    final hit = cornerHitSize(hitW, hitH);
+    LayoutResizeCorner? best;
+    var bestDist = double.infinity;
+
+    void consider(LayoutResizeCorner corner, bool inZone, double dist) {
+      if (!inZone || dist >= bestDist) return;
+      best = corner;
+      bestDist = dist;
+    }
+
+    if (localX <= hit && localY <= hit) {
+      consider(LayoutResizeCorner.topLeft, true, math.sqrt(localX * localX + localY * localY));
+    }
+    if (localX >= hitW - hit && localY <= hit) {
+      consider(
+        LayoutResizeCorner.topRight,
+        true,
+        math.sqrt((hitW - localX) * (hitW - localX) + localY * localY),
+      );
+    }
+    if (localX <= hit && localY >= hitH - hit) {
+      consider(
+        LayoutResizeCorner.bottomLeft,
+        true,
+        math.sqrt(localX * localX + (hitH - localY) * (hitH - localY)),
+      );
+    }
+    if (localX >= hitW - hit && localY >= hitH - hit) {
+      consider(
+        LayoutResizeCorner.bottomRight,
+        true,
+        math.sqrt((hitW - localX) * (hitW - localX) + (hitH - localY) * (hitH - localY)),
+      );
+    }
+    return best;
+  }
+
+  static Offset anchorForCorner(
+    LayoutResizeCorner corner,
+    double left,
+    double top,
+    double hitW,
+    double hitH,
+  ) {
+    switch (corner) {
+      case LayoutResizeCorner.topLeft:
+        return Offset(left + hitW, top + hitH);
+      case LayoutResizeCorner.topRight:
+        return Offset(left, top + hitH);
+      case LayoutResizeCorner.bottomLeft:
+        return Offset(left + hitW, top);
+      case LayoutResizeCorner.bottomRight:
+        return Offset(left, top);
+    }
+  }
+
+  static void applyButtonResize({
     required ControllerElement element,
-    required Offset elementCenterOnScreen,
-    required Offset pointerOnScreen,
+    required LayoutResizeCorner corner,
+    required Offset anchorScreen,
+    required Offset pointerScreen,
+    required Size screenSize,
     required double gridSize,
   }) {
-    final logicalDx = math.max(pointerOnScreen.dx - elementCenterOnScreen.dx, 0.0);
-    final logicalDy = math.max(pointerOnScreen.dy - elementCenterOnScreen.dy, 0.0);
-    final next = math.max(math.max(logicalDx, logicalDy), joystickMinRadius).toDouble();
+    double newLeft, newTop, newRight, newBottom;
+    switch (corner) {
+      case LayoutResizeCorner.topLeft:
+        newLeft = pointerScreen.dx;
+        newTop = pointerScreen.dy;
+        newRight = anchorScreen.dx;
+        newBottom = anchorScreen.dy;
+        break;
+      case LayoutResizeCorner.topRight:
+        newLeft = anchorScreen.dx;
+        newTop = pointerScreen.dy;
+        newRight = pointerScreen.dx;
+        newBottom = anchorScreen.dy;
+        break;
+      case LayoutResizeCorner.bottomLeft:
+        newLeft = pointerScreen.dx;
+        newTop = anchorScreen.dy;
+        newRight = anchorScreen.dx;
+        newBottom = pointerScreen.dy;
+        break;
+      case LayoutResizeCorner.bottomRight:
+        newLeft = anchorScreen.dx;
+        newTop = anchorScreen.dy;
+        newRight = pointerScreen.dx;
+        newBottom = pointerScreen.dy;
+        break;
+    }
+
+    final (minW, minH) = element.buttonShape == ButtonShape.rectangle
+        ? (buttonRectMinWidth, buttonRectMinHeight)
+        : (buttonSquareMinSize, buttonSquareMinSize);
+
+    if (newRight - newLeft < minW) {
+      if (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.bottomLeft) {
+        newLeft = newRight - minW;
+      } else {
+        newRight = newLeft + minW;
+      }
+    }
+    if (newBottom - newTop < minH) {
+      if (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.topRight) {
+        newTop = newBottom - minH;
+      } else {
+        newBottom = newTop + minH;
+      }
+    }
+
+    final newHitW = newRight - newLeft;
+    final newHitH = newBottom - newTop;
+
+    if (element.buttonShape == ButtonShape.rectangle) {
+      element.buttonWidth = math.max(snapToGrid(math.max(newHitW, buttonRectMinWidth), gridSize), buttonRectMinWidth);
+      element.buttonHeight = math.max(snapToGrid(math.max(newHitH, buttonRectMinHeight), gridSize), buttonRectMinHeight);
+    } else {
+      final nextSize = math.max(math.max(newHitW, newHitH), buttonSquareMinSize);
+      element.size = math.max(snapToGrid(nextSize, gridSize), buttonSquareMinSize);
+    }
+
+    final layout = element.buttonLayoutSize;
+    final finalW = layout.width;
+    final finalH = layout.height;
+    final pinnedLeft = (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.bottomLeft)
+        ? anchorScreen.dx - finalW
+        : anchorScreen.dx;
+    final pinnedTop = (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.topRight)
+        ? anchorScreen.dy - finalH
+        : anchorScreen.dy;
+    element.position = Offset(
+      ((pinnedLeft + finalW / 2) / screenSize.width).clamp(0.0, 1.0),
+      ((pinnedTop + finalH / 2) / screenSize.height).clamp(0.0, 1.0),
+    );
+  }
+
+  static void applyJoystickResize({
+    required ControllerElement element,
+    required LayoutResizeCorner corner,
+    required Offset anchorScreen,
+    required Offset pointerScreen,
+    required Size screenSize,
+    required double gridSize,
+  }) {
+    double newLeft, newTop, newRight, newBottom;
+    switch (corner) {
+      case LayoutResizeCorner.topLeft:
+        newLeft = pointerScreen.dx;
+        newTop = pointerScreen.dy;
+        newRight = anchorScreen.dx;
+        newBottom = anchorScreen.dy;
+        break;
+      case LayoutResizeCorner.topRight:
+        newLeft = anchorScreen.dx;
+        newTop = pointerScreen.dy;
+        newRight = pointerScreen.dx;
+        newBottom = anchorScreen.dy;
+        break;
+      case LayoutResizeCorner.bottomLeft:
+        newLeft = pointerScreen.dx;
+        newTop = anchorScreen.dy;
+        newRight = anchorScreen.dx;
+        newBottom = pointerScreen.dy;
+        break;
+      case LayoutResizeCorner.bottomRight:
+        newLeft = anchorScreen.dx;
+        newTop = anchorScreen.dy;
+        newRight = pointerScreen.dx;
+        newBottom = pointerScreen.dy;
+        break;
+    }
+
+    const minW = joystickMinRadius * 2;
+    const minH = joystickMinRadius * 2;
+    if (newRight - newLeft < minW) {
+      if (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.bottomLeft) {
+        newLeft = newRight - minW;
+      } else {
+        newRight = newLeft + minW;
+      }
+    }
+    if (newBottom - newTop < minH) {
+      if (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.topRight) {
+        newTop = newBottom - minH;
+      } else {
+        newBottom = newTop + minH;
+      }
+    }
+
+    final newHitW = newRight - newLeft;
+    final newHitH = newBottom - newTop;
+    final next = math.max(math.max(newHitW, newHitH) / 2, joystickMinRadius);
     element.size = math.max(snapToGrid(next, gridSize), joystickMinRadius);
+
+    final finalSize = element.size * 2;
+    final pinnedLeft = (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.bottomLeft)
+        ? anchorScreen.dx - finalSize
+        : anchorScreen.dx;
+    final pinnedTop = (corner == LayoutResizeCorner.topLeft || corner == LayoutResizeCorner.topRight)
+        ? anchorScreen.dy - finalSize
+        : anchorScreen.dy;
+    element.position = Offset(
+      ((pinnedLeft + finalSize / 2) / screenSize.width).clamp(0.0, 1.0),
+      ((pinnedTop + finalSize / 2) / screenSize.height).clamp(0.0, 1.0),
+    );
   }
 }
 
 class ControllerLayout {
+  static const double defaultTiltDeadzone = 0.08;
+  static const double defaultTiltDeadzoneWhileStepping = 0.5;
+
   final String gameId;          // e.g., "racing_game_01"
   String layoutName;      // e.g., "Manual Transmission"
   bool favorite;        // User can mark certain layouts as favorites
@@ -87,6 +282,8 @@ class ControllerLayout {
   ControllerId tiltTarget;
   ControllerId stepTarget;
   int stepButtonBitmask;
+  double? tiltDeadzone;
+  double? tiltDeadzoneWhileStepping;
   final List<ControllerElement> elements;
 
   ControllerLayout({
@@ -100,7 +297,13 @@ class ControllerLayout {
     this.tiltTarget = ControllerId.rightJoystick,
     this.stepTarget = ControllerId.leftJoystick,
     this.stepButtonBitmask = 0,
+    this.tiltDeadzone,
+    this.tiltDeadzoneWhileStepping,
   });
+
+  double get effectiveTiltDeadzone => tiltDeadzone ?? defaultTiltDeadzone;
+  double get effectiveTiltDeadzoneWhileStepping =>
+      tiltDeadzoneWhileStepping ?? defaultTiltDeadzoneWhileStepping;
 
   Map<String, dynamic> toJson() => {
     'gameId': gameId,
@@ -113,6 +316,8 @@ class ControllerLayout {
       "tiltTarget": tiltTarget.index, // Store as int
       "stepTarget": stepTarget.index,
       "stepButtonBitmask": stepButtonBitmask,
+      if (tiltDeadzone != null) "tiltDeadzone": tiltDeadzone,
+      if (tiltDeadzoneWhileStepping != null) "tiltDeadzoneWhileStepping": tiltDeadzoneWhileStepping,
       'elements': elements.map((e) => e.toJson()).toList(),
     }
   };
@@ -131,8 +336,10 @@ class ControllerLayout {
         hexColor = alpha + hexColor.substring(0, 6);
       }
     }
-    int tiltIdx = data['tiltTarget'] ?? ControllerId.rightJoystick.index;
-    int stepIdx = data['stepTarget'] ?? ControllerId.leftJoystick.index;
+    int tiltIdx = (data['tiltTarget'] as num?)?.toInt() ?? ControllerId.rightJoystick.index;
+    int stepIdx = (data['stepTarget'] as num?)?.toInt() ?? ControllerId.leftJoystick.index;
+    final tiltDeadzoneRaw = data['tiltDeadzone'];
+    final tiltDeadzoneWhileSteppingRaw = data['tiltDeadzoneWhileStepping'];
     return ControllerLayout(
       gameId: json['gameId'].toString(),
       layoutName: json['layoutName'] ?? "Default Layout",
@@ -142,7 +349,11 @@ class ControllerLayout {
       favorite: json['favorite'] ?? false,
       tiltTarget: ControllerId.values[tiltIdx],
       stepTarget: ControllerId.values[stepIdx],
-      stepButtonBitmask: data['stepButtonBitmask'] ?? 0,
+      stepButtonBitmask: (data['stepButtonBitmask'] as num?)?.toInt() ?? 0,
+      tiltDeadzone: tiltDeadzoneRaw is num ? tiltDeadzoneRaw.toDouble() : null,
+      tiltDeadzoneWhileStepping: tiltDeadzoneWhileSteppingRaw is num
+          ? tiltDeadzoneWhileSteppingRaw.toDouble()
+          : null,
       elements: elementList,
     );
   }
@@ -245,7 +456,7 @@ class ControllerElement {
     }
     final String typeName = (json['type'] as String).toLowerCase();
     final ControllerElementType elemType = ControllerElementType.values.firstWhere((e) => e.name == typeName);
-    final int bid = json['buttonId'] ?? 1 << 0;
+    final int bid = (json['buttonId'] as num?)?.toInt() ?? (1 << 0);
     ButtonShape shape = ButtonShape.circle;
     if (json['buttonShape'] != null) {
       final String sn = (json['buttonShape'] as String).toLowerCase();
@@ -280,6 +491,7 @@ class CustomButton extends StatefulWidget {
   final Function(String id, bool pressed) onPressed;
   final ValueChanged<double>? onSizeChanged;
   final double resizeGridSize;
+  final String? systemIconOverride;
 
   const CustomButton({
     super.key,
@@ -291,6 +503,7 @@ class CustomButton extends StatefulWidget {
     this.isEditing = false,
     this.isSelected = false,
     this.resizeGridSize = 8,
+    this.systemIconOverride,
   });
 
   @override
@@ -300,7 +513,8 @@ class CustomButton extends StatefulWidget {
 class _CustomButtonState extends State<CustomButton> {
   bool isPressed = false;
   bool _isResizing = false;
-  bool _dragStartedFromResizeZone = false;
+  LayoutResizeCorner? _resizeCorner;
+  Offset? _resizeAnchorScreen;
   Widget? _cachedIcon;
   String? _lastProcessedImage;
   bool? _lastPressedState;
@@ -308,6 +522,7 @@ class _CustomButtonState extends State<CustomButton> {
   double? _lastVisualScale;
   ButtonShape? _lastButtonShape;
   String? _lastUseSystemIcon;
+  String? _lastSystemIconOverride;
 
   BoxDecoration _buttonFaceDecoration(ControllerElement element, double w, double h) {
     final Color bg = isPressed ? Colors.white : Color(int.parse(element.backgroundColor, radix: 16));
@@ -345,13 +560,15 @@ class _CustomButtonState extends State<CustomButton> {
 
   Widget _buildIcon(ControllerElement element) {
     final double vis = element.buttonVisualScale;
+    final String? effectiveSystemIcon = widget.systemIconOverride ?? element.useSystemIcon;
     if (_cachedIcon != null &&
         _lastProcessedImage == element.image &&
         _lastPressedState == isPressed &&
         _lastColor == element.color &&
         _lastVisualScale == vis &&
         _lastButtonShape == element.buttonShape &&
-        _lastUseSystemIcon == element.useSystemIcon) {
+        _lastUseSystemIcon == element.useSystemIcon &&
+        _lastSystemIconOverride == widget.systemIconOverride) {
       return _cachedIcon!;
     }
 
@@ -415,14 +632,15 @@ class _CustomButtonState extends State<CustomButton> {
     }
  
     // System Icons
-    if (element.useSystemIcon != null && element.useSystemIcon != "None" && element.image == null) {
-      newlyCreatedWidget = _buildSvgLabel(element.useSystemIcon!, vis, element.color);
+    if (effectiveSystemIcon != null && effectiveSystemIcon != "None" && element.image == null) {
+      newlyCreatedWidget = _buildSvgLabel(effectiveSystemIcon, vis, element.color);
       _lastProcessedImage = null;
       _lastPressedState = isPressed;
       _lastColor = element.color;
       _lastVisualScale = vis;
       _lastButtonShape = element.buttonShape;
       _lastUseSystemIcon = element.useSystemIcon;
+      _lastSystemIconOverride = widget.systemIconOverride;
       _cachedIcon = newlyCreatedWidget;
       return newlyCreatedWidget;
     }
@@ -447,6 +665,26 @@ class _CustomButtonState extends State<CustomButton> {
 
   Widget _buildSvgLabel(String key, double visualScale, String colorHex) {
     const String path = 'assets/icons/';
+
+    final Map<String, IconData> materialIconMap = {
+      'screenshot': Icons.crop_free,
+      'pause': Icons.pause,
+      'play': Icons.play_arrow,
+      'settings': Icons.settings,
+    };
+
+    if (materialIconMap.containsKey(key)) {
+      final Color iconColor = isPressed
+          ? Colors.black
+          : colorHex != "FFFFFFFF"
+              ? Color(int.parse(colorHex, radix: 16))
+              : Colors.white;
+      return Icon(
+        materialIconMap[key],
+        color: iconColor,
+        size: visualScale * 0.55,
+      );
+    }
     
     final Map<String, String> svgMap = {
       'square':   '${path}square.svg',
@@ -507,46 +745,58 @@ class _CustomButtonState extends State<CustomButton> {
     final layout = widget.element.buttonLayoutSize;
     final double w = layout.width;
     final double h = layout.height;
-    const double resizeHitSize = 36.0;
-    final center = Offset(realX, realY);
+    final elLeft = realX - w / 2;
+    final elTop = realY - h / 2;
     return Positioned(
-      left: realX - (w / 2) - 4,
-      top: realY - (h / 2) - 4,
+      left: realX - (w / 2) - LayoutEditorResize.hostPadding,
+      top: realY - (h / 2) - LayoutEditorResize.hostPadding,
       child: GestureDetector(
         onPanStart: widget.isEditing
             ? (details) {
                 if (!widget.isSelected) return;
-                final lp = details.localPosition;
-                _dragStartedFromResizeZone =
-                    lp.dx >= (w - resizeHitSize) && lp.dy >= (h - resizeHitSize);
-                if (_dragStartedFromResizeZone) {
+                final corner = LayoutEditorResize.tryGetResizeCorner(
+                  details.localPosition.dx - LayoutEditorResize.hostPadding,
+                  details.localPosition.dy - LayoutEditorResize.hostPadding,
+                  w,
+                  h,
+                );
+                if (corner != null) {
+                  _resizeCorner = corner;
+                  _resizeAnchorScreen = LayoutEditorResize.anchorForCorner(
+                    corner, elLeft, elTop, w, h);
                   setState(() => _isResizing = true);
-                  LayoutEditorResize.applyButtonResizeFromPointer(
+                  LayoutEditorResize.applyButtonResize(
                     element: widget.element,
-                    elementCenterOnScreen: center,
-                    pointerOnScreen: details.globalPosition,
+                    corner: corner,
+                    anchorScreen: _resizeAnchorScreen!,
+                    pointerScreen: details.globalPosition,
+                    screenSize: screenSize,
                     gridSize: widget.resizeGridSize,
                   );
+                  widget.onPositionChanged(widget.element.position);
                   widget.onSizeChanged?.call(widget.element.size);
                 }
               }
             : null,
         onPanUpdate: widget.isEditing ? (details) {
           if (!widget.isSelected) return;
-          if (_isResizing) {
+          if (_isResizing && _resizeCorner != null && _resizeAnchorScreen != null) {
             setState(() {
-              LayoutEditorResize.applyButtonResizeFromPointer(
+              LayoutEditorResize.applyButtonResize(
                 element: widget.element,
-                elementCenterOnScreen: center,
-                pointerOnScreen: details.globalPosition,
+                corner: _resizeCorner!,
+                anchorScreen: _resizeAnchorScreen!,
+                pointerScreen: details.globalPosition,
+                screenSize: screenSize,
                 gridSize: widget.resizeGridSize,
               );
+              widget.onPositionChanged(widget.element.position);
               widget.onSizeChanged?.call(widget.element.size);
             });
             return;
           }
 
-          if (!_dragStartedFromResizeZone) {
+          if (!_isResizing) {
             double newX = (details.globalPosition.dx / screenSize.width).clamp(0.0, 1.0);
             double newY = (details.globalPosition.dy / screenSize.height).clamp(0.0, 1.0);
             widget.onPositionChanged(Offset(newX, newY));
@@ -555,13 +805,15 @@ class _CustomButtonState extends State<CustomButton> {
         onPanEnd: widget.isEditing
             ? (_) => setState(() {
                   _isResizing = false;
-                  _dragStartedFromResizeZone = false;
+                  _resizeCorner = null;
+                  _resizeAnchorScreen = null;
                 })
             : null,
         onPanCancel: widget.isEditing
             ? () => setState(() {
                   _isResizing = false;
-                  _dragStartedFromResizeZone = false;
+                  _resizeCorner = null;
+                  _resizeAnchorScreen = null;
                 })
             : null,
         onTap: widget.isEditing ? widget.onSelect : null,
@@ -585,44 +837,18 @@ class _CustomButtonState extends State<CustomButton> {
                 : Border.all(color: Colors.transparent),
             borderRadius: BorderRadius.circular(4), // Slightly rounded corners for the square
           ),
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Transform.scale(
-                scale: isPressed ? 0.92 : 1.0,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 80),
-                  width: w,
-                  height: h,
-                  decoration: hideDecoration
-                      ? null
-                      : _buttonFaceDecoration(widget.element, w, h),
-                  alignment: Alignment.center,
-                  child: _buildIcon(widget.element),
-                ),
-              ),
-              if (widget.isEditing && widget.isSelected)
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: IgnorePointer(
-                    child: Container(
-                      width: 24,
-                      height: 24,
-                      decoration: BoxDecoration(
-                        color: Colors.blueAccent,
-                        borderRadius: BorderRadius.circular(3),
-                        border: Border.all(color: Colors.white, width: 1),
-                      ),
-                      child: const Icon(
-                        Icons.open_in_full,
-                        size: 12,
-                        color: Colors.white,
-                      ),
-                    ),
-                  ),
-                ),
-            ],
+          child: Transform.scale(
+            scale: isPressed ? 0.92 : 1.0,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 80),
+              width: w,
+              height: h,
+              decoration: hideDecoration
+                  ? null
+                  : _buttonFaceDecoration(widget.element, w, h),
+              alignment: Alignment.center,
+              child: _buildIcon(widget.element),
+            ),
           ),
         ),
       ),
@@ -662,7 +888,8 @@ class _CustomJoystickState extends State<CustomJoystick> {
   Offset? dragStartCenter;
   Timer? _joystickTimer;
   bool _isResizing = false;
-  bool _dragStartedFromResizeZone = false;
+  LayoutResizeCorner? _resizeCorner;
+  Offset? _resizeAnchorScreen;
 
   @override
   void initState() {
@@ -729,29 +956,37 @@ class _CustomJoystickState extends State<CustomJoystick> {
     final screenSize = MediaQuery.of(context).size;
     final double maxRadius = widget.element.size;
     final double diameter = maxRadius * 2;
-    const double resizeHitSize = 36.0;
-    // Convert 0.0-1.0 to actual pixels
     final double realX = widget.element.position.dx * screenSize.width;
     final double realY = widget.element.position.dy * screenSize.height;
-    final center = Offset(realX, realY);
+    final elLeft = realX - maxRadius;
+    final elTop = realY - maxRadius;
     return Positioned(
-      left: realX - maxRadius - 4,
-      top: realY - maxRadius - 4,
+      left: realX - maxRadius - LayoutEditorResize.hostPadding,
+      top: realY - maxRadius - LayoutEditorResize.hostPadding,
       child: GestureDetector(
         onPanStart: widget.isEditing
             ? (details) {
                 if (!widget.isSelected) return;
-                final lp = details.localPosition;
-                _dragStartedFromResizeZone =
-                    lp.dx >= (diameter - resizeHitSize) && lp.dy >= (diameter - resizeHitSize);
-                if (_dragStartedFromResizeZone) {
+                final corner = LayoutEditorResize.tryGetResizeCorner(
+                  details.localPosition.dx - LayoutEditorResize.hostPadding,
+                  details.localPosition.dy - LayoutEditorResize.hostPadding,
+                  diameter,
+                  diameter,
+                );
+                if (corner != null) {
+                  _resizeCorner = corner;
+                  _resizeAnchorScreen = LayoutEditorResize.anchorForCorner(
+                    corner, elLeft, elTop, diameter, diameter);
                   setState(() => _isResizing = true);
-                  LayoutEditorResize.applyJoystickResizeFromPointer(
+                  LayoutEditorResize.applyJoystickResize(
                     element: widget.element,
-                    elementCenterOnScreen: center,
-                    pointerOnScreen: details.globalPosition,
+                    corner: corner,
+                    anchorScreen: _resizeAnchorScreen!,
+                    pointerScreen: details.globalPosition,
+                    screenSize: screenSize,
                     gridSize: widget.resizeGridSize,
                   );
+                  widget.onPositionChanged(widget.element.position);
                   widget.onSizeChanged?.call(widget.element.size);
                 }
               }
@@ -759,19 +994,22 @@ class _CustomJoystickState extends State<CustomJoystick> {
         onPanUpdate: widget.isEditing
           ? (details) {
               if (!widget.isSelected) return;
-              if (_isResizing) {
+              if (_isResizing && _resizeCorner != null && _resizeAnchorScreen != null) {
                 setState(() {
-                  LayoutEditorResize.applyJoystickResizeFromPointer(
+                  LayoutEditorResize.applyJoystickResize(
                     element: widget.element,
-                    elementCenterOnScreen: center,
-                    pointerOnScreen: details.globalPosition,
+                    corner: _resizeCorner!,
+                    anchorScreen: _resizeAnchorScreen!,
+                    pointerScreen: details.globalPosition,
+                    screenSize: screenSize,
                     gridSize: widget.resizeGridSize,
                   );
+                  widget.onPositionChanged(widget.element.position);
                   widget.onSizeChanged?.call(widget.element.size);
                 });
                 return;
               }
-              if (!_dragStartedFromResizeZone) {
+              if (!_isResizing) {
                 double newX = (details.globalPosition.dx / screenSize.width).clamp(0.0, 1.0);
                 double newY = (details.globalPosition.dy / screenSize.height).clamp(0.0, 1.0);
                 widget.onPositionChanged(Offset(newX, newY));
@@ -781,13 +1019,15 @@ class _CustomJoystickState extends State<CustomJoystick> {
         onPanEnd: widget.isEditing
             ? (_) => setState(() {
                   _isResizing = false;
-                  _dragStartedFromResizeZone = false;
+                  _resizeCorner = null;
+                  _resizeAnchorScreen = null;
                 })
             : _onPanEnd,
         onPanCancel: widget.isEditing
             ? () => setState(() {
                   _isResizing = false;
-                  _dragStartedFromResizeZone = false;
+                  _resizeCorner = null;
+                  _resizeAnchorScreen = null;
                 })
             : null,
         onTap: widget.isEditing ? widget.onSelect : null,
@@ -799,70 +1039,44 @@ class _CustomJoystickState extends State<CustomJoystick> {
                 : Border.all(color: Colors.transparent),
             borderRadius: BorderRadius.circular(4),
           ),
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Container(
-                width: diameter,
-                height: diameter,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Color(int.parse(widget.element.backgroundColor, radix: 16)),
-                  border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white54, width: 2),
-                ),
-                child: Stack(
-                  children: [
-                    Center(
-                      child: Container(
-                        width: maxRadius * 1.6,
-                        height: maxRadius * 1.6, 
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle, 
-                          border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white30)
-                        )
-                      )
+          child: Container(
+            width: diameter,
+            height: diameter,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Color(int.parse(widget.element.backgroundColor, radix: 16)),
+              border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white54, width: 2),
+            ),
+            child: Stack(
+              children: [
+                Center(
+                  child: Container(
+                    width: maxRadius * 1.6,
+                    height: maxRadius * 1.6,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white30),
                     ),
-                    Center(
-                      child: Transform.translate(
-                        offset: delta, 
-                        child: Container(
-                          width: 44, 
-                          height: 44, 
-                          decoration: BoxDecoration(
-                            color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white, 
-                            shape: BoxShape.circle, 
-                            boxShadow: const [
-                              BoxShadow(blurRadius: 8, color: Colors.black45)
-                            ]
-                          )
-                        )
-                      )
-                    ),
-                  ],
+                  ),
                 ),
-              ),
-              if (widget.isEditing && widget.isSelected)
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: IgnorePointer(
+                Center(
+                  child: Transform.translate(
+                    offset: delta,
                     child: Container(
-                      width: 24,
-                      height: 24,
+                      width: 44,
+                      height: 44,
                       decoration: BoxDecoration(
-                        color: Colors.blueAccent,
-                        borderRadius: BorderRadius.circular(3),
-                        border: Border.all(color: Colors.white, width: 1),
-                      ),
-                      child: const Icon(
-                        Icons.open_in_full,
-                        size: 12,
-                        color: Colors.white,
+                        color: widget.element.color != "FFFFFFFF" ? Color(int.parse(widget.element.color, radix: 16)) : Colors.white,
+                        shape: BoxShape.circle,
+                        boxShadow: const [
+                          BoxShadow(blurRadius: 8, color: Colors.black45),
+                        ],
                       ),
                     ),
                   ),
                 ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

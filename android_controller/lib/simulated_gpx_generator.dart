@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:geolocator/geolocator.dart';
 import 'package:gpx/gpx.dart';
 
 /// Synthetic GPX trail: Haversine random walk in small steps; timestamps run **forward**
@@ -10,9 +11,31 @@ import 'package:gpx/gpx.dart';
 class SimulatedGpxGenerator {
   SimulatedGpxGenerator._();
 
-  /// Python script defaults (`--lat` / `--lon`).
-  static const double defaultLat = 3.2206334;
-  static const double defaultLon = 101.9676587;
+  static const double _fallbackLat = 3.2206334;
+  static const double _fallbackLon = 101.9676587;
+
+  /// Last-resort coordinates when GPS is unavailable.
+  static double get fallbackLat => _fallbackLat;
+  static double get fallbackLon => _fallbackLon;
+
+  /// User location when permitted; otherwise [_fallbackLat] / [_fallbackLon].
+  static Future<({double lat, double lon})> resolveDefaultStartPosition() async {
+    try {
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
+        return (lat: _fallbackLat, lon: _fallbackLon);
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
+      ).timeout(const Duration(seconds: 8));
+      return (lat: pos.latitude, lon: pos.longitude);
+    } catch (_) {
+      return (lat: _fallbackLat, lon: _fallbackLon);
+    }
+  }
 
   static const double _scale = 0.0001;
   static const double _angleVariability = math.pi / 7;
@@ -48,8 +71,8 @@ class SimulatedGpxGenerator {
     required DateTime recordingStartUtc,
     required DateTime recordingEndUtc,
     required int hardwareStepCount,
-    double startLat = defaultLat,
-    double startLon = defaultLon,
+    double startLat = _fallbackLat,
+    double startLon = _fallbackLon,
     double metersPerStep = defaultMetersPerStep,
     math.Random? random,
   }) {

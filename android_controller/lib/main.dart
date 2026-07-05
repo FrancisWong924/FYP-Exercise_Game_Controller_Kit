@@ -14,9 +14,11 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:pedometer/pedometer.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'game_step_counter.dart';
+import 'controller_tutorial.dart';
+import 'controller_user_settings.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -38,6 +40,7 @@ class ControllerApp extends StatefulWidget {
 
 class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserver {
   final BleManager bleManager = BleManager();
+  final GameStepCounter gameStepCounter = GameStepCounter();
   late SharedPreferences prefs;
   String _status = 'Connecting...';
   bool showStatusBanner = true;
@@ -54,9 +57,17 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   double steeringValue = 0.0; // -1.0 (left) to +1.0 (right)
 
   StreamSubscription<AccelerometerEvent>? accelSubscription;
+  final List<double> _walkingAccelRollWindow = [];
+  static const int _walkingAccelRollWindowSize = 9;
+  final List<double> _recentSteppingSteering = [];
+  static const int _recentSteppingSteeringSize = 7;
+  static const double _steppingSteeringMax = 0.75;
+  double _lastConfirmedSteppingSteering = 0.0;
+  bool _wasWalking = false;
   double accelZ = 0.0;  // Current Z-axis accel
   double stepThreshold = 1.5;  // Tune this: higher = needs stronger shake/step
   double lastAccelZ = 0.0;
+  double stepValue = 0.0;
   Timer? stepTimer;  // Debounce steps
   bool isWalking = false;  // True if forward motion detected
   bool steeringEnabled = false; // New: toggle for steering control
@@ -70,8 +81,10 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
 
   static const String _kExerciseMapPickLat = 'exercise_map_pick_lat';
   static const String _kExerciseMapPickLon = 'exercise_map_pick_lon';
+  static const String _kDefaultLayoutStandardToolbar = 'default_layout_uses_standard_toolbar';
 
   static String defaultKey = "Default_Layout";
+  static String superTaxKartKey = "SuperTaxKart_v1";
   ControllerLayout? defaultLayout;
   ControllerLayout? currentLayout;
   ControllerLayout? cachedLayout; 
@@ -88,7 +101,30 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   double resizeGridSize = 8;
   final TextEditingController _resizeGridSizeController = TextEditingController(text: '8');
 
+  final GlobalKey _standardToolbarKey = GlobalKey();
+  final GlobalKey _tutorialLayoutToolbarKey = GlobalKey();
+  final GlobalKey _tutorialScreenshotKey = GlobalKey();
+  final GlobalKey _tutorialPauseKey = GlobalKey();
+  final GlobalKey _tutorialSettingsKey = GlobalKey();
+  final GlobalKey _tutorialCustomizeLayoutKey = GlobalKey();
+  final GlobalKey _tutorialElementMappingKey = GlobalKey();
+  final GlobalKey _tutorialTiltSteeringKey = GlobalKey();
+  final GlobalKey _tutorialStepDetectionKey = GlobalKey();
+  final GlobalKey _tutorialExerciseGpxKey = GlobalKey();
+  final GlobalKey _tutorialEditorToolbarKey = GlobalKey();
+  final GlobalKey _tutorialEditorToolbarLeftKey = GlobalKey();
+  final GlobalKey _tutorialEditorToolbarRightKey = GlobalKey();
+  final GlobalKey _tutorialElementMappingButtonsKey = GlobalKey();
+  final GlobalKey _tutorialElementMappingTiltKey = GlobalKey();
+  final GlobalKey _tutorialElementMappingStepKey = GlobalKey();
+  final GlobalKey _tutorialElementMappingDialogKey = GlobalKey();
+  final GlobalKey _tutorialExerciseMapDialogKey = GlobalKey();
+  bool _tutorialScheduled = false;
+
   bool _gpxExerciseRecording = false;
+  bool _gpxSetupInProgress = false;
+  bool _gpxTutorialStopDisplay = false;
+  StateSetter? _settingsDialogSetState;
   StreamSubscription<StepCount>? _gpxPedometerSub;
   int? _gpxStepBaseline;
   int? _gpxLastPedometerSteps;
@@ -113,6 +149,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     "B": 1 << 13,
     "X": 1 << 14,
     "Y": 1 << 15,
+    "PAUSE/RESUME": ControllerButtonIds.pauseResume,
+    "SCREENSHOT": ControllerButtonIds.screenshot,
+    "SETTINGS": ControllerButtonIds.settings,
   };
 
   @override
@@ -130,11 +169,12 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     cachedLayout = null;
     currentLayout = null;
     currentStorageKey = null;
-    accelSubscription?.cancel();
+    _stopMotionSensorListening();
     _gpxPedometerSub?.cancel();
     stepTimer?.cancel();
     _resizeGridSizeController.dispose();
     bleManager.stopInputSending();
+    unawaited(gameStepCounter.dispose());
     bleManager.dispose();
     super.dispose();
   }
@@ -158,7 +198,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         // User came back to the app
         print("App Resumed");
         if (bleManager.pcDevice == null) {
-          setState(() => paused = false);
+          _setPaused(false);
         }
         break;
       case AppLifecycleState.detached:
@@ -170,6 +210,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   }
 
   Future<void> initializeApp() async {
+    gameStepCounter.reset();
     await initPrefs();
     defaultLayout = await getDefaultLayout();
     currentStorageKey = defaultKey;
@@ -181,6 +222,13 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
       });
     } else {
       await loadLayout(defaultKey);
+    }
+    await _migrateDefaultLayoutToStandardToolbar();
+
+    final superTaxKartLayout = await getSuperTaxKartLayout();
+    if (!prefs.containsKey(superTaxKartKey)) {
+      print("[Init] SuperTaxKart layout not found. Creating it now...");
+      await saveLayout(superTaxKartKey, superTaxKartLayout);
     }
     // Listen to connection status
     bleManager.statusStream.listen((status) {
@@ -196,38 +244,18 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           status == BleConnectionStatus.failed ||
           status == BleConnectionStatus.bluetoothOff) {
         _resetLoadingState();
-        accelSubscription?.cancel();
-        // Stop tilt steering
-        setState(() async {
-          steeringValue = 0.0;
-          _processedBackground = null;
-          backgroundColor = null;
-          currentStorageKey = defaultKey;
-          await loadLayout(defaultKey);
-          final allKeys = prefs.getKeys();
-          for (String key in allKeys) {
-            final jsonString = prefs.getString(key);
-            if (jsonString == null) continue;
-            try {
-              final Map<String, dynamic> data = jsonDecode(jsonString);
-              // Check if it's the same game/version AND it's already a favorite
-              if (data['gameId'] == defaultLayout!.gameId && data['favorite'] == true) {
-                final layout = ControllerLayout.fromJson(data);
-                currentLayout = layout;
-                currentStorageKey = key;
-              }
-            } catch (e) {
-              continue; // Skip keys that aren't valid layout JSON
-            }
-          }
-        });
-
-        // Stop step detection
+        _stopMotionSensorListening();
         stepTimer?.cancel();
         setState(() {
+          steeringValue = 0.0;
           isWalking = false;
+          _processedBackground = null;
+          backgroundColor = null;
         });
+        unawaited(_restoreLayoutAfterDisconnect());
       }
+
+      gameStepCounter.setBleConnected(status == BleConnectionStatus.connected);
 
       // When reconnecting and previously enabled, restart sensors
       if (status == BleConnectionStatus.connected) {
@@ -331,20 +359,51 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         }
 
         if (message == "ENABLE_STEP") {
-          setState(() => steppingEnabled = true);
+          print("[UI] ENABLE_STEP → game step counter + accelerometer stepping");
+          _setSteppingEnabled(true);
           return;
         }
 
         if (message == "DISABLE_STEP") {
-          setState(() => steppingEnabled = false);
+          print("[UI] DISABLE_STEP");
+          _setSteppingEnabled(false);
+          return;
+        }
+
+        if (message.startsWith("GET_STEP_COUNT:")) {
+          final reqId = message.substring("GET_STEP_COUNT:".length);
+          print("[UI] GET_STEP_COUNT reqId=$reqId → count=${gameStepCounter.count}");
+          print("[UI] ${gameStepCounter.debugState()}");
+          if (reqId.isNotEmpty) {
+            await bleManager.sendMessage("STEP_COUNT:$reqId:${gameStepCounter.count}");
+          }
+          return;
+        }
+
+        if (message == "RESET_STEP_COUNT") {
+          print("[UI] RESET_STEP_COUNT");
+          gameStepCounter.reset();
+          return;
+        }
+
+        if (message == "STEP_COUNT_ARM") {
+          print("[UI] STEP_COUNT_ARM");
+          gameStepCounter.setGameWsActive(true);
+          return;
+        }
+
+        if (message == "STEP_COUNT_DISARM") {
+          print("[UI] STEP_COUNT_DISARM");
+          gameStepCounter.setGameWsActive(false);
           return;
         }
       } catch (e) {
         print("[UI] Error decoding incoming BLE data: $e");
       }
     });
-    // Start Bluetooth connection
-    bleManager.startScanningAndConnect();
+    // Start Bluetooth connection, then auto-tutorial once permissions/UI settle.
+    await bleManager.startScanningAndConnect();
+    _scheduleTutorialIfNeeded();
   }
 
   // Helper: Log to console + update UI
@@ -394,10 +453,58 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     }
   }
 
+  void _setPaused(bool value) {
+    if (paused == value) return;
+    setState(() => paused = value);
+    gameStepCounter.setPaused(value);
+  }
+
+  void _setSteppingEnabled(bool value) {
+    if (steppingEnabled == value) return;
+    setState(() => steppingEnabled = value);
+    print("[UI] steppingEnabled:$value");
+    gameStepCounter.setStepDetectionEnabled(value);
+  }
+
+  Future<void> _handleLayoutButtonPress(ControllerElement element, bool pressed) async {
+    final bit = element.buttonId;
+    final layout = currentLayout;
+    if (layout == null) return;
+
+    if (bit == ControllerButtonIds.pauseResume) {
+      if (!pressed) return;
+      final nextPaused = !paused;
+      _setPaused(nextPaused);
+      final sent = await bleManager.sendMessage(
+        nextPaused ? "PAUSE" : "RESUME",
+        tiltTarget: layout.tiltTarget,
+        stepTarget: layout.stepTarget,
+        stepBitmask: layout.stepButtonBitmask,
+      );
+      if (!sent) _setPaused(!nextPaused);
+      return;
+    }
+
+    if (bit == ControllerButtonIds.screenshot) {
+      if (!pressed) return;
+      await bleManager.sendMessage("SCREENSHOT");
+      return;
+    }
+
+    if (bit == ControllerButtonIds.settings) {
+      if (!pressed) return;
+      _openSettingsDialog();
+      return;
+    }
+
+    bleManager.updateButton(bit, pressed);
+  }
+
   void _handleInterruption() {
+    if (_gpxSetupInProgress) return;
     // Logic to prevent the car/character from driving off forever
     if (!paused) {
-      setState(() => paused = true);
+      _setPaused(true);
       bleManager.sendMessage("PAUSE", 
         tiltTarget: currentLayout!.tiltTarget,
         stepTarget: currentLayout!.stepTarget,
@@ -419,33 +526,22 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     }
   }
 
+  void _stopMotionSensorListening() {
+    accelSubscription?.cancel();
+    accelSubscription = null;
+    _walkingAccelRollWindow.clear();
+    _recentSteppingSteering.clear();
+    _lastConfirmedSteppingSteering = 0.0;
+    _wasWalking = false;
+  }
+
   // Call this once when you need both features
   void startAccelerometerListening() {
-    accelSubscription?.cancel();
+    _stopMotionSensorListening();
 
     accelSubscription = accelerometerEventStream(samplingPeriod: SensorInterval.gameInterval)
       .listen((AccelerometerEvent event) {
         if (paused || isSettingsOpen) return;
-
-        // ── STEERING (landscape left/right tilt) ───────────────────────────────
-        double roll = math.atan2(event.z, event.y);
-        // print("Raw roll: ${roll.toStringAsFixed(3)}");
-        double deviation = neutralRoll - roll;
-        double rawSteering = deviation / maxDeviation;
-        rawSteering = rawSteering.clamp(-1.0, 1.0);
-        // print("rawSteering: ${rawSteering.toStringAsFixed(3)}");
-        const double smoothing = 0.2;
-        filteredSteering = filteredSteering * (1 - smoothing) + rawSteering * smoothing;
-
-        double steering = filteredSteering;
-        if (steering.abs() < 0.08) steering = 0.0;
-        // print("steering: ${steering.toStringAsFixed(3)}");
-        if (steeringEnabled) {
-          if ((steering - steeringValue).abs() > 0.01) {
-            steeringValue = steering;
-            bleManager.updateSteering(steeringValue, currentLayout!.tiltTarget);
-          }
-        }
 
         // ── WALKING DETECTION ──────────────────────────────────────────────────
         smoothedZ = 0.8 * smoothedZ + 0.2 * event.z;
@@ -459,21 +555,164 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
             isWalking = false;
           });
         }
+
+        final activeStepValue = steppingEnabled && isWalking ? -1.0 : 0.0;
+
+        // ── STEERING (landscape left/right tilt) ───────────────────────────────
+        final accelRoll = math.atan2(event.z, event.y);
+        final roll = _estimateRoll(accelRoll, isWalking);
+        double deviation = neutralRoll - roll;
+        double rawSteering = deviation / maxDeviation;
+        rawSteering = rawSteering.clamp(-1.0, 1.0);
+
+        if (isWalking != _wasWalking) {
+          filteredSteering = rawSteering;
+          _wasWalking = isWalking;
+        } else if (isWalking) {
+          // No EMA while stepping — avoids latching a single bad frame.
+          filteredSteering = rawSteering;
+        } else {
+          const double smoothing = 0.2;
+          filteredSteering = filteredSteering * (1 - smoothing) + rawSteering * smoothing;
+        }
+
+        double steering = filteredSteering;
+        final normalTiltDeadzone =
+            currentLayout?.effectiveTiltDeadzone ?? ControllerLayout.defaultTiltDeadzone;
+        final steppingTiltDeadzone = currentLayout?.effectiveTiltDeadzoneWhileStepping ??
+            ControllerLayout.defaultTiltDeadzoneWhileStepping;
+        final appliedTiltDeadzone =
+            activeStepValue != 0.0 ? steppingTiltDeadzone : normalTiltDeadzone;
+        steering = _applyTiltDeadzoneAndRescale(steering, appliedTiltDeadzone);
+        if (activeStepValue != 0.0) {
+          steering = steering.clamp(-_steppingSteeringMax, _steppingSteeringMax);
+          steering = _sanitizeSteppingSteering(steering);
+        } else {
+          _recentSteppingSteering.clear();
+          _lastConfirmedSteppingSteering = 0.0;
+        }
+        // print("steering: ${steering.toStringAsFixed(3)}");
+
         if (steppingEnabled) {
-          double stepValue = isWalking ? -1.0 : 0.0;
-  
+          stepValue = activeStepValue;
+
           // We check if the state actually changed to prevent spamming BLE
           if (stepValue != lastSentStepValue) {
             lastSentStepValue = stepValue;
-            
+
             bleManager.updateStep(
-              stepValue, 
-              jid: currentLayout!.stepTarget, 
-              bitmask: currentLayout!.stepButtonBitmask
+              stepValue,
+              jid: currentLayout!.stepTarget,
+              bitmask: currentLayout!.stepButtonBitmask,
             );
           }
         }
+
+        if (steeringEnabled) {
+          if ((steering - steeringValue).abs() > 0.01) {
+            steeringValue = steering;
+            bleManager.updateSteering(steeringValue, currentLayout!.tiltTarget);
+          }
+        }
     });
+  }
+
+  /// While stepping: majority-sign median accel (no gyro — shake corrupts integration).
+  /// While still: raw accelerometer roll.
+  double _estimateRoll(double accelRoll, bool walking) {
+    if (!walking) {
+      _walkingAccelRollWindow.clear();
+      return accelRoll;
+    }
+
+    _walkingAccelRollWindow.add(accelRoll);
+    if (_walkingAccelRollWindow.length > _walkingAccelRollWindowSize) {
+      _walkingAccelRollWindow.removeAt(0);
+    }
+    return _majoritySignMedianRoll(_walkingAccelRollWindow);
+  }
+
+  double _majoritySignMedianRoll(List<double> rolls) {
+    if (rolls.isEmpty) return 0.0;
+    if (rolls.length < 3) return _medianRoll(rolls);
+
+    var negCount = 0;
+    var posCount = 0;
+    for (final roll in rolls) {
+      final steer = neutralRoll - roll;
+      if (steer < -0.02) {
+        negCount++;
+      } else if (steer > 0.02) {
+        posCount++;
+      }
+    }
+
+    if (negCount > posCount) {
+      final negRolls =
+          rolls.where((roll) => neutralRoll - roll < 0).toList(growable: false);
+      if (negRolls.isNotEmpty) return _medianRoll(negRolls);
+    } else if (posCount > negCount) {
+      final posRolls =
+          rolls.where((roll) => neutralRoll - roll > 0).toList(growable: false);
+      if (posRolls.isNotEmpty) return _medianRoll(posRolls);
+    }
+
+    return _medianRoll(rolls);
+  }
+
+  /// Rejects opposite-sign spikes (e.g. +1.0 while tilting left) before BLE send.
+  double _sanitizeSteppingSteering(double steering) {
+    const signThreshold = 0.08;
+
+    if (_recentSteppingSteering.length >= 3) {
+      var negCount = 0;
+      var posCount = 0;
+      for (final sample in _recentSteppingSteering) {
+        if (sample < -signThreshold) {
+          negCount++;
+        } else if (sample > signThreshold) {
+          posCount++;
+        }
+      }
+
+      final oppositeSpike = (negCount > posCount && steering > signThreshold) ||
+          (posCount > negCount && steering < -signThreshold);
+      final extremeOpposite = steering.abs() >= 0.85 &&
+          ((negCount > posCount && steering > 0) ||
+              (posCount > negCount && steering < 0));
+
+      if (oppositeSpike || extremeOpposite) {
+        steering = _lastConfirmedSteppingSteering;
+      }
+    }
+
+    _recentSteppingSteering.add(steering);
+    if (_recentSteppingSteering.length > _recentSteppingSteeringSize) {
+      _recentSteppingSteering.removeAt(0);
+    }
+
+    if (steering.abs() > signThreshold) {
+      _lastConfirmedSteppingSteering = steering;
+    }
+
+    return steering;
+  }
+
+  double _medianRoll(List<double> rolls) {
+    if (rolls.isEmpty) return 0.0;
+    final sorted = List<double>.from(rolls)..sort();
+    final mid = sorted.length ~/ 2;
+    if (sorted.length.isOdd) return sorted[mid];
+    return (sorted[mid - 1] + sorted[mid]) / 2.0;
+  }
+
+  double _applyTiltDeadzoneAndRescale(double value, double deadzone) {
+    final dz = deadzone.clamp(0.0, 0.99);
+    final absValue = value.abs();
+    if (absValue <= dz) return 0.0;
+
+    final normalized = (absValue - dz) / (1.0 - dz);
+    return (value.isNegative ? -normalized : normalized).clamp(-1.0, 1.0);
   }
 
   Future<void> _onExerciseGpxMenuPressed() async {
@@ -484,11 +723,29 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _startExerciseGpxRecording() async {
-    Navigator.pop(context);
+  Future<bool> _ensureExerciseGpxPermissions() async {
+    if (Platform.isAndroid) {
+      final ar = await Permission.activityRecognition.request();
+      return ar.isGranted;
+    }
+    if (Platform.isIOS) {
+      final s = await Permission.sensors.request();
+      return s.isGranted;
+    }
+    return true;
+  }
+
+  void _closeSettingsDialogIfOpen() {
+    if (!isSettingsOpen) return;
+    final nav = Navigator.of(context, rootNavigator: true);
+    if (nav.canPop()) nav.pop();
+  }
+
+  Future<void> _startExerciseGpxRecording({bool forTutorialStep = false}) async {
     if (!mounted) return;
 
-    if (bleManager.pcDevice == null || !bleManager.pcDevice!.isConnected) {
+    if (!forTutorialStep &&
+        (bleManager.pcDevice == null || !bleManager.pcDevice!.isConnected)) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -498,99 +755,107 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
       return;
     }
 
-    if (Platform.isAndroid) {
-      final ar = await Permission.activityRecognition.request();
-      if (!ar.isGranted) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Physical activity permission is required for step counting.')),
-        );
-        return;
-      }
-    } else if (Platform.isIOS) {
-      final s = await Permission.sensors.request();
-      if (!s.isGranted) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Motion permission is required for step counting.')),
-        );
-        return;
-      }
-    }
-
-    final lastLat = prefs.getDouble(_kExerciseMapPickLat);
-    final lastLon = prefs.getDouble(_kExerciseMapPickLon);
-    LatLng initialCenter = lastLat != null && lastLon != null
-        ? LatLng(lastLat, lastLon)
-        : LatLng(SimulatedGpxGenerator.defaultLat, SimulatedGpxGenerator.defaultLon);
-    if (lastLat == null || lastLon == null) {
-      try {
-        var locPerm = await Geolocator.checkPermission();
-        if (locPerm == LocationPermission.denied) {
-          locPerm = await Geolocator.requestPermission();
-        }
-        if (locPerm != LocationPermission.denied &&
-            locPerm != LocationPermission.deniedForever) {
-          final pos = await Geolocator.getCurrentPosition(
-            locationSettings: const LocationSettings(accuracy: LocationAccuracy.low),
-          ).timeout(const Duration(seconds: 8));
-          initialCenter = LatLng(pos.latitude, pos.longitude);
-        }
-      } catch (_) {}
-    }
-
-    if (!mounted) return;
-    final picked = await showExerciseStartMapPicker(context, initialCenter: initialCenter);
-    if (picked == null || !mounted) return;
-
-    await prefs.setDouble(_kExerciseMapPickLat, picked.latitude);
-    await prefs.setDouble(_kExerciseMapPickLon, picked.longitude);
-
-    late StepCount firstStep;
+    if (!forTutorialStep) _gpxSetupInProgress = true;
     try {
-      firstStep = await Pedometer.stepCountStream.first.timeout(const Duration(seconds: 12));
-    } catch (e) {
+      if (!forTutorialStep) {
+        if (!await _ensureExerciseGpxPermissions()) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Physical activity permission is required for step counting.')),
+          );
+          return;
+        }
+      }
+
+      final lastLat = prefs.getDouble(_kExerciseMapPickLat);
+      final lastLon = prefs.getDouble(_kExerciseMapPickLon);
+      late final LatLng initialCenter;
+      if (lastLat != null && lastLon != null) {
+        initialCenter = LatLng(lastLat, lastLon);
+      } else if (forTutorialStep) {
+        initialCenter = LatLng(
+          SimulatedGpxGenerator.fallbackLat,
+          SimulatedGpxGenerator.fallbackLon,
+        );
+      } else {
+        final def = await SimulatedGpxGenerator.resolveDefaultStartPosition();
+        initialCenter = LatLng(def.lat, def.lon);
+      }
+
+      if (!mounted) return;
+
+      if (!forTutorialStep) {
+        _closeSettingsDialogIfOpen();
+        await WidgetsBinding.instance.endOfFrame;
+        if (!mounted) return;
+      }
+
+      final picked = await showExerciseStartMapPicker(
+        context,
+        initialCenter: initialCenter,
+        forTutorialStep: forTutorialStep,
+        dialogKey: forTutorialStep ? _tutorialExerciseMapDialogKey : null,
+        onShown: forTutorialStep
+            ? () {
+                if (mounted) _showExerciseMapTutorialHighlight(attempt: 0);
+              }
+            : null,
+      );
+      if (picked == null || !mounted) return;
+
+      if (forTutorialStep) return;
+
+      await prefs.setDouble(_kExerciseMapPickLat, picked.latitude);
+      await prefs.setDouble(_kExerciseMapPickLon, picked.longitude);
+
+      late StepCount firstStep;
+      try {
+        firstStep = await Pedometer.stepCountStream.first.timeout(const Duration(seconds: 12));
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Step counter unavailable: $e')),
+        );
+        return;
+      }
+
+      if (!mounted) return;
+
+      await _gpxPedometerSub?.cancel();
+      _gpxStepBaseline = firstStep.steps;
+      _gpxLastPedometerSteps = firstStep.steps;
+      _gpxSessionStartLat = picked.latitude;
+      _gpxSessionStartLon = picked.longitude;
+      _gpxRecordingStartedAtUtc = DateTime.now().toUtc();
+      _gpxExerciseRecording = true;
+      _gpxPedometerSub = Pedometer.stepCountStream.listen((StepCount e) {
+        if (!_gpxExerciseRecording) return;
+        _gpxLastPedometerSteps = e.steps;
+      });
+
+      setState(() {});
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Step counter unavailable: $e')),
+        const SnackBar(
+          content: Text('Exercise GPX recording started. Open settings and tap the same item when finished.'),
+          duration: Duration(seconds: 4),
+        ),
       );
-      return;
+    } finally {
+      if (!forTutorialStep) _gpxSetupInProgress = false;
     }
-
-    if (!mounted) return;
-
-    await _gpxPedometerSub?.cancel();
-    _gpxStepBaseline = firstStep.steps;
-    _gpxLastPedometerSteps = firstStep.steps;
-    _gpxSessionStartLat = picked.latitude;
-    _gpxSessionStartLon = picked.longitude;
-    _gpxRecordingStartedAtUtc = DateTime.now().toUtc();
-    _gpxExerciseRecording = true;
-    _gpxPedometerSub = Pedometer.stepCountStream.listen((StepCount e) {
-      if (!_gpxExerciseRecording) return;
-      _gpxLastPedometerSteps = e.steps;
-    });
-
-    setState(() {});
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Exercise GPX recording started. Open settings and tap the same item when finished.'),
-        duration: Duration(seconds: 4),
-      ),
-    );
   }
 
   Future<void> _stopExerciseGpxRecording() async {
-    Navigator.pop(context);
+    _closeSettingsDialogIfOpen();
     if (!mounted) return;
 
     await _gpxPedometerSub?.cancel();
     _gpxPedometerSub = null;
 
     final baseline = _gpxStepBaseline;
-    final startLat = _gpxSessionStartLat ?? SimulatedGpxGenerator.defaultLat;
-    final startLon = _gpxSessionStartLon ?? SimulatedGpxGenerator.defaultLon;
+    final startLat = _gpxSessionStartLat ?? SimulatedGpxGenerator.fallbackLat;
+    final startLon = _gpxSessionStartLon ?? SimulatedGpxGenerator.fallbackLon;
     final recordingEndUtc = DateTime.now().toUtc();
     final recordingStartUtc = _gpxRecordingStartedAtUtc ?? recordingEndUtc;
     int steps = 0;
@@ -697,6 +962,602 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     setState(() => isLoading = false);
   }
 
+  void _scheduleTutorialIfNeeded() {
+    if (_tutorialScheduled || isEditing) return;
+    _tutorialScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted || isEditing) return;
+      if (!await ControllerUserSettings.tryConsumeTutorialForCurrentVersion()) return;
+      if (!mounted || isEditing) return;
+      // BLE permission / system UI dialogs can change screen metrics after first layout.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (!mounted || isEditing) return;
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || isEditing) return;
+      _startControllerTutorial(attempt: 0);
+    });
+  }
+
+  GlobalKey? _tutorialKeyForElement(String id) {
+    switch (id) {
+      case 'toolbar_screenshot':
+        return _tutorialScreenshotKey;
+      case 'toolbar_pause':
+        return _tutorialPauseKey;
+      case 'toolbar_settings':
+        return _tutorialSettingsKey;
+      default:
+        return null;
+    }
+  }
+
+  void _startTutorialManually() {
+    Navigator.of(context, rootNavigator: true).pop();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !isEditing) _startControllerTutorial(attempt: 0);
+    });
+  }
+
+  void _startControllerTutorial({required int attempt}) {
+    if (!mounted || isEditing) return;
+
+    final elements = currentLayout?.elements ?? [];
+    final usesLayoutToolbar = _layoutHasToolbarElements(elements);
+    final toolbarKey =
+        usesLayoutToolbar ? _tutorialLayoutToolbarKey : _standardToolbarKey;
+
+    if (toolbarKey.currentContext == null) {
+      if (attempt < 8) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _startControllerTutorial(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showToolbarIntro(
+      context,
+      keyTarget: toolbarKey,
+      onFinish: () {
+        if (mounted) _openSettingsDialog(forTutorialStep: true);
+      },
+    );
+  }
+
+  Widget _buildLayoutToolbarTutorialAnchor(
+    List<ControllerElement> elements,
+    double screenWidth,
+    double screenHeight,
+  ) {
+    final toolbarEls =
+        elements.where((e) => _isToolbarElementId(e.id)).toList();
+    if (toolbarEls.isEmpty) return const SizedBox.shrink();
+
+    double left = double.infinity;
+    double top = double.infinity;
+    double right = 0;
+    double bottom = 0;
+    for (final e in toolbarEls) {
+      final layout = e.buttonLayoutSize;
+      const hostPadding = LayoutEditorResize.hostPadding;
+      final w = layout.width + hostPadding * 2;
+      final h = layout.height + hostPadding * 2;
+      final cx = e.position.dx * screenWidth;
+      final cy = e.position.dy * screenHeight;
+      left = math.min(left, cx - w / 2);
+      top = math.min(top, cy - h / 2);
+      right = math.max(right, cx + w / 2);
+      bottom = math.max(bottom, cy + h / 2);
+    }
+
+    return Positioned(
+      left: left,
+      top: top,
+      width: right - left,
+      height: bottom - top,
+      child: IgnorePointer(
+        child: SizedBox(key: _tutorialLayoutToolbarKey),
+      ),
+    );
+  }
+
+  void _showCustomizeLayoutTutorialStep({required int attempt}) {
+    if (!mounted || isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialCustomizeLayoutKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showCustomizeLayoutTutorialStep(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showCustomizeLayoutIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (mounted) _showElementMappingTutorialStep(attempt: 0);
+      },
+    );
+  }
+
+  void _showElementMappingTutorialStep({required int attempt}) {
+    if (!mounted || isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialElementMappingKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showElementMappingTutorialStep(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showElementMappingIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (mounted) _showMotionControlsTutorialStep(attempt: 0);
+      },
+    );
+  }
+
+  void _showMotionControlsTutorialStep({required int attempt}) {
+    if (!mounted || isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([
+      _tutorialTiltSteeringKey,
+      _tutorialStepDetectionKey,
+    ]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showMotionControlsTutorialStep(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showMotionControlsIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (mounted) _showExerciseGpxTutorialStep(attempt: 0);
+      },
+    );
+  }
+
+  Future<void> _showExerciseGpxTutorialStep({required int attempt}) async {
+    if (!mounted || isEditing) return;
+
+    final widgetContext = _tutorialExerciseGpxKey.currentContext;
+    if (widgetContext == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showExerciseGpxTutorialStep(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    await Scrollable.ensureVisible(
+      widgetContext,
+      alignment: 1.0,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeInOut,
+    );
+
+    if (!mounted || isEditing) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showExerciseGpxStartTutorialHighlight(attempt: 0);
+    });
+  }
+
+  void _showExerciseGpxStartTutorialHighlight({required int attempt}) {
+    if (!mounted || isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialExerciseGpxKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showExerciseGpxStartTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showExerciseGpxIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (mounted) _showEditorToolbarTutorialStep();
+      },
+    );
+  }
+
+  Future<void> _showExerciseGpxStopTutorialStep({required int attempt}) async {
+    if (!mounted) return;
+
+    final widgetContext = _tutorialExerciseGpxKey.currentContext;
+    if (widgetContext == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showExerciseGpxStopTutorialStep(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    await Scrollable.ensureVisible(
+      widgetContext,
+      alignment: 1.0,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeInOut,
+    );
+
+    if (!mounted) return;
+
+    _setGpxTutorialStopDisplay(true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showExerciseGpxStopTutorialHighlight(attempt: 0);
+    });
+  }
+
+  void _showExerciseGpxStopTutorialHighlight({required int attempt}) {
+    if (!mounted) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialExerciseGpxKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showExerciseGpxStopTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showExerciseGpxStopIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        _setGpxTutorialStopDisplay(false);
+        if (!mounted) return;
+        if (isSettingsOpen && Navigator.of(context, rootNavigator: true).canPop()) {
+          Navigator.of(context, rootNavigator: true).pop();
+          setState(() => isSettingsOpen = false);
+        }
+      },
+    );
+  }
+
+  Future<void> _showEditorToolbarTutorialStep() async {
+    if (!mounted) return;
+
+    if (isSettingsOpen && Navigator.of(context, rootNavigator: true).canPop()) {
+      Navigator.of(context, rootNavigator: true).pop();
+      if (mounted) setState(() => isSettingsOpen = false);
+    }
+
+    if (!isEditing) {
+      toggleEditMode();
+    }
+
+    if (!mounted) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showEditorToolbarTutorialHighlight(attempt: 0);
+    });
+  }
+
+  void _showEditorToolbarTutorialHighlight({required int attempt}) {
+    if (!mounted || !isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialEditorToolbarKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showEditorToolbarTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showEditorToolbarIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (mounted) _showEditorToolbarLeftTutorialHighlight(attempt: 0);
+      },
+    );
+  }
+
+  void _showEditorToolbarLeftTutorialHighlight({required int attempt}) {
+    if (!mounted || !isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialEditorToolbarLeftKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showEditorToolbarLeftTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showEditorToolbarLeftIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (mounted) _showEditorToolbarRightTutorialHighlight(attempt: 0);
+      },
+    );
+  }
+
+  void _showEditorToolbarRightTutorialHighlight({required int attempt}) {
+    if (!mounted || !isEditing) return;
+
+    final bounds = ControllerTutorial.boundsFromKeys([_tutorialEditorToolbarRightKey]);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showEditorToolbarRightTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showEditorToolbarRightIntro(
+      context,
+      highlightBounds: bounds,
+      onFinish: () {
+        if (!mounted) return;
+        _exitEditModeForTutorial();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _showElementMappingButtonsTutorialStep();
+        });
+      },
+    );
+  }
+
+  void _exitEditModeForTutorial() {
+    if (!isEditing) return;
+    setState(() {
+      editLayoutCopy = null;
+      originalLayoutJson = null;
+      isEditing = false;
+      selectedElement = null;
+    });
+    bleManager.setInputPause(false);
+  }
+
+  Future<void> _showElementMappingButtonsTutorialStep() async {
+    if (!mounted) return;
+
+    mappingSetting(forTutorialStep: true);
+  }
+
+  Future<void> _scrollAndHighlightElementMappingButtons({required int attempt}) async {
+    if (!mounted) return;
+
+    final widgetContext = _tutorialElementMappingButtonsKey.currentContext;
+    if (widgetContext == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _scrollAndHighlightElementMappingButtons(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    await Scrollable.ensureVisible(
+      widgetContext,
+      alignment: 0.0,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeInOut,
+    );
+
+    if (!mounted) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showElementMappingButtonsTutorialHighlight(attempt: 0);
+    });
+  }
+
+  void _showElementMappingButtonsTutorialHighlight({required int attempt}) {
+    if (!mounted) return;
+
+    final bounds = ControllerTutorial.visibleBoundsFromKey(_tutorialElementMappingButtonsKey);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showElementMappingButtonsTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    final dialogBounds = ControllerTutorial.boundsFromKeys([_tutorialElementMappingDialogKey]);
+
+    ControllerTutorial.showElementMappingButtonsIntro(
+      context,
+      highlightBounds: bounds,
+      dialogBounds: dialogBounds,
+      onFinish: () {
+        if (mounted) _scrollAndHighlightElementMappingTilt(attempt: 0);
+      },
+    );
+  }
+
+  Future<void> _scrollAndHighlightElementMappingTilt({required int attempt}) async {
+    if (!mounted) return;
+
+    final widgetContext = _tutorialElementMappingTiltKey.currentContext;
+    if (widgetContext == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _scrollAndHighlightElementMappingTilt(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    await Scrollable.ensureVisible(
+      widgetContext,
+      alignment: 0.0,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeInOut,
+    );
+
+    if (!mounted) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showElementMappingTiltTutorialHighlight(attempt: 0);
+    });
+  }
+
+  void _showElementMappingTiltTutorialHighlight({required int attempt}) {
+    if (!mounted) return;
+
+    final bounds = ControllerTutorial.visibleBoundsFromKey(_tutorialElementMappingTiltKey);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showElementMappingTiltTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    final dialogBounds = ControllerTutorial.boundsFromKeys([_tutorialElementMappingDialogKey]);
+
+    ControllerTutorial.showElementMappingTiltIntro(
+      context,
+      highlightBounds: bounds,
+      dialogBounds: dialogBounds,
+      onFinish: () {
+        if (mounted) _scrollAndHighlightElementMappingStep(attempt: 0);
+      },
+    );
+  }
+
+  Future<void> _scrollAndHighlightElementMappingStep({required int attempt}) async {
+    if (!mounted) return;
+
+    final widgetContext = _tutorialElementMappingStepKey.currentContext;
+    if (widgetContext == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _scrollAndHighlightElementMappingStep(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    await Scrollable.ensureVisible(
+      widgetContext,
+      alignment: 0.0,
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeInOut,
+    );
+
+    if (!mounted) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _showElementMappingStepTutorialHighlight(attempt: 0);
+    });
+  }
+
+  void _showElementMappingStepTutorialHighlight({required int attempt}) {
+    if (!mounted) return;
+
+    final bounds = ControllerTutorial.visibleBoundsFromKey(_tutorialElementMappingStepKey);
+    if (bounds == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showElementMappingStepTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    final dialogBounds = ControllerTutorial.boundsFromKeys([_tutorialElementMappingDialogKey]);
+
+    ControllerTutorial.showElementMappingStepIntro(
+      context,
+      highlightBounds: bounds,
+      dialogBounds: dialogBounds,
+      onFinish: () {
+        if (mounted) _showExerciseMapTutorialStep();
+      },
+    );
+  }
+
+  Future<void> _showExerciseMapTutorialStep() async {
+    if (!mounted) return;
+
+    final nav = Navigator.of(context, rootNavigator: true);
+    if (nav.canPop()) {
+      nav.pop();
+    }
+
+    if (!mounted) return;
+    await _startExerciseGpxRecording(forTutorialStep: true);
+  }
+
+  void _showExerciseMapTutorialHighlight({required int attempt}) {
+    if (!mounted) return;
+
+    if (_tutorialExerciseMapDialogKey.currentContext == null) {
+      if (attempt < 5) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showExerciseMapTutorialHighlight(attempt: attempt + 1);
+        });
+      }
+      return;
+    }
+
+    ControllerTutorial.showExerciseMapIntro(
+      _tutorialExerciseMapDialogKey.currentContext!,
+      dialogKey: _tutorialExerciseMapDialogKey,
+      onFinish: () {
+        if (!mounted) return;
+        final nav = Navigator.of(context, rootNavigator: true);
+        if (nav.canPop()) nav.pop();
+        if (mounted) _openSettingsDialog(forGpxStopTutorialStep: true);
+      },
+    );
+  }
+
+  Future<void> _restoreLayoutAfterDisconnect() async {
+    currentStorageKey = defaultKey;
+    await loadLayout(defaultKey);
+    ControllerLayout? favoriteLayout;
+    String? favoriteKey;
+    for (final key in prefs.getKeys()) {
+      if (key == _kExerciseMapPickLat || key == _kExerciseMapPickLon) continue;
+      final raw = prefs.get(key);
+      if (raw is! String) continue;
+      try {
+        final data = jsonDecode(raw) as Map<String, dynamic>;
+        if (data['gameId'] == defaultLayout!.gameId && data['favorite'] == true) {
+          favoriteLayout = ControllerLayout.fromJson(data);
+          favoriteKey = key;
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+    if (!mounted || favoriteLayout == null || favoriteKey == null) return;
+    setState(() {
+      currentLayout = favoriteLayout;
+      currentStorageKey = favoriteKey;
+    });
+  }
+
   Future<void> saveLayout(String storageKey, ControllerLayout layout) async {
     final String jsonString = jsonEncode(layout.toJson());
     await prefs.setString(storageKey, jsonString);
@@ -704,6 +1565,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   }
 
   Future<bool> loadLayout(String storageKey) async {
+    final previousLayout = currentLayout;
     final jsonString = prefs.getString(storageKey);
     if (jsonString != null) {
       try {     
@@ -711,6 +1573,16 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         cachedLayout = ControllerLayout.fromJson(jsonDecode(jsonString));
         currentLayout = cachedLayout; // Set current layout to the loaded cached layout
         currentStorageKey = storageKey;
+        if (previousLayout != null) {
+          bleManager.resetTiltAndStepInputs(
+            tiltTarget: previousLayout.tiltTarget,
+            stepTarget: previousLayout.stepTarget,
+            stepBitmask: previousLayout.stepButtonBitmask,
+          );
+          steeringValue = 0.0;
+          lastSentStepValue = 0.0;
+          bleManager.forceTransmitInputPacket();
+        }
         if (isEditing) {
           cloneLayout();
         }
@@ -860,6 +1732,50 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     );
   }
 
+  Future<void> _migrateDefaultLayoutToStandardToolbar() async {
+    if (prefs.getBool(_kDefaultLayoutStandardToolbar) == true) return;
+
+    final jsonString = prefs.getString(defaultKey);
+    if (jsonString == null) {
+      await prefs.setBool(_kDefaultLayoutStandardToolbar, true);
+      return;
+    }
+
+    try {
+      final Map<String, dynamic> json = jsonDecode(jsonString);
+      final data = json['data'] as Map<String, dynamic>;
+      final elements = data['elements'] as List;
+      final hasToolbar = elements.any(
+        (e) => _isToolbarElementId((e as Map<String, dynamic>)['id'] as String),
+      );
+      if (!hasToolbar) {
+        await prefs.setBool(_kDefaultLayoutStandardToolbar, true);
+        return;
+      }
+
+      data['elements'] =
+          elements.where((e) => !_isToolbarElementId((e as Map<String, dynamic>)['id'] as String)).toList();
+      final migrated = ControllerLayout.fromJson(json);
+      defaultLayout = migrated;
+      await saveLayout(defaultKey, migrated);
+      if (currentStorageKey == defaultKey) {
+        await loadLayout(defaultKey);
+      }
+      await prefs.setBool(_kDefaultLayoutStandardToolbar, true);
+      print('[Init] Migrated default layout to use standard toolbar.');
+    } catch (e) {
+      print('[Init] Default layout migration skipped: $e');
+    }
+  }
+
+  Future<ControllerLayout> getSuperTaxKartLayout() async {
+    final raw = await rootBundle.loadString('assets/SuperTaxKart.exersync');
+    final Map<String, dynamic> json = jsonDecode(raw);
+    json.putIfAbsent('gameId', () => 'SuperTaxKart');
+    json.putIfAbsent('version', () => '1');
+    return ControllerLayout.fromJson(json);
+  }
+
   void processBackgroundImage(String? source) {
     if (source == null || source.isEmpty) return;
 
@@ -916,9 +1832,159 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     bleManager.setInputPause(isEditing);
   }
 
+  bool _isToolbarElementId(String id) => id.startsWith('toolbar_');
+
+  bool _layoutHasToolbarElements(List<ControllerElement> elements) =>
+      elements.any((e) => _isToolbarElementId(e.id));
+
+  bool get _showGpxStopInSettings => _gpxExerciseRecording || _gpxTutorialStopDisplay;
+
+  void _setGpxTutorialStopDisplay(bool value) {
+    if (_gpxTutorialStopDisplay == value) return;
+    _gpxTutorialStopDisplay = value;
+    _settingsDialogSetState?.call(() {});
+  }
+
+  void _openSettingsDialog({bool forTutorialStep = false, bool forGpxStopTutorialStep = false}) {
+    setState(() => isSettingsOpen = true);
+    showDialog(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (BuildContext context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            _settingsDialogSetState = setDialogState;
+            return Center(
+              child: Material(
+                color: Colors.transparent,
+                child: Container(
+                  width: MediaQuery.of(context).size.width * 0.45,
+                  padding: const EdgeInsets.all(20),
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.of(context).size.height * 0.85,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A1A1A),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white10),
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
+                    ],
+                  ),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          "SETTINGS",
+                          style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                        ),
+                        const SizedBox(height: 20),
+                        _buildMenuButton(
+                          const Icon(Icons.tune, color: Colors.white54, size: 20),
+                          "Customize Layout",
+                          () {
+                            Navigator.pop(context);
+                            toggleEditMode();
+                          },
+                          key: _tutorialCustomizeLayoutKey,
+                        ),
+                        const SizedBox(height: 10),
+                        _buildMenuButton(
+                          const Icon(Icons.tune, color: Colors.white54, size: 20),
+                          "Element Mapping Customization",
+                          () {
+                            Navigator.pop(context);
+                            mappingSetting();
+                          },
+                          key: _tutorialElementMappingKey,
+                        ),
+                        const SizedBox(height: 10),
+                        _buildMenuButton(
+                          const Icon(Icons.tune, color: Colors.white54, size: 20),
+                          steeringEnabled ? "Disable Tilt Steering" : "Enable Tilt Steering",
+                          () {
+                            setDialogState(() {
+                              steeringEnabled = !steeringEnabled;
+                              if (!steeringEnabled) {
+                                bleManager.updateSteering(0.0, currentLayout!.tiltTarget);
+                              }
+                            });
+                          },
+                          key: _tutorialTiltSteeringKey,
+                        ),
+                        const SizedBox(height: 10),
+                        _buildMenuButton(
+                          const Icon(Icons.tune, color: Colors.white54, size: 20),
+                          steppingEnabled ? "Disable Step Detection" : "Enable Step Detection",
+                          () {
+                            final next = !steppingEnabled;
+                            _setSteppingEnabled(next);
+                            setDialogState(() {
+                              if (!next) {
+                                bleManager.updateStep(
+                                  0.0,
+                                  jid: currentLayout!.stepTarget,
+                                  bitmask: currentLayout!.stepButtonBitmask,
+                                );
+                              }
+                            });
+                          },
+                          key: _tutorialStepDetectionKey,
+                        ),
+                        const SizedBox(height: 10),
+                        _buildMenuButton(
+                          Icon(
+                            _showGpxStopInSettings ? Icons.stop_circle_outlined : Icons.fiber_manual_record,
+                            color: _showGpxStopInSettings ? Colors.redAccent : Colors.white54,
+                            size: 20,
+                          ),
+                          _showGpxStopInSettings ? 'Stop exercise GPX' : 'Start exercise GPX recording',
+                          () async {
+                            await _onExerciseGpxMenuPressed();
+                          },
+                          key: _tutorialExerciseGpxKey,
+                        ),
+                        const SizedBox(height: 10),
+                        _buildMenuButton(
+                          const Icon(Icons.school_outlined, color: Colors.white54, size: 20),
+                          "Tutorial",
+                          _startTutorialManually,
+                        ),
+                        const SizedBox(height: 10),
+                        TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    ).then((_) {
+      _settingsDialogSetState = null;
+      _gpxTutorialStopDisplay = false;
+      if (mounted) setState(() => isSettingsOpen = false);
+    });
+    if (forTutorialStep) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _showCustomizeLayoutTutorialStep(attempt: 0);
+      });
+    } else if (forGpxStopTutorialStep) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _showExerciseGpxStopTutorialStep(attempt: 0);
+      });
+    }
+  }
+
   Widget _buildStandardToolbar() {
     return Center(
       child: Row(
+        key: _standardToolbarKey,
         mainAxisSize: MainAxisSize.min,
         children: [
           GestureDetector(
@@ -939,14 +2005,16 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           const SizedBox(width: 4),
           GestureDetector(
             onTap: () async {
-              setState(() => paused = !paused);
-              final sent = await bleManager.sendMessage(paused ? "PAUSE" : "RESUME", 
+              final nextPaused = !paused;
+              _setPaused(nextPaused);
+              final sent = await bleManager.sendMessage(
+                nextPaused ? "PAUSE" : "RESUME",
                 tiltTarget: currentLayout!.tiltTarget,
                 stepTarget: currentLayout!.stepTarget,
-                stepBitmask: currentLayout!.stepButtonBitmask
+                stepBitmask: currentLayout!.stepButtonBitmask,
               );
               if (!sent) {
-                setState(() => paused = !paused);
+                _setPaused(!nextPaused);
               }
             },
             child: Container(
@@ -961,118 +2029,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           ),
           const SizedBox(width: 4),
           GestureDetector(
-            onTap: () {
-              setState(() => isSettingsOpen = true);
-              showDialog(
-                context: context,
-                barrierColor: Colors.black54, // Darkens the background
-                builder: (BuildContext context) {
-                  return StatefulBuilder(
-                    builder: (context, setDialogState) {
-                      return Center(
-                        child: Material(
-                          color: Colors.transparent,
-                          child: Container(
-                            // Set your desired width/height for the center box
-                            width: MediaQuery.of(context).size.width * 0.45,
-                            padding: const EdgeInsets.all(20),
-                            constraints: BoxConstraints(
-                              maxHeight: MediaQuery.of(context).size.height * 0.85,
-                            ),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1A1A1A), // Dark charcoal
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.white10),
-                              boxShadow: [
-                                BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
-                              ],
-                            ),
-                            child: SingleChildScrollView(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const Text(
-                                    "SETTINGS",
-                                    style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
-                                  ),
-                                  const SizedBox(height: 20),
-                                  _buildMenuButton(
-                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                    "Customize Layout", 
-                                    () {
-                                      Navigator.pop(context);
-                                      toggleEditMode();
-                                  }),
-                                  const SizedBox(height: 10),
-                                  _buildMenuButton(
-                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                    "Element Mapping Customization", 
-                                    () {
-                                      Navigator.pop(context);
-                                      mappingSetting();
-                                  }),
-                                  const SizedBox(height: 10),
-                                  _buildMenuButton(
-                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                    steeringEnabled ? "Disable Tilt Steering" : "Enable Tilt Steering",
-                                    () {
-                                      setDialogState(() {
-                                        steeringEnabled = !steeringEnabled;
-                                        if (!steeringEnabled) {
-                                          // Force immediate reset so we don't wait for the sensor loop
-                                          bleManager.updateSteering(0.0, currentLayout!.tiltTarget);
-                                        }
-                                      });
-                                  }),
-                                  const SizedBox(height: 10),
-                                  _buildMenuButton(
-                                    const Icon(Icons.tune, color: Colors.white54, size: 20), 
-                                    steppingEnabled ? "Disable Step Detection" : "Enable Step Detection",
-                                    () {
-                                      setDialogState(() {
-                                        steppingEnabled = !steppingEnabled;
-                                        if (!steppingEnabled) {
-                                          // Force immediate reset so we don't wait for the sensor loop
-                                          bleManager.updateStep(
-                                            0.0, 
-                                            jid: currentLayout!.stepTarget, 
-                                            bitmask: currentLayout!.stepButtonBitmask
-                                          );
-                                        }
-                                      });
-                                  }),
-                                  const SizedBox(height: 10),
-                                  _buildMenuButton(
-                                    Icon(
-                                      _gpxExerciseRecording ? Icons.stop_circle_outlined : Icons.fiber_manual_record,
-                                      color: _gpxExerciseRecording ? Colors.redAccent : Colors.white54,
-                                      size: 20,
-                                    ),
-                                    _gpxExerciseRecording ? 'Stop exercise GPX' : 'Start exercise GPX recording',
-                                    () async {
-                                      await _onExerciseGpxMenuPressed();
-                                    },
-                                  ),
-                                  const SizedBox(height: 10),
-                                  // Close Button
-                                  TextButton(
-                                    onPressed: () => Navigator.pop(context),
-                                    child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  );
-                },
-              ).then((_) {
-                // This runs when the dialog is closed
-                setState(() => isSettingsOpen = false);
-              });
-            },
+            onTap: _openSettingsDialog,
             child: Container(
               width: 36, height: 26,
               decoration: const BoxDecoration(
@@ -1091,6 +2048,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   Widget _buildEditorToolbar() {
     final double toolbarWidth = MediaQuery.of(context).size.width * 0.45;
     return GestureDetector(
+      key: _tutorialEditorToolbarKey,
       onPanUpdate: (details) {
         setState(() {
           final size = MediaQuery.of(context).size;
@@ -1125,6 +2083,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                 Expanded(
                   flex: 6,
                   child: Column(
+                    key: _tutorialEditorToolbarLeftKey,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       Row(
@@ -1321,6 +2280,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                 Expanded(
                   flex: 4,
                   child: Column(
+                    key: _tutorialEditorToolbarRightKey,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text("SAVED LAYOUTS", style: TextStyle(color: Colors.white38, fontSize: 9, fontWeight: FontWeight.bold)),
@@ -1343,7 +2303,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
     );
   }
 
-  void mappingSetting() {
+  void mappingSetting({bool forTutorialStep = false}) {
     // Assuming these are your available bitmask/command options
     final List<String> availableCommands = buttonBitmasks.keys.toList();
     cloneLayout();
@@ -1376,6 +2336,7 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                     child: Material(
                       color: Colors.transparent,
                       child: Container(
+                        key: _tutorialElementMappingDialogKey,
                         width: MediaQuery.of(context).size.width * 0.5, // Slightly wider for two columns
                         // maxHeight: MediaQuery.of(context).size.height * 0.8,
                         padding: const EdgeInsets.all(20),
@@ -1396,60 +2357,79 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                                 style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, letterSpacing: 1.2),
                               ),
                               const SizedBox(height: 20),
-                              // --- Section: Buttons ---
-                              _buildSectionHeader("BUTTONS"),
-                              ...editLayoutCopy!.elements.where((e) => e.type == ControllerElementType.button).map((btn) {
-                                String currentLabel = buttonBitmasks.entries
-                                  .firstWhere((entry) => entry.value == btn.buttonId, 
-                                    orElse: () => buttonBitmasks.entries.first).key;
-                                return _buildMappingRow(
-                                  btn.label, 
-                                  currentLabel, 
-                                  availableCommands,
-                                  (String newLabel) {
-                                    setDialogState(() {
-                                      btn.buttonId = buttonBitmasks[newLabel]!;
-                                    });
-                                  }
-                                );
-                              }),
-                              const SizedBox(height: 20),
-                              // --- Section: Tilt ---
-                              _buildSectionHeader("TILT"),
-                              _buildMappingRow(
-                                "Steering Target", 
-                                editLayoutCopy!.tiltTarget == ControllerId.leftJoystick ? "LEFT JOYSTICK" : "RIGHT JOYSTICK", 
-                                ["LEFT JOYSTICK", "RIGHT JOYSTICK"], 
-                                (String selected) {
-                                  setDialogState(() {
-                                    editLayoutCopy!.tiltTarget = (selected == "LEFT JOYSTICK") 
-                                        ? ControllerId.leftJoystick 
-                                        : ControllerId.rightJoystick;
-                                  });
-                                }
+                              Column(
+                                key: _tutorialElementMappingButtonsKey,
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _buildSectionHeader("BUTTONS"),
+                                  ...editLayoutCopy!.elements.where((e) => e.type == ControllerElementType.button).map((btn) {
+                                    String currentLabel = buttonBitmasks.entries
+                                      .firstWhere((entry) => entry.value == btn.buttonId, 
+                                        orElse: () => buttonBitmasks.entries.first).key;
+                                    return _buildMappingRow(
+                                      btn.label, 
+                                      currentLabel, 
+                                      availableCommands,
+                                      (String newLabel) {
+                                        setDialogState(() {
+                                          btn.buttonId = buttonBitmasks[newLabel]!;
+                                        });
+                                      }
+                                    );
+                                  }),
+                                ],
                               ),
                               const SizedBox(height: 20),
-                              // --- Section: Step ---
-                              _buildSectionHeader("STEP"),
-                              _buildMappingRow(
-                                "Step Output", 
-                                // Determine display label
-                                editLayoutCopy!.stepButtonBitmask != 0 
-                                    ? buttonBitmasks.entries.firstWhere((e) => e.value == editLayoutCopy!.stepButtonBitmask).key 
-                                    : (editLayoutCopy!.stepTarget == ControllerId.leftJoystick ? "LEFT JOYSTICK (LY)" : "RIGHT JOYSTICK (RY)"),
-                                ["LEFT JOYSTICK (LY)", "RIGHT JOYSTICK (RY)", ...availableCommands], 
-                                (String selected) {
-                                  setDialogState(() {
-                                    if (selected.contains("JOYSTICK")) {
-                                      editLayoutCopy!.stepButtonBitmask = 0;
-                                      editLayoutCopy!.stepTarget = (selected.contains("LEFT")) 
-                                          ? ControllerId.leftJoystick 
-                                          : ControllerId.rightJoystick;
-                                    } else {
-                                      editLayoutCopy!.stepButtonBitmask = buttonBitmasks[selected]!;
+                              Column(
+                                key: _tutorialElementMappingTiltKey,
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _buildSectionHeader("TILT"),
+                                  _buildMappingRow(
+                                    "Steering Target", 
+                                    editLayoutCopy!.tiltTarget == ControllerId.leftJoystick ? "LEFT JOYSTICK" : "RIGHT JOYSTICK", 
+                                    ["LEFT JOYSTICK", "RIGHT JOYSTICK"], 
+                                    (String selected) {
+                                      setDialogState(() {
+                                        editLayoutCopy!.tiltTarget = (selected == "LEFT JOYSTICK") 
+                                            ? ControllerId.leftJoystick 
+                                            : ControllerId.rightJoystick;
+                                      });
                                     }
-                                  });
-                                }
+                                  ),
+                                  _buildTiltDeadzoneSlider(setDialogState),
+                                  _buildTiltDeadzoneWhileSteppingSlider(setDialogState),
+                                ],
+                              ),
+                              const SizedBox(height: 20),
+                              Column(
+                                key: _tutorialElementMappingStepKey,
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _buildSectionHeader("STEP"),
+                                  _buildMappingRow(
+                                    "Step Output", 
+                                    editLayoutCopy!.stepButtonBitmask != 0 
+                                        ? buttonBitmasks.entries.firstWhere((e) => e.value == editLayoutCopy!.stepButtonBitmask).key 
+                                        : (editLayoutCopy!.stepTarget == ControllerId.leftJoystick ? "LEFT JOYSTICK (LY)" : "RIGHT JOYSTICK (RY)"),
+                                    ["LEFT JOYSTICK (LY)", "RIGHT JOYSTICK (RY)", ...availableCommands], 
+                                    (String selected) {
+                                      setDialogState(() {
+                                        if (selected.contains("JOYSTICK")) {
+                                          editLayoutCopy!.stepButtonBitmask = 0;
+                                          editLayoutCopy!.stepTarget = (selected.contains("LEFT")) 
+                                              ? ControllerId.leftJoystick 
+                                              : ControllerId.rightJoystick;
+                                        } else {
+                                          editLayoutCopy!.stepButtonBitmask = buttonBitmasks[selected]!;
+                                        }
+                                      });
+                                    }
+                                  ),
+                                ],
                               ),
                               const SizedBox(height: 20),
                               TextButton(
@@ -1475,6 +2455,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
         );
       },
     );
+    if (forTutorialStep) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollAndHighlightElementMappingButtons(attempt: 0);
+      });
+    }
   }
 
   Widget _buildSectionHeader(String title) {
@@ -1485,6 +2470,75 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
           Text(title, style: const TextStyle(color: Colors.blueAccent, fontSize: 12, fontWeight: FontWeight.bold)),
           const SizedBox(width: 10),
           const Expanded(child: Divider(color: Colors.white10, thickness: 1)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTiltDeadzoneSlider(StateSetter setDialogState) {
+    return _buildDeadzoneSlider(
+      setDialogState,
+      label: 'TILT DEADZONE',
+      value: editLayoutCopy!.tiltDeadzone ?? ControllerLayout.defaultTiltDeadzone,
+      min: 0.0,
+      max: 1.0,
+      divisions: 100,
+      onChanged: (next) => editLayoutCopy!.tiltDeadzone = next,
+    );
+  }
+
+  Widget _buildTiltDeadzoneWhileSteppingSlider(StateSetter setDialogState) {
+    return _buildDeadzoneSlider(
+      setDialogState,
+      label: 'TILT DEADZONE WHILE STEPPING',
+      value: editLayoutCopy!.tiltDeadzoneWhileStepping ??
+          ControllerLayout.defaultTiltDeadzoneWhileStepping,
+      min: 0.0,
+      max: 1.0,
+      divisions: 100,
+      onChanged: (next) => editLayoutCopy!.tiltDeadzoneWhileStepping = next,
+    );
+  }
+
+  Widget _buildDeadzoneSlider(
+    StateSetter setDialogState, {
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required int divisions,
+    required ValueChanged<double> onChanged,
+  }) {
+    final clamped = value.clamp(min, max);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+              ),
+              Text(
+                clamped.toStringAsFixed(2),
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+            ],
+          ),
+          Slider(
+            value: clamped,
+            min: min,
+            max: max,
+            divisions: divisions,
+            activeColor: Colors.blueAccent,
+            inactiveColor: Colors.white24,
+            onChanged: (next) {
+              setDialogState(() => onChanged(next));
+            },
+          ),
         ],
       ),
     );
@@ -1528,8 +2582,9 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   }
 
   // Helper method to keep your buttons consistent
-  Widget _buildMenuButton(Widget iconWidget, String label, VoidCallback onTap) {
+  Widget _buildMenuButton(Widget iconWidget, String label, VoidCallback onTap, {Key? key}) {
     return Material(
+      key: key,
       color: Colors.transparent, // Required for InkWell to show effects
       child: InkWell(
         onTap: onTap,
@@ -1563,9 +2618,11 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
   List<Widget> _buildLayoutList() {
     final allKeys = prefs.getKeys().toList();
     allKeys.sort((a, b) {
-      if (a == "Default_Layout") return -1; // 'a' comes first
-      if (b == "Default_Layout") return 1;  // 'b' comes first
-      return 0; // maintain relative order for everything else
+      if (a == defaultKey) return -1;
+      if (b == defaultKey) return 1;
+      if (a == superTaxKartKey) return -1;
+      if (b == superTaxKartKey) return 1;
+      return a.compareTo(b);
     });
     return allKeys.map((key) {
       try {
@@ -1810,10 +2867,14 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                     bool isSelected = selectedElement?.id == element.id;
                     if (element.type == ControllerElementType.button) {
                       return CustomButton(
+                        key: _tutorialKeyForElement(element.id),
                         element: element,
                         isEditing: isEditing,
                         isSelected: isSelected,
                         resizeGridSize: resizeGridSize,
+                        systemIconOverride: element.id == 'toolbar_pause' && !isEditing
+                            ? (paused ? 'play' : 'pause')
+                            : null,
                         onSelect: () => setState(() => selectedElement = element),
                         onSizeChanged: (newSize) => setState(() {
                           final selected = selectedElement;
@@ -1822,10 +2883,8 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                           }
                         }),
                         onPressed: (id, pressed) {
-                          // send button press/release to PC
                           if (!isEditing) {
-                            final bit = element.buttonId;
-                            bleManager.updateButton(bit, pressed);
+                            _handleLayoutButtonPress(element, pressed);
                           }
                         },
                         onPositionChanged: (newOffset) => setState(() => element.position = newOffset),
@@ -1862,16 +2921,23 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                       top: editorPosition.dy * screenHeight,
                       child: _buildEditorToolbar(),
                     ),
-                  ] else ...[
+                  ] else if (!_layoutHasToolbarElements(elementsToRender)) ...[
                     Positioned(
-                      top: 5, // Adjust this value to move it higher or lower
+                      top: 5,
                       left: 16,
                       right: 16,
                       child: _buildStandardToolbar(),
                     ),
-                    // Connection status banner
+                  ],
+                  if (!isEditing && _layoutHasToolbarElements(elementsToRender))
+                    _buildLayoutToolbarTutorialAnchor(
+                      elementsToRender,
+                      screenWidth,
+                      screenHeight,
+                    ),
+                  if (!isEditing)
                     Positioned(
-                      bottom: 10, // Adjust as needed
+                      bottom: 10,
                       left: 16,
                       right: 16,
                       child: Center(
@@ -1882,7 +2948,6 @@ class _ControllerAppState extends State<ControllerApp> with WidgetsBindingObserv
                         ),
                       ),
                     ),
-                  ],
                 ],
               );
             },

@@ -5,6 +5,17 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:io';
 
+/// Bits 0–15 are sent in the 16-byte input packet; 16–18 are app-side commands only.
+class ControllerButtonIds {
+  static const int inputPacketMask = 0xFFFF;
+  static const int pauseResume = 1 << 16;
+  static const int screenshot = 1 << 17;
+  static const int settings = 1 << 18;
+
+  static bool isInputPacketButton(int buttonId) =>
+      buttonId != 0 && (buttonId & inputPacketMask) == buttonId;
+}
+
 class BleUuids {
   static const String service     = "12345678-1234-5678-1234-56789abcdef0";
   static const String notifyChar  = "12345678-1234-5678-1234-56789abcdef2"; // phone writes → PC
@@ -28,6 +39,7 @@ class BleManager {
 
   bool _isConnecting = false;
   bool _reconnectBusy = false;
+  int _connectSession = 0;
   Timer? _heartbeatTimer;
   Timer? _disconnectWatcher;
   Timer? _inputTimer;
@@ -93,8 +105,13 @@ class BleManager {
     });
   }
 
+  bool get _isFullyConnected =>
+      pingCharacteristic != null &&
+      pcDevice != null &&
+      pcDevice!.isConnected;
+
   Future<void> startScanningAndConnect() async {
-    if (_isConnecting || (pcDevice != null && pcDevice!.isConnected)) return;
+    if (_isConnecting || _isFullyConnected) return;
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     // Turn on Bluetooth if needed
@@ -144,31 +161,58 @@ class BleManager {
     }
   }
 
+  bool _connectSessionAlive(int session, BluetoothDevice device) =>
+      session == _connectSession && device.isConnected;
+
   Future<void> connectToDevice(BluetoothDevice device) async {
+    final session = ++_connectSession;
     try {
-      // Cancel any previous connection state listener
       await _connectionStateSubscription?.cancel();
       _connectionStateSubscription = null;
+      pingCharacteristic = null;
+      inputCharacteristic = null;
+
       await device.connect(license: License.free);
+      if (!_connectSessionAlive(session, device)) return;
       print("[BLE] Connected to ${device.platformName}");
+
+      _connectionStateSubscription = device.connectionState.listen((BluetoothConnectionState state) async {
+        print("[BLE] Connection state changed: $state");
+        if (state == BluetoothConnectionState.disconnected) {
+          print("[BLE] Disconnected from PC!");
+          _connectSession++;
+          _statusController.add(BleConnectionStatus.disconnected);
+          _handleCleanupAndReconnect();
+        }
+      }, onError: (e) {
+        print("[BLE] Connection error: $e");
+        _connectSession++;
+        _handleCleanupAndReconnect();
+      });
+
       await Future.delayed(const Duration(seconds: 2));
+      if (!_connectSessionAlive(session, device)) return;
+
       if (Platform.isAndroid) {
         print("[BLE] Clearing Android GATT Cache...");
         await device.clearGattCache();
         await Future.delayed(const Duration(seconds: 3));
+        if (!_connectSessionAlive(session, device)) return;
       }
 
       List<BluetoothService> services = [];
       for (int i = 0; i < 3; i++) {
+        if (!_connectSessionAlive(session, device)) return;
         services = await device.discoverServices();
         if (services.isNotEmpty) break;
-        
+
         print("[BLE] Services empty, waiting and retrying ($i)...");
         await Future.delayed(const Duration(seconds: 1));
       }
+      if (!_connectSessionAlive(session, device)) return;
       if (services.isEmpty) {
         print("[BLE] Fatal: Could not find services after 3 tries.");
-        _handleCleanupAndReconnect();
+        await _handleCleanupAndReconnect();
         return;
       }
       print("[BLE] Discovered ${services.length} services");
@@ -178,40 +222,35 @@ class BleManager {
           print("[BLE] Found our service!");
           for (var char in service.characteristics) {
             final uuidStr = char.uuid.str.toLowerCase();
-            // Setup notify (PC → Phone)
             if (uuidStr == BleUuids.notifyChar.toLowerCase()) {
               await _lastValueSubscription?.cancel();
               _lastValueSubscription = null;
               await char.setNotifyValue(true);
               await Future.delayed(const Duration(milliseconds: 200));
+              if (!_connectSessionAlive(session, device)) return;
 
               _lastValueSubscription = char.lastValueStream.listen((value) {
                 String text = utf8.decode(value, allowMalformed: true).trim();
-                print("[BLE] ← From PC: $text");
+                // print("[BLE] ← From PC: $text");
                 if (text.contains("PONG")) {
-                  _lastPongTime = DateTime.now();  // We are alive!
+                  _lastPongTime = DateTime.now();
                   return;
                 }
                 _dataController.add(value);
               });
               print("[BLE] Notify enabled on ${char.uuid.str}");
-            }
-
-            // 2. PING characteristic (Write With Response)
-            else if (uuidStr == BleUuids.pingChar.toLowerCase()) {
+            } else if (uuidStr == BleUuids.pingChar.toLowerCase()) {
               pingCharacteristic = char;
               print("[BLE] PING characteristic ready: $uuidStr");
-            }
-
-            // 3. INPUT characteristic (Write Without Response) – for buttons & joysticks
-            else if (uuidStr == BleUuids.inputChar.toLowerCase()) {
+            } else if (uuidStr == BleUuids.inputChar.toLowerCase()) {
               inputCharacteristic = char;
               print("[BLE] INPUT characteristic ready (fast): $uuidStr");
             }
           }
         }
       }
-      // Start heartbeat only if PING char exists
+
+      if (!_connectSessionAlive(session, device)) return;
       if (pingCharacteristic != null) {
         _statusController.add(BleConnectionStatus.connected);
         _startHeartbeat();
@@ -219,43 +258,50 @@ class BleManager {
         startInputSending();
         print("[BLE] Setup complete! Ready to send input + heartbeat.");
       } else {
-        print("[BLE] ERROR: PING characteristic not found!");
+        print("[BLE] ERROR: PING characteristic not found — incomplete GATT, reconnecting");
+        await _handleCleanupAndReconnect();
       }
-      // Monitor disconnection
-      _connectionStateSubscription = device.connectionState.listen((BluetoothConnectionState state) async {
-        print("[BLE] Connection state changed: $state");
-        if (state == BluetoothConnectionState.disconnected) {
-          print("[BLE] Disconnected from PC!");
-          _statusController.add(BleConnectionStatus.disconnected);
-          _handleCleanupAndReconnect();
-        }
-      },
-      onError: (e) {
-        print("[BLE] Connection error: $e");
-        _handleCleanupAndReconnect();
-      });
     } catch (e) {
       print("[BLE] Connect failed: $e");
-      await device.disconnect();
-      _handleCleanupAndReconnect();
+      _connectSession++;
+      try {
+        await device.disconnect();
+      } catch (_) {}
+      await _handleCleanupAndReconnect();
     }
   }
 
   Future<void> _handleCleanupAndReconnect() async {
     if (_reconnectBusy) return;
     _reconnectBusy = true;
+    _connectSession++;
     try {
       stopInputSending();
       _stopHeartbeat();
       _disconnectWatcher?.cancel();
+      await _lastValueSubscription?.cancel();
+      _lastValueSubscription = null;
+      await _connectionStateSubscription?.cancel();
+      _connectionStateSubscription = null;
 
+      final device = pcDevice;
       pcDevice = null;
       pingCharacteristic = null;
       inputCharacteristic = null;
-
       _isConnecting = false;
+
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+      if (device != null) {
+        try {
+          await device.disconnect();
+        } catch (e) {
+          print("[BLE] disconnect during cleanup: $e");
+        }
+      }
+
       _statusController.add(BleConnectionStatus.failed);
-      // Short backoff: Windows server kills duplicate processes + retries GATT; long phone waits hurt UX.
       await Future.delayed(const Duration(milliseconds: 900));
       if (!_statusController.isClosed) {
         print("[BLE] Attempting to reconnect...");
@@ -296,13 +342,15 @@ class BleManager {
     }
 
     try {
-      final bytes = utf8.encode("$command\n");  // e.g., "PAUSE\n" or "RESUME\n"
-      await pingCharacteristic!.write(bytes, withoutResponse: false);  // MUST be false!
+      final bytes = utf8.encode("$command\n");
+      await pingCharacteristic!.write(bytes, withoutResponse: false);
       print("[BLE] → Sent command: $command");
       if (command == "PAUSE") {
-        updateSteering(0.0, tiltTarget);
-        updateStep(0.0, jid: stepTarget, bitmask: stepBitmask);
-        updateSteering(0.0, tiltTarget == ControllerId.leftJoystick ? ControllerId.rightJoystick : ControllerId.leftJoystick);
+        resetTiltAndStepInputs(
+          tiltTarget: tiltTarget,
+          stepTarget: stepTarget,
+          stepBitmask: stepBitmask,
+        );
       }
       return true;
     } catch (e) {
@@ -336,6 +384,7 @@ class BleManager {
   }
 
   void updateButton(int buttonBit, bool pressed) {
+    if (!ControllerButtonIds.isInputPacketButton(buttonBit)) return;
     if (pressed) {
       currentButtons |= buttonBit;
     } else {
@@ -349,6 +398,26 @@ class BleManager {
     } else {
       currentJoy = currentJoy.copyWith(joyRX: x, joyRY: y);
     }
+  }
+
+  void resetTiltAndStepInputs({
+    required ControllerId tiltTarget,
+    required ControllerId stepTarget,
+    required int stepBitmask,
+  }) {
+    updateSteering(0.0, tiltTarget);
+    updateStep(0.0, jid: stepTarget, bitmask: stepBitmask);
+    updateSteering(
+      0.0,
+      tiltTarget == ControllerId.leftJoystick
+          ? ControllerId.rightJoystick
+          : ControllerId.leftJoystick,
+    );
+  }
+
+  void forceTransmitInputPacket() {
+    _resetInputSendState();
+    sendCombinedInputPacket();
   }
 
   void updateSteering(double steering, ControllerId target) {
@@ -395,14 +464,15 @@ class BleManager {
     final bool isRtPressed = (currentButtons & _bitRt) != 0;
     final int leftTriggerValue = isLtPressed ? 255 : 0;
     final int rightTriggerValue = isRtPressed ? 255 : 0;
-    final int buttonsMask = currentButtons & ~(_bitLt | _bitRt);
+    final int buttonsMask =
+        (currentButtons & ControllerButtonIds.inputPacketMask) & ~(_bitLt | _bitRt);
 
-    // Bytes 0–1: Buttons (16-bit mask; LT/RT use bytes 2–3)
+    // Bytes 0–1: Buttons (16-bit mask)
     bd.setUint16(0, buttonsMask, Endian.little);
     
     // Bytes 2–3: Triggers (2 × Uint8)
-    bd.setUint8(2, leftTriggerValue);  // Byte 2: Left Trigger
-    bd.setUint8(3, rightTriggerValue); // Byte 3: Right Trigger
+    bd.setUint8(2, leftTriggerValue);
+    bd.setUint8(3, rightTriggerValue);
 
     // Bytes 4–11: Joysticks (4 × Int16)
     bd.setInt16(4, (currentJoy.joyLX * 32767).round(), Endian.little);
@@ -418,7 +488,7 @@ class BleManager {
     _lastSentPacket = Uint8List.fromList(packet);
     try {
       if (pcDevice!.isConnected) {
-        print("→ Button: ${currentButtons.toString()} LX:${currentJoy.joyLX.toStringAsFixed(2)} LY:${currentJoy.joyLY.toStringAsFixed(2)} RX:${currentJoy.joyRX.toStringAsFixed(2)} RY:${currentJoy.joyRY.toStringAsFixed(2)}");
+        // print("→ Button: ${currentButtons.toString()} LX:${currentJoy.joyLX.toStringAsFixed(2)} LY:${currentJoy.joyLY.toStringAsFixed(2)} RX:${currentJoy.joyRX.toStringAsFixed(2)} RY:${currentJoy.joyRY.toStringAsFixed(2)}");
         // Fast path: no response
         inputCharacteristic!.write(packet, withoutResponse: true);
       }
